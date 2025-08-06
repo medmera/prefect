@@ -249,6 +249,13 @@ The default timeout for requests to the API
 **Supported environment variables**:
 `PREFECT_API_REQUEST_TIMEOUT`
 
+### `iap`
+Settings for interacting with the Prefect API using IAP.
+
+**Type**: [IAPSettings](#iapsettings)
+
+**TOML dotted key path**: `api.iap`
+
 ---
 ## CLISettings
 Settings for controlling CLI behavior
@@ -545,6 +552,57 @@ This value sets the default retry delay seconds for all flows.
 
 **Supported environment variables**:
 `PREFECT_FLOWS_DEFAULT_RETRY_DELAY_SECONDS`, `PREFECT_FLOW_DEFAULT_RETRY_DELAY_SECONDS`
+
+---
+## IAPSettings
+Settings for interacting with the Prefect API using IAP
+### `enabled`
+Whether to enable IAP authentication. If enabled, the client will use IAP to authenticate with the Prefect API.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `api.iap.enabled`
+
+**Supported environment variables**:
+`PREFECT_API_IAP_ENABLED`
+
+### `client_id_gcp_secret_version`
+The name of the GCP secret to use for the client ID.
+
+**Type**: `string | None`
+
+**Default**: `None`
+
+**TOML dotted key path**: `api.iap.client_id_gcp_secret_version`
+
+**Supported environment variables**:
+`PREFECT_API_IAP_CLIENT_ID_GCP_SECRET_VERSION`
+
+### `impersonate_service_account`
+The email of the service account to impersonate for the API when using the service-account mode.
+
+**Type**: `string | None`
+
+**Default**: `None`
+
+**TOML dotted key path**: `api.iap.impersonate_service_account`
+
+**Supported environment variables**:
+`PREFECT_API_IAP_IMPERSONATE_SERVICE_ACCOUNT`
+
+### `auth_header_name`
+The name of the HTTP header to use for IAP authentication.
+
+**Type**: `string`
+
+**Default**: `Authorization`
+
+**TOML dotted key path**: `api.iap.auth_header_name`
+
+**Supported environment variables**:
+`PREFECT_API_IAP_AUTH_HEADER_NAME`
 
 ---
 ## InternalSettings

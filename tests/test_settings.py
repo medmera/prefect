@@ -100,6 +100,14 @@ SUPPORTED_SETTINGS = {
         "legacy": True,
     },
     "PREFECT_API_EVENTS_STREAM_OUT_ENABLED": {"test_value": True, "legacy": True},
+    "PREFECT_API_IAP_AUTH_HEADER_NAME": {"test_value": "Authorization"},
+    "PREFECT_API_IAP_CLIENT_ID_GCP_SECRET_VERSION": {
+        "test_value": "projects/1234567890/secrets/secret-name/versions/latest"
+    },
+    "PREFECT_API_IAP_ENABLED": {"test_value": True},
+    "PREFECT_API_IAP_IMPERSONATE_SERVICE_ACCOUNT": {
+        "test_value": "service-account@project.iam.gserviceaccount.com"
+    },
     "PREFECT_API_KEY": {"test_value": "key"},
     "PREFECT_API_LOG_RETRYABLE_ERRORS": {"test_value": True, "legacy": True},
     "PREFECT_API_MAX_FLOW_RUN_GRAPH_ARTIFACTS": {"test_value": 10, "legacy": True},
