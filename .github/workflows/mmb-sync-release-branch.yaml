@@ -1,0 +1,65 @@
+name: MMB - Sync release branch
+
+on:
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  sync-release-branch:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for rebasing
+          fetch-depth: 0
+          # Use a token that can push to protected branches
+          token: ${{ secrets.PREFECT_REPO_PAT }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up upstream remote
+        run: |
+          # Add upstream remote if it doesn't exist
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/PrefectHQ/prefect.git
+          fi
+          # Verify remotes
+          git remote -v
+
+      - name: Make sync script executable
+        run: chmod +x scripts/sync-release-branch.sh
+
+      - name: Run sync script (dry run first)
+        run: |
+          echo "Running dry run first..."
+          ./scripts/sync-release-branch.sh --dry-run
+
+      - name: Run actual sync
+        run: |
+          echo "Running actual sync..."
+          ./scripts/sync-release-branch.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.PREFECT_REPO_PAT }}
+
+      - name: Create summary
+        if: always()
+        run: |
+          echo "## Sync Release Branch Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Current branch**: $(git branch --show-current)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Latest commits on release**:" >> $GITHUB_STEP_SUMMARY
+          git log --oneline -5 release | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || echo "- Could not fetch release branch commits" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Latest tags**:" >> $GITHUB_STEP_SUMMARY
+          git tag --sort=-version:refname | head -5 | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || echo "- Could not fetch tags" >> $GITHUB_STEP_SUMMARY

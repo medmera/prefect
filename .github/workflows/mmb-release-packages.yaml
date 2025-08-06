@@ -1,0 +1,284 @@
+name: MMB - Release Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_python:
+        description: "Release Python packages"
+        required: false
+        default: true
+        type: boolean
+      release_docker:
+        description: "Release Docker images"
+        required: false
+        default: true
+        type: boolean
+      build_integrations:
+        description: "Build integration packages (Python only)"
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: "Perform a dry run (no actual building or pushing)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+# Prevent concurrent releases
+concurrency:
+  group: release-packages
+  cancel-in-progress: false
+
+jobs:
+  release-python-packages:
+    name: Release Python packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ inputs.release_python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.12
+
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Authenticate to Google Cloud (Workload Identity)
+        id: gcp_auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}"
+          workload_identity_provider: "${{ vars.ARTIFACT_REGISTRY_WORKLOAD_IDENTITY_PROVIDER }}"
+
+      - name: "Set up Cloud SDK"
+        uses: "google-github-actions/setup-gcloud@v2"
+
+      - name: Run Python package release
+        id: python_release
+        run: |
+          ./scripts/release-python-packages.sh \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" \
+            "${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}" \
+            "${{ inputs.build_integrations }}" \
+            "${{ inputs.dry_run }}"
+        continue-on-error: true
+
+      - name: Create Python release summary
+        if: always()
+        run: |
+          echo "## 📦 Python Package Release" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Project ID: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Repository: ${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build integrations: ${{ inputs.build_integrations }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if the script failed and why
+          if [[ "${{ steps.python_release.outputs.script_failed }}" == "true" ]]; then
+            local exit_code="${{ steps.python_release.outputs.script_exit_code }}"
+            echo "⚠️ **Script completed with exit code: $exit_code**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Interpret exit codes
+            case $exit_code in
+              1)
+                echo "This indicates some packages failed to upload, but the script handled the error gracefully." >> $GITHUB_STEP_SUMMARY
+                echo "Check the logs above for details on which packages succeeded and which failed." >> $GITHUB_STEP_SUMMARY
+                ;;
+              2)
+                echo "This indicates a configuration or setup error." >> $GITHUB_STEP_SUMMARY
+                ;;
+              *)
+                echo "This indicates an unexpected error occurred." >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Note:** The workflow will continue even if some packages failed to upload." >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ job.status }}" == "success" ]]; then
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+              echo "✅ **Dry run completed successfully**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "No packages were actually built or uploaded." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ **Python packages released successfully**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Repository URL:**" >> $GITHUB_STEP_SUMMARY
+              echo "https://console.cloud.google.com/artifacts/browse/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}/${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Installation:**" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+              echo "pip install --index-url https://${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}-python.pkg.dev/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}/simple/ prefect" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ **Python package release failed**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Check the job logs for detailed error information." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  release-docker-images:
+    name: Release Docker images (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: ${{ inputs.release_docker }}
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to Google Cloud (Workload Identity)
+        id: gcp_auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}"
+          workload_identity_provider: "${{ vars.ARTIFACT_REGISTRY_WORKLOAD_IDENTITY_PROVIDER }}"
+
+      - name: "Set up Cloud SDK"
+        uses: "google-github-actions/setup-gcloud@v2"
+
+      - name: Login to GCP Artifact Registry
+        uses: docker/login-action@v2.1.0
+        with:
+          registry: "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}-docker.pkg.dev/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}"
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth.outputs.auth_token }}
+
+      - name: Run Docker image release
+        id: docker_release
+        run: |
+          ./scripts/release-docker-images.sh \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" \
+            "${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}" \
+            "${{ inputs.dry_run }}" \
+            "false" \
+            "${{ matrix.python-version }}"
+        # No continue-on-error here: any failure will fail the job
+
+      - name: Create Docker release summary
+        if: always()
+        run: |
+          echo "## 🐳 Docker Image Release (Python ${{ matrix.python-version }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Project ID: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Repository: ${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Python version: ${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Platforms: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ job.status }}" == "success" ]]; then
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+              echo "✅ **Dry run completed successfully**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "No images were actually built or uploaded." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ **Docker images released successfully**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Repository URL:**" >> $GITHUB_STEP_SUMMARY
+              echo "https://console.cloud.google.com/artifacts/browse/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}/${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Usage:**" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+              echo "# Pull specific Python version built in this job:" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}-docker.pkg.dev/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}/prefect:latest-python${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ **Docker image release failed**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Check the job logs for detailed error information." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  summary:
+    name: Release Summary
+    runs-on: ubuntu-latest
+    needs: [release-python-packages, release-docker-images]
+    if: always()
+
+    steps:
+      - name: Create overall summary
+        run: |
+          echo "# 🚀 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- GCP Project: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Python packages: ${{ inputs.release_python }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker images: ${{ inputs.release_docker }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build integrations: ${{ inputs.build_integrations }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check job statuses
+          python_status="${{ needs.release-python-packages.result || 'skipped' }}"
+          docker_status="${{ needs.release-docker-images.result || 'skipped' }}"
+
+          echo "**Job Results:**" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ inputs.release_python }}" == "true" ]]; then
+            if [[ "$python_status" == "success" ]]; then
+              echo "- ✅ Python packages: Success" >> $GITHUB_STEP_SUMMARY
+            elif [[ "$python_status" == "failure" ]]; then
+              echo "- ❌ Python packages: Failed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⏸️ Python packages: $python_status" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- ⏭️ Python packages: Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [[ "${{ inputs.release_docker }}" == "true" ]]; then
+            if [[ "$docker_status" == "success" ]]; then
+              echo "- ✅ Docker images: Success" >> $GITHUB_STEP_SUMMARY
+            elif [[ "$docker_status" == "failure" ]]; then
+              echo "- ❌ Docker images: Failed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⏸️ Docker images: $docker_status" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- ⏭️ Docker images: Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Overall status
+          if [[ ("${{ inputs.release_python }}" != "true" || "$python_status" == "success") && ("${{ inputs.release_docker }}" != "true" || "$docker_status" == "success") ]]; then
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+              echo "🎉 **All dry runs completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "🎉 **All releases completed successfully!**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Access your artifacts:**" >> $GITHUB_STEP_SUMMARY
+              echo "- [Artifact Registry Console](https://console.cloud.google.com/artifacts/browse/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }})" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ **Some releases failed. Check individual job logs for details.**" >> $GITHUB_STEP_SUMMARY
+          fi
