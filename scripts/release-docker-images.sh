@@ -8,7 +8,8 @@ REGION="$2"
 REPO_NAME="$3"
 DRY_RUN="${4:-false}"
 NO_PUSH="${5:-false}"
-SINGLE_PYTHON_VERSION="${6:-}"
+FORCE_RELEASE_VERSION="${6:-false}"
+SINGLE_PYTHON_VERSION="${7:-}"
 
 # Docker build configuration
 PYTHON_VERSIONS=("3.9" "3.10" "3.11" "3.12" "3.13")
@@ -214,7 +215,11 @@ setup_buildx() {
 
 # Get latest tag for prefect core (x.x.x or x.x.x.anything or x.x.xanything format) by creation date
 get_prefect_tag_version() {
-    git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
+    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
+        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1
+    else
+        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
+    fi
 }
 
 # Create clean version files temporarily (same as Python script)
@@ -245,7 +250,11 @@ get_version() {
     if [[ -n "$tag_version" ]]; then
         echo "$tag_version"
     else
-        config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+        if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
+            error "No clean release version tag (x.y.z) found. Please create a tag matching x.y.z before running this script with FORCE_RELEASE_VERSION=true."
+        else
+            config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+        fi
     fi
 }
 
@@ -576,7 +585,7 @@ main() {
 
 # Show usage if help is requested
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [DRY_RUN] [NO_PUSH] [SINGLE_PYTHON_VERSION]"
+    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [DRY_RUN] [NO_PUSH] [SINGLE_PYTHON_VERSION] [FORCE_RELEASE_VERSION]"
     echo ""
     echo "Build and publish Prefect Docker images to GCP Artifact Registry"
     echo "Uses clean git tag versions instead of dirty development versions"
@@ -587,11 +596,12 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  REPO_NAME              Repository name (required)"
     echo "  DRY_RUN                Preview builds without building/pushing (optional, default: 'false', set to 'true' for dry run)"
     echo "  NO_PUSH                Build locally without pushing to registry (optional, default: 'false', set to 'true' to skip push)"
+    echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
     echo "  SINGLE_PYTHON_VERSION  Build only for specific Python version (optional, e.g., '3.11'). If not specified, builds for all versions."
     echo ""
     echo "Version handling:"
-    echo "  - Uses latest tag matching x.x.x pattern (e.g., 3.4.11)"
-    echo "  - Falls back to dynamic version if no clean tag found"
+    echo "  - If FORCE_RELEASE_VERSION=true: Only tags matching x.y.z (e.g., 3.4.11) are allowed."
+    echo "  - Otherwise: Allows x.y.z or x.y.z.suffix (e.g., 3.4.11.dev1)"
     echo "  - Passes clean version to Docker build process"
     echo ""
     echo "Configuration:"
