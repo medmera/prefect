@@ -19,7 +19,10 @@ from packaging import version
 from starlette import status
 from typing_extensions import ParamSpec, Self, TypeVar
 
-from prefect.client.iap_auth import IAPAuth
+try:
+    from prefect.client.iap_auth import IAPAuth
+except ImportError:
+    IAPAuth = None
 
 from prefect.client.orchestration._artifacts.client import (
     ArtifactClient,
@@ -248,6 +251,10 @@ def get_client(
         )
 
     if PREFECT_API_IAP_ENABLED.value():
+        if IAPAuth is None:
+            raise ImportError(
+                "IAP authentication is not available. Please install the prefect (or prefect-client) package with the 'gcp-iap' extra."
+            )
         if httpx_settings is None:
             httpx_settings = {}
         httpx_settings["auth"] = IAPAuth()

@@ -2,7 +2,7 @@ import asyncio
 import json
 import threading
 import time
-from typing import Generator, Optional
+from typing import AsyncGenerator, Generator, Optional
 
 import google.auth
 import google.auth.transport.requests
@@ -31,7 +31,7 @@ class IAPTokenManager:
     _instance = None
     _lock = threading.Lock()
 
-    def __new__(cls):
+    def __new__(cls) -> "IAPTokenManager":
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -214,10 +214,10 @@ class IAPAuth(httpx.Auth):
             auth_header_name: Name of the authorization header. If not provided, will use
                              the value from PREFECT_API_IAP_AUTH_HEADER_NAME setting.
         """
-        self.auth_header_name = (
+        self.auth_header_name: str = (
             auth_header_name or PREFECT_API_IAP_AUTH_HEADER_NAME.value()
         )
-        self.token_manager = IAPTokenManager()
+        self.token_manager: IAPTokenManager = IAPTokenManager()
 
     def sync_auth_flow(
         self, request: httpx.Request
@@ -248,7 +248,7 @@ class IAPAuth(httpx.Auth):
             # Retry the request
             yield request
 
-    async def async_auth_flow(self, request: httpx.Request):
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """
         Asynchronous authentication flow for httpx.AsyncClient.
 
