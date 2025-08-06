@@ -17,7 +17,8 @@ from python_socks.async_.asyncio import Proxy
 from typing_extensions import Self
 from websockets.asyncio.client import ClientConnection, connect
 
-from prefect.settings import get_current_settings
+from prefect.client.iap_auth import IAPTokenManager
+from prefect.settings import PREFECT_API_IAP_ENABLED, get_current_settings
 
 
 def create_ssl_context_for_websocket(uri: str) -> Optional[ssl.SSLContext]:
@@ -141,4 +142,11 @@ class WebsocketProxyConnect(connect):
 
 def websocket_connect(uri: str, **kwargs: Any) -> WebsocketProxyConnect:
     """Create a WebSocket connection with proxy and SSL support."""
+
+    if PREFECT_API_IAP_ENABLED.value():
+        kwargs["additional_headers"] = {
+            **(kwargs.get("additional_headers", {}) or {}),
+            **IAPTokenManager().get_id_token_header(),
+        }
+
     return WebsocketProxyConnect(uri, **kwargs)
