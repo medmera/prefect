@@ -8,6 +8,7 @@ REGION="$2"
 REPO_NAME="$3"
 BUILD_INTEGRATIONS="${4:-true}"
 DRY_RUN="${5:-false}"
+FORCE_RELEASE_VERSION="${6:-false}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -508,13 +509,21 @@ upload_packages() {
 
 # Get latest tag for prefect core (x.x.x or x.x.x.anything or x.x.xanything format) by creation date
 get_prefect_tag_version() {
-    git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
+    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
+        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1
+    else
+        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
+    fi
 }
 
 # Get latest tag for integration package (prefect-{name}-x.x.x or prefect-{name}-x.x.x.anything format) by creation date
 get_integration_tag_version() {
     local package_name="$1"
-    git tag --list --sort=-creatordate | grep -E "^${package_name}-[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1 | sed "s/^${package_name}-//"
+    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
+        git tag --list --sort=-creatordate | grep -E "^${package_name}-[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1 | sed "s/^${package_name}-//"
+    else
+        git tag --list --sort=-creatordate | grep -E "^${package_name}-[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1 | sed "s/^${package_name}-//"
+    fi
 }
 
 # Create clean version files temporarily
@@ -597,7 +606,11 @@ get_version() {
     if [[ -n "$tag_version" ]]; then
         echo "$tag_version"
     else
-        config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+        if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
+            config_error "No clean release version tag (x.y.z) found. Please create a tag matching x.y.z before running this script with FORCE_RELEASE_VERSION=true."
+        else
+            config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+        fi
     fi
 }
 
@@ -735,7 +748,7 @@ main() {
 
 # Show usage if help is requested
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [BUILD_INTEGRATIONS] [DRY_RUN]"
+    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [BUILD_INTEGRATIONS] [DRY_RUN] [FORCE_RELEASE_VERSION]"
     echo ""
     echo "Build and publish Prefect Python packages to GCP Artifact Registry"
     echo "Uses clean git tag versions instead of dirty development versions"
@@ -746,11 +759,13 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  REPO_NAME           Repository name (required)"
     echo "  BUILD_INTEGRATIONS  Build integration packages (optional, default: 'true', set to 'false' to skip)"
     echo "  DRY_RUN             Preview versions without building/uploading (optional, default: 'false', set to 'true' for dry run)"
+    echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
     echo ""
     echo "Version handling:"
-    echo "  - Prefect core: Uses latest tag matching x.x.x pattern (e.g., 3.4.11)"
-    echo "  - Integrations: Uses latest tag matching prefect-{name}-x.x.x pattern (e.g., prefect-aws-0.5.9)"
-    echo "  - Falls back to dynamic version if no clean tag found"
+    echo "  - If FORCE_RELEASE_VERSION=true: Only tags matching x.y.z (e.g., 3.4.11) are allowed."
+    echo "  - Otherwise: Allows x.y.z or x.y.z.suffix (e.g., 3.4.11.dev1)"
+    echo "  - Integrations: Uses latest tag matching prefect-{name}-x.x.x pattern if FORCE_RELEASE_VERSION, else allows suffixes."
+    echo "  - Falls back to dynamic version if no clean tag found (unless FORCE_RELEASE_VERSION=true)"
     echo ""
     echo "Examples:"
     echo "  $0 my-project us-central1 prefect-pypi                  # Basic usage"

@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      force_release_version:
+        description: "Require strict x.y.z release version (no suffixes)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -73,7 +78,8 @@ jobs:
             "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" \
             "${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}" \
             "${{ inputs.build_integrations }}" \
-            "${{ inputs.dry_run }}"
+            "${{ inputs.dry_run }}" \
+            "${{ inputs.force_release_version }}"
         continue-on-error: true
 
       - name: Create Python release summary
@@ -177,6 +183,7 @@ jobs:
             "${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}" \
             "${{ inputs.dry_run }}" \
             "false" \
+            "${{ inputs.force_release_version }}" \
             "${{ matrix.python-version }}"
         # No continue-on-error here: any failure will fail the job
 
