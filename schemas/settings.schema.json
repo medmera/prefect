@@ -97,6 +97,11 @@
                     ],
                     "title": "Request Timeout",
                     "type": "number"
+                },
+                "iap": {
+                    "$ref": "#/$defs/IAPSettings",
+                    "description": "Settings for interacting with the Prefect API using IAP.",
+                    "supported_environment_variables": []
                 }
             },
             "title": "APISettings",
@@ -417,6 +422,63 @@
                 }
             },
             "title": "FlowsSettings",
+            "type": "object"
+        },
+        "IAPSettings": {
+            "description": "Settings for interacting with the Prefect API using IAP",
+            "properties": {
+                "enabled": {
+                    "default": false,
+                    "description": "Whether to enable IAP authentication. If enabled, the client will use IAP to authenticate with the Prefect API.",
+                    "supported_environment_variables": [
+                        "PREFECT_API_IAP_ENABLED"
+                    ],
+                    "title": "Enabled",
+                    "type": "boolean"
+                },
+                "client_id_gcp_secret_version": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "description": "The name of the GCP secret to use for the client ID.",
+                    "supported_environment_variables": [
+                        "PREFECT_API_IAP_CLIENT_ID_GCP_SECRET_VERSION"
+                    ],
+                    "title": "Client Id Gcp Secret Version"
+                },
+                "impersonate_service_account": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "description": "The email of the service account to impersonate for the API when using the service-account mode.",
+                    "supported_environment_variables": [
+                        "PREFECT_API_IAP_IMPERSONATE_SERVICE_ACCOUNT"
+                    ],
+                    "title": "Impersonate Service Account"
+                },
+                "auth_header_name": {
+                    "default": "Authorization",
+                    "description": "The name of the HTTP header to use for IAP authentication.",
+                    "supported_environment_variables": [
+                        "PREFECT_API_IAP_AUTH_HEADER_NAME"
+                    ],
+                    "title": "Auth Header Name",
+                    "type": "string"
+                }
+            },
+            "title": "IAPSettings",
             "type": "object"
         },
         "InternalSettings": {
