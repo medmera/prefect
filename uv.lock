@@ -3817,6 +3817,10 @@ email = [
 gcp = [
     { name = "prefect-gcp" },
 ]
+gcp-iap = [
+    { name = "google-auth" },
+    { name = "google-cloud-secret-manager" },
+]
 github = [
     { name = "prefect-github" },
 ]
@@ -3940,6 +3944,8 @@ requires-dist = [
     { name = "exceptiongroup", specifier = ">=1.0.0" },
     { name = "fastapi", specifier = ">=0.111.0,<1.0.0" },
     { name = "fsspec", specifier = ">=2022.5.0" },
+    { name = "google-auth", marker = "extra == 'gcp-iap'", specifier = ">=2.40.3" },
+    { name = "google-cloud-secret-manager", marker = "extra == 'gcp-iap'", specifier = ">=2.24.0" },
     { name = "graphviz", specifier = ">=0.20.1" },
     { name = "griffe", specifier = ">=0.49.0,<2.0.0" },
     { name = "httpcore", specifier = ">=1.0.5,<2.0.0" },
@@ -4003,7 +4009,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=13.0,<16.0" },
     { name = "whenever", marker = "python_full_version >= '3.13'", specifier = ">=0.7.3,<0.9.0" },
 ]
-provides-extras = ["aws", "azure", "bitbucket", "dask", "databricks", "dbt", "docker", "email", "gcp", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
+provides-extras = ["aws", "azure", "bitbucket", "dask", "databricks", "dbt", "docker", "email", "gcp", "gcp-iap", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
 
 [package.metadata.requires-dev]
 benchmark = [

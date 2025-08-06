@@ -10,6 +10,31 @@ from prefect.settings.base import (
 )
 
 
+class IAPSettings(PrefectBaseSettings):
+    """
+    Settings for interacting with the Prefect API using IAP
+    """
+
+    model_config: ClassVar[SettingsConfigDict] = build_settings_config(("api", "iap"))
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable IAP authentication. If enabled, the client will use IAP to authenticate with the Prefect API.",
+    )
+    client_id_gcp_secret_version: Optional[str] = Field(
+        default=None,
+        description="The name of the GCP secret to use for the client ID.",
+    )
+    impersonate_service_account: Optional[str] = Field(
+        default=None,
+        description="The email of the service account to impersonate for the API when using the service-account mode.",
+    )
+    auth_header_name: str = Field(
+        default="Authorization",
+        description="The name of the HTTP header to use for IAP authentication.",
+    )
+
+
 class APISettings(PrefectBaseSettings):
     """
     Settings for interacting with the Prefect API
@@ -43,4 +68,8 @@ class APISettings(PrefectBaseSettings):
     request_timeout: float = Field(
         default=60.0,
         description="The default timeout for requests to the API",
+    )
+    iap: IAPSettings = Field(
+        default_factory=IAPSettings,
+        description="Settings for interacting with the Prefect API using IAP.",
     )

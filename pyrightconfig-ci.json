@@ -60,6 +60,7 @@
 		"src/prefect/_versioning.py",
 		"src/prefect/blocks/",
 		"src/prefect/cli/",
+		"src/prefect/client/iap_auth.py",
 		"src/prefect/deployments/",
 		"src/prefect/docker/",
 		"src/prefect/events/",
