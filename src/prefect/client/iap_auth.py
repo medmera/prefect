@@ -248,7 +248,9 @@ class IAPAuth(httpx.Auth):
             # Retry the request
             yield request
 
-    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """
         Asynchronous authentication flow for httpx.AsyncClient.
 
