@@ -139,12 +139,13 @@ jobs:
           fi
 
   release-docker-images:
-    name: Release Docker images (Python ${{ matrix.python-version }})
+    name: Docker (${{ matrix.python-version }} - ${{ matrix.image-type }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
     if: ${{ inputs.release_docker }}
     strategy:
       matrix:
+        image-type: ["", "poetry-gcloud"]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
 
@@ -184,7 +185,8 @@ jobs:
             "${{ inputs.dry_run }}" \
             "false" \
             "${{ inputs.force_release_version }}" \
-            "${{ matrix.python-version }}"
+            "${{ matrix.python-version }}" \
+            "${{ matrix.image-type }}"
         # No continue-on-error here: any failure will fail the job
 
       - name: Create Docker release summary
