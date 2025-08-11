@@ -50,3 +50,7 @@ dask-worker-space/
 # Editors
 .idea/
 .vscode/
+
+# Docker
+Dockerfile
+Dockerfile.*
