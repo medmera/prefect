@@ -153,11 +153,19 @@ RUN poetry self add keyring keyrings.google-artifactregistry-auth
 ########################################################
 
 # Install gcloud if application_default_credentials
-RUN echo "Installing gcloud for application_default_credentials" && \
-  curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz && \
-  mkdir -p /usr/local/gcloud && \
-  tar -C /usr/local/gcloud -xvf /tmp/google-cloud-sdk.tar.gz && \
-  /usr/local/gcloud/google-cloud-sdk/install.sh --quiet
+ENV GCLOUD_LITE_VERSION=529.0.0
+RUN set -eux; \
+    echo "Installing gcloud-lite for application_default_credentials"; \
+    curl -fsSL -o /tmp/gcloud-lite.tar.gz "https://github.com/tonymet/gcloud-lite/releases/download/${GCLOUD_LITE_VERSION}/google-cloud-cli-${GCLOUD_LITE_VERSION}-linux-x86_64-lite.tar.gz"; \
+    mkdir -p /usr/local/gcloud; \
+    tar -xzf /tmp/gcloud-lite.tar.gz -C /usr/local/gcloud; \
+    rm -f /tmp/gcloud-lite.tar.gz; \
+    /usr/local/gcloud/google-cloud-sdk/install.sh --quiet --path-update=true --rc-path /root/.bashrc; \
+    /usr/local/gcloud/google-cloud-sdk/bin/gcloud components remove bq --quiet; \
+    /usr/local/gcloud/google-cloud-sdk/bin/gcloud components remove gsutil --quiet; \
+    /usr/local/gcloud/google-cloud-sdk/bin/gcloud config set core/disable_usage_reporting true; \
+    /usr/local/gcloud/google-cloud-sdk/bin/gcloud config set component_manager/disable_update_check true; \
+    /usr/local/gcloud/google-cloud-sdk/bin/gcloud config set metrics/environment devshell_ci
   
 # Adding the package path to local
 ENV PATH=$PATH:/usr/local/gcloud/google-cloud-sdk/bin
