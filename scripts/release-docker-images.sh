@@ -16,7 +16,7 @@ IMAGE_TYPE="${8:-}"
 PYTHON_VERSIONS=("3.9" "3.10" "3.11" "3.12" "3.13")
 FLAVORS=("")
 IMAGES=("prefect")
-PLATFORMS="linux/amd64,linux/arm64"
+PLATFORMS="linux/amd64"
 
 # Colors for output
 RED='\033[0;31m'

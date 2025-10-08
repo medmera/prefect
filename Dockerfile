@@ -9,7 +9,7 @@ ARG BASE_IMAGE=python:${PYTHON_VERSION}-slim
 # The version used to build the Python distributable.
 ARG BUILD_PYTHON_VERSION=3.9
 # THe version used to build the UI distributable.
-ARG NODE_VERSION=18.18.0
+ARG NODE_VERSION=20.19.0
 # Any extra Python requirements to install
 ARG EXTRA_PIP_PACKAGES=""
 
@@ -97,7 +97,8 @@ RUN apt-get update && \
     apt-get install --no-install-recommends -y \
     tini=0.19.* \
     build-essential \
-    git>=1:2.47.3 \
+    git \
+    media-types \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install UV from official image - pin to specific version for build caching

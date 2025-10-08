@@ -175,8 +175,35 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.gcp_auth.outputs.auth_token }}
 
-      - name: Run Docker image release
+      - name: Run Docker image release (no push)
         id: docker_release
+        run: |
+          ./scripts/release-docker-images.sh \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" \
+            "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}" \
+            "${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}" \
+            "${{ inputs.dry_run }}" \
+            "true" \
+            "${{ inputs.force_release_version }}" \
+            "${{ matrix.python-version }}" \
+            "${{ matrix.image-type }}"
+
+      - name: Reauthenticate to Google Cloud (Workload Identity)
+        id: gcp_auth_push
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}"
+          workload_identity_provider: "${{ vars.ARTIFACT_REGISTRY_WORKLOAD_IDENTITY_PROVIDER }}"
+
+      - name: Login to GCP Artifact Registry
+        uses: docker/login-action@v2.1.0
+        with:
+          registry: "${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}-docker.pkg.dev/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}"
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth_push.outputs.auth_token }}
+
+      - name: Run Docker image release (push)
+        id: docker_release_push
         run: |
           ./scripts/release-docker-images.sh \
             "${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}" \
@@ -187,7 +214,6 @@ jobs:
             "${{ inputs.force_release_version }}" \
             "${{ matrix.python-version }}" \
             "${{ matrix.image-type }}"
-        # No continue-on-error here: any failure will fail the job
 
       - name: Create Docker release summary
         if: always()

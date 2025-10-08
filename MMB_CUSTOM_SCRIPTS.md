@@ -286,6 +286,309 @@ If the sync fails, the workflow provides:
 
 ---
 
+## Reconstruct Release Branch Script
+
+### Overview
+
+The `scripts/reconstruct-release-branch.sh` script allows you to rebuild the release branch from a specific git tag while preserving MMB-specific customizations. This is useful when you need to "clean" the release branch to match a specific upstream version and re-apply custom changes.
+
+### Purpose
+
+This script solves the problem when:
+
+1. Your release branch has accumulated many commits from upstream
+2. You want to reset to a specific upstream version (tag)
+3. You need to preserve your custom MMB-specific commits on top
+4. You want a clean, linear history from a known good state
+
+### What the Script Does
+
+The script performs these operations automatically:
+
+1. **Pre-flight Checks** - Validates repository state and tag exists
+2. **Identify Custom Commits** - Finds all MMB-specific commits to preserve
+3. **Backup Creation** - Creates a timestamped backup branch for safety
+4. **Reset to Tag** - Resets release branch to the specified tag
+5. **Cherry-pick Custom Commits** - Re-applies MMB-specific commits on top
+6. **Summary** - Shows the reconstructed branch structure
+
+### Visual Example
+
+Here's what happens to your release branch when running the script:
+
+#### Scenario:
+
+- You want to reset to upstream tag `3.4.22`
+- Your release branch has accumulated many upstream commits
+- You have 5 custom MMB commits that need to be preserved
+
+#### Before Script:
+
+```
+tag 3.4.22:      A---B---C
+                      |
+upstream commits:     |---U1---U2---U3---U4---U5
+                                           |
+release:          A---B---C---U1---U2---U3---U4---U5---M1---M2---U6---M3---M4---M5
+                  (complex history with interleaved commits)
+```
+
+#### After Script:
+
+```
+tag 3.4.22:      A---B---C
+                          |
+release:          A---B---C---M1---M2---M3---M4---M5
+                  (clean history with only tag + MMB commits)
+```
+
+#### What Happened:
+
+- **Release branch**: Reset to tag `3.4.22` commit (C)
+- **Custom commits**: M1-M5 identified and cherry-picked on top
+- **Result**: Clean release branch with only the tag base + MMB customizations
+
+### Prerequisites
+
+- Clean working tree (no uncommitted changes)
+- Origin remote configured pointing to your fork
+- Release branch exists locally
+- The target tag exists (will be fetched if needed)
+
+### Usage
+
+```bash
+# Test what the script will do (recommended first run)
+./scripts/reconstruct-release-branch.sh --dry-run 3.4.22
+
+# Actually perform the reconstruction
+./scripts/reconstruct-release-branch.sh 3.4.22
+
+# Show help and options
+./scripts/reconstruct-release-branch.sh --help
+```
+
+### Safety Features
+
+- **Automatic Backup**: Creates timestamped backup branch before any changes
+- **Pre-flight Checks**: Validates repository state and tag existence
+- **Dry Run Mode**: Preview what will happen without making changes
+- **Commit Review**: Shows all commits that will be preserved
+- **Clean Exit**: Returns to original branch when done
+- **Manual Push**: Requires explicit push command after reconstruction
+
+### Step-by-Step Process
+
+1. **Validation Phase**
+
+   - Checks you're in a git repository
+   - Verifies origin remote exists
+   - Confirms release branch exists
+   - Ensures working tree is clean
+
+2. **Discovery Phase**
+
+   - Fetches all remotes and tags
+   - Verifies the target tag exists
+   - Identifies all commits between tag and current release
+   - Displays commits for review
+
+3. **Backup Phase**
+
+   - Creates backup branch: `backup-before-reconstruct-YYYYMMDD-HHMMSS`
+   - Records current branch for restoration
+   - Pushes backup to origin (if possible)
+
+4. **Reconstruction Phase**
+
+   - Resets release branch to specified tag
+   - Cherry-picks all MMB-specific commits in order
+   - Handles any conflicts (requires manual resolution)
+
+5. **Completion**
+   - Shows reconstructed branch structure
+   - Provides next steps for pushing
+   - Reports success summary
+
+### Error Handling
+
+The script handles common scenarios:
+
+- **Dirty Working Tree**: Exits with clear message to commit or stash changes
+- **Missing Tag**: Shows available tags matching pattern
+- **No Commits to Preserve**: Warns and exits (nothing to reconstruct)
+- **Cherry-pick Conflicts**: Provides commands for manual conflict resolution
+
+### Configuration
+
+The script uses these default values (editable at the top of the script):
+
+```bash
+UPSTREAM_REMOTE="upstream"  # Optional, not required
+ORIGIN_REMOTE="origin"
+MAIN_BRANCH="main"
+RELEASE_BRANCH="release"
+```
+
+### Recovery
+
+If something goes wrong, you can restore from the backup:
+
+```bash
+# List backup branches
+git branch | grep backup-before-reconstruct
+
+# Restore from a specific backup
+git checkout backup-before-reconstruct-20241007-153022
+
+# Force reset release branch to backup (if needed)
+git branch -f release backup-before-reconstruct-20241007-153022
+git push origin release --force
+```
+
+### When to Use
+
+Run this script when:
+
+- You want to reset release branch to a specific upstream version
+- Your release branch has become complex with many upstream commits
+- You need a clean, linear history from a known good state
+- You're troubleshooting issues and want to start from a clean base
+- You want to ensure only MMB-specific customizations remain
+
+### Example Workflow
+
+```bash
+# 1. Check what will happen (dry run)
+./scripts/reconstruct-release-branch.sh --dry-run 3.4.22
+
+# 2. Review the commits that will be preserved
+# (shown in dry run output)
+
+# 3. Perform the reconstruction
+./scripts/reconstruct-release-branch.sh 3.4.22
+
+# 4. Verify the result
+git log --oneline 3.4.22..release
+
+# 5. Push to origin if satisfied
+git push origin release --force
+```
+
+### GitHub Workflow Integration
+
+#### Automated Reconstruction Workflow
+
+The reconstruction process has been automated with a GitHub workflow located at `.github/workflows/mmb-reconstruct-release-branch.yaml`.
+
+#### Triggering the Workflow
+
+The workflow can be triggered manually from the GitHub UI:
+
+1. Go to the **Actions** tab in your GitHub repository
+2. Select **"MMB - Reconstruct Release Branch"** from the workflow list
+3. Click **"Run workflow"**
+4. Choose your options:
+   - **base_tag**: Git tag to use as base (e.g., `3.4.22`)
+   - **Dry run**: Preview what will happen without making changes
+   - **Automatically force push**: Auto-push the reconstructed branch to origin
+5. Click **"Run workflow"** to start
+
+#### Workflow Features
+
+- **Manual Trigger**: Uses `workflow_dispatch` for on-demand execution
+- **Tag Validation**: Verifies the tag exists before reconstruction
+- **Dry Run Mode**: Preview changes before executing
+- **Optional Auto-Push**: Choose whether to automatically push changes
+- **Automatic Authentication**: Handles Git authentication via GitHub token
+- **Comprehensive Reporting**: Provides detailed summary with commit lists
+- **Error Handling**: Clear guidance when manual intervention is needed
+
+#### Workflow Inputs
+
+| Input        | Description                                    | Type    | Required | Default |
+| ------------ | ---------------------------------------------- | ------- | -------- | ------- |
+| `base_tag`   | Git tag to use as base (e.g., 3.4.22)          | string  | Yes      | -       |
+| `dry_run`    | Perform a dry run without making changes       | boolean | No       | false   |
+| `force_push` | Automatically force push the reconstructed branch | boolean | No       | false   |
+
+#### What the Workflow Does
+
+1. **Setup Phase**
+
+   - Checks out the repository with full history
+   - Configures Git with bot credentials
+   - Validates that the target tag exists
+   - Makes the reconstruct script executable
+
+2. **Reconstruction Phase** (if not dry run)
+
+   - Runs the `reconstruct-release-branch.sh` script with specified tag
+   - Handles authentication for pushing changes (if auto-push enabled)
+   - Captures any errors for reporting
+
+3. **Push Phase** (if auto-push enabled)
+
+   - Force pushes the reconstructed branch to origin
+   - Uses authentication token for secure push
+
+4. **Reporting Phase**
+   - Creates detailed summary of changes
+   - Shows reconstructed branch structure
+   - Lists commits that were preserved
+   - Provides next steps if manual push needed
+   - Shows base tag details
+
+#### Workflow Outputs
+
+The workflow creates a detailed job summary showing:
+
+- ✅ Reconstruction status
+- 🏷️ Base tag used
+- 🔧 Commits preserved from original release
+- 📝 New branch structure
+- 📋 Next steps (if manual push needed)
+- 🎯 Base tag commit details
+
+#### Security Considerations
+
+- Uses `PREFECT_REPO_PAT` secret or `GITHUB_TOKEN` for authentication
+- Requires `contents: write` permission
+- Safe force-pushing with proper authentication
+- Creates backup branches before any destructive operations
+
+### Local vs Workflow Execution
+
+| Aspect                  | Local Execution        | GitHub Workflow              |
+| ----------------------- | ---------------------- | ---------------------------- |
+| **Trigger**             | Manual command         | GitHub UI button             |
+| **Environment**         | Your machine           | GitHub Actions runner        |
+| **Authentication**      | Your Git credentials   | GitHub token or PAT          |
+| **Feedback**            | Terminal output        | GitHub UI summary            |
+| **Backup**              | Local backup branches  | Same backup branches         |
+| **Conflict Resolution** | Interactive            | Requires manual local fix    |
+| **Push Control**        | Always manual          | Optional automatic or manual |
+
+### When to Use Each Method
+
+**Use Local Execution When:**
+
+- You want immediate feedback and control
+- You expect cherry-pick conflicts that need resolution
+- You're testing or developing the script
+- You need to inspect changes before pushing
+- You want to experiment with different tags
+
+**Use GitHub Workflow When:**
+
+- You want a clean, audited process
+- Multiple team members need to trigger reconstructions
+- You want automated reporting and summaries
+- You're confident in the tag and auto-push is acceptable
+- You want the reconstruction documented in Actions history
+
+---
+
 ## Release Scripts
 
 ### Overview

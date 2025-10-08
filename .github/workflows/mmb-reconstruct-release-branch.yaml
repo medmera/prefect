@@ -1,0 +1,153 @@
+name: MMB - Reconstruct Release Branch
+
+on:
+    # Allow manual triggering
+    workflow_dispatch:
+        inputs:
+            base_tag:
+                description: "Git tag to use as base (e.g., 3.4.22)"
+                required: true
+                type: string
+            dry_run:
+                description: "Perform a dry run without making changes"
+                required: false
+                default: false
+                type: boolean
+            force_push:
+                description: "Automatically force push the reconstructed branch"
+                required: false
+                default: false
+                type: boolean
+
+jobs:
+    reconstruct-release-branch:
+        runs-on: ubuntu-latest
+
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  # Fetch full history for reconstruction
+                  fetch-depth: 0
+                  # Use a token that can push to protected branches
+                  token: ${{ secrets.PREFECT_REPO_PAT || github.token }}
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name "github-actions[bot]"
+                  git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+            - name: Set up upstream remote (optional)
+              run: |
+                  # Add upstream remote if it exists (not required for reconstruction)
+                  if ! git remote | grep -q "^upstream$"; then
+                    echo "No upstream remote configured (not required for this operation)"
+                  fi
+                  # Verify remotes
+                  git remote -v
+
+            - name: Validate tag
+              run: |
+                  echo "Validating that tag '${{ inputs.base_tag }}' exists..."
+                  git fetch --all --tags
+                  if ! git rev-parse "${{ inputs.base_tag }}" >/dev/null 2>&1; then
+                    echo "❌ Error: Tag '${{ inputs.base_tag }}' not found!"
+                    echo ""
+                    echo "Available tags matching pattern:"
+                    git tag -l "${{ inputs.base_tag }}*" | head -10
+                    exit 1
+                  fi
+                  echo "✅ Tag '${{ inputs.base_tag }}' exists"
+                  git log -1 --oneline "${{ inputs.base_tag }}"
+
+            - name: Run reconstruction (dry run)
+              if: inputs.dry_run == true
+              run: |
+                  echo "Running dry run..."
+                  ./scripts/reconstruct-release-branch.sh --dry-run "${{ inputs.base_tag }}"
+
+            - name: Run actual reconstruction
+              if: inputs.dry_run == false
+              run: |
+                  echo "Running actual reconstruction..."
+                  ./scripts/reconstruct-release-branch.sh "${{ inputs.base_tag }}"
+
+            - name: Push reconstructed branch
+              if: inputs.dry_run == false && inputs.force_push == true
+              run: |
+                  echo "Force pushing reconstructed release branch..."
+                  git push origin release --force
+              env:
+                  GITHUB_TOKEN: ${{ secrets.PREFECT_REPO_PAT || github.token }}
+
+            - name: Create summary
+              if: always()
+              run: |
+                  echo "## 🔨 Reconstruct Release Branch Summary" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+                  echo "- Base tag: \`${{ inputs.base_tag }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+                  echo "- Auto push: ${{ inputs.force_push }}" >> $GITHUB_STEP_SUMMARY
+                  echo "- Status: **${{ job.status }}**" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+
+                  if [[ "${{ job.status }}" == "success" ]]; then
+                    if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+                      echo "### ✅ Dry Run Completed" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "No changes were made. Review the logs above to see what would happen." >> $GITHUB_STEP_SUMMARY
+                    else
+                      echo "### ✅ Reconstruction Completed" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      
+                      # Show current branch state
+                      echo "**Current branch structure:**" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                      git log --oneline -10 release >> $GITHUB_STEP_SUMMARY || echo "Could not fetch release branch commits" >> $GITHUB_STEP_SUMMARY
+                      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      
+                      # Show commits preserved
+                      echo "**Commits preserved from original release branch:**" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                      git log --oneline "${{ inputs.base_tag }}..release" >> $GITHUB_STEP_SUMMARY || echo "No commits beyond base tag" >> $GITHUB_STEP_SUMMARY
+                      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      
+                      if [[ "${{ inputs.force_push }}" == "true" ]]; then
+                        echo "**✅ Changes pushed to origin**" >> $GITHUB_STEP_SUMMARY
+                        echo "" >> $GITHUB_STEP_SUMMARY
+                        echo "The reconstructed release branch has been pushed to origin." >> $GITHUB_STEP_SUMMARY
+                      else
+                        echo "**📋 Next Steps**" >> $GITHUB_STEP_SUMMARY
+                        echo "" >> $GITHUB_STEP_SUMMARY
+                        echo "The release branch has been reconstructed locally but not pushed." >> $GITHUB_STEP_SUMMARY
+                        echo "" >> $GITHUB_STEP_SUMMARY
+                        echo "To push the changes, run:" >> $GITHUB_STEP_SUMMARY
+                        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+                        echo "git push origin release --force" >> $GITHUB_STEP_SUMMARY
+                        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                        echo "" >> $GITHUB_STEP_SUMMARY
+                        echo "Or re-run this workflow with 'Automatically force push' enabled." >> $GITHUB_STEP_SUMMARY
+                      fi
+                    fi
+                  else
+                    echo "### ❌ Reconstruction Failed" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "Check the job logs above for detailed error information." >> $GITHUB_STEP_SUMMARY
+                  fi
+
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "---" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Base tag details:**" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                  git log -1 "${{ inputs.base_tag }}" 2>/dev/null | head -10 >> $GITHUB_STEP_SUMMARY || echo "Could not fetch tag details" >> $GITHUB_STEP_SUMMARY
+                  echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
