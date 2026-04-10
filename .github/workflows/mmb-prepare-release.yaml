@@ -89,6 +89,10 @@ jobs:
           BASE_TAG: ${{ inputs.base_tag }}
           PREP_BRANCH: ${{ steps.prepare.outputs.prep_branch }}
         run: |
+          gh label create needs-conflict-resolution \
+            --color E11D48 \
+            --description "Merge conflicts must be resolved before this PR can be merged" \
+            --force
           gh pr create \
             --base release \
             --head "$PREP_BRANCH" \
