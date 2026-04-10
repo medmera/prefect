@@ -507,22 +507,44 @@ upload_packages() {
     fi
 }
 
-# Get latest tag for prefect core (x.x.x or x.x.x.anything or x.x.xanything format) by creation date
+# Get the nearest ancestor tag for prefect core (x.x.x format).
+# Uses git describe to find the tag that is actually an ancestor of the current
+# commit, so the version matches the code in the working tree.
 get_prefect_tag_version() {
+    local tag
     if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1
+        # Strict x.y.z only — no pre-release suffixes
+        tag=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 HEAD 2>/dev/null) || true
+        if [[ -n "$tag" ]] && echo "$tag" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
+            echo "$tag"
+        fi
     else
-        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
+        tag=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 HEAD 2>/dev/null) || true
+        if [[ -n "$tag" ]] && echo "$tag" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$"; then
+            echo "$tag"
+        fi
     fi
 }
 
-# Get latest tag for integration package (prefect-{name}-x.x.x or prefect-{name}-x.x.x.anything format) by creation date
+# Get the nearest ancestor tag for an integration package (prefect-{name}-x.x.x format).
+# Uses git describe to find the tag that is actually an ancestor of the current
+# commit, so the version matches the code in the working tree.
 get_integration_tag_version() {
     local package_name="$1"
+    local tag
+    tag=$(git describe --tags --match "${package_name}-*" --abbrev=0 HEAD 2>/dev/null) || true
+    if [[ -z "$tag" ]]; then
+        return 0
+    fi
+    local version="${tag#${package_name}-}"
     if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-        git tag --list --sort=-creatordate | grep -E "^${package_name}-[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1 | sed "s/^${package_name}-//"
+        if echo "$version" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
+            echo "$version"
+        fi
     else
-        git tag --list --sort=-creatordate | grep -E "^${package_name}-[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1 | sed "s/^${package_name}-//"
+        if echo "$version" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$"; then
+            echo "$version"
+        fi
     fi
 }
 
