@@ -59,20 +59,16 @@ jobs:
           BASE_TAG: ${{ inputs.base_tag }}
           PREP_BRANCH: ${{ steps.prepare.outputs.prep_branch }}
         run: |
-          gh pr create \
-            --base release \
-            --head "$PREP_BRANCH" \
-            --title "chore: merge upstream ${BASE_TAG} into release" \
-            --body "$(cat <<'PREOF'
-          ## Merge upstream ${{ inputs.base_tag }} into release
+          cat > /tmp/pr-body.md << 'PREOF'
+          ## Merge upstream UPSTREAM_TAG into release
 
           This PR was created automatically by the **MMB - Prepare Release** workflow.
 
-          **Base tag:** \`${{ inputs.base_tag }}\`
+          **Base tag:** \`UPSTREAM_TAG\`
           **Merge result:** Clean — no conflicts
 
           ### What this does
-          Merges the upstream Prefect \`${{ inputs.base_tag }}\` tag into the \`release\`
+          Merges the upstream Prefect \`UPSTREAM_TAG\` tag into the \`release\`
           branch, bringing in all upstream changes while preserving MMB customisations.
 
           ### Review checklist
@@ -80,7 +76,12 @@ jobs:
           - [ ] Verify integration package code is at the expected version
           - [ ] Merge when satisfied — then run **MMB - Release Packages** to publish
           PREOF
-          )"
+          sed -i "s|UPSTREAM_TAG|${BASE_TAG}|g" /tmp/pr-body.md
+          gh pr create \
+            --base release \
+            --head "$PREP_BRANCH" \
+            --title "chore: merge upstream ${BASE_TAG} into release" \
+            --body-file /tmp/pr-body.md
 
       - name: Create pull request (conflicts present)
         if: inputs.dry_run == false && steps.prepare.outputs.conflicts == 'true'
@@ -89,21 +90,12 @@ jobs:
           BASE_TAG: ${{ inputs.base_tag }}
           PREP_BRANCH: ${{ steps.prepare.outputs.prep_branch }}
         run: |
-          gh label create needs-conflict-resolution \
-            --color E11D48 \
-            --description "Merge conflicts must be resolved before this PR can be merged" \
-            --force
-          gh pr create \
-            --base release \
-            --head "$PREP_BRANCH" \
-            --title "chore: merge upstream ${BASE_TAG} into release [CONFLICTS]" \
-            --label "needs-conflict-resolution" \
-            --body "$(cat <<'PREOF'
-          ## Merge upstream ${{ inputs.base_tag }} into release
+          cat > /tmp/pr-body.md << 'PREOF'
+          ## Merge upstream UPSTREAM_TAG into release
 
           This PR was created automatically by the **MMB - Prepare Release** workflow.
 
-          **Base tag:** \`${{ inputs.base_tag }}\`
+          **Base tag:** \`UPSTREAM_TAG\`
           **Merge result:** ⚠️ Conflicts detected — resolution required before merging
 
           ### How to resolve conflicts
@@ -111,14 +103,14 @@ jobs:
           1. Check out the prep branch locally:
              ```bash
              git fetch origin
-             git checkout release-prep/${{ inputs.base_tag }}
+             git checkout release-prep/UPSTREAM_TAG
              ```
-          2. Open the files with conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`),
+          2. Open the files with conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`),
              resolve each conflict, then stage and commit:
              ```bash
              git add <resolved-files>
              git commit --amend --no-edit   # or a new commit
-             git push origin release-prep/${{ inputs.base_tag }}
+             git push origin release-prep/UPSTREAM_TAG
              ```
           3. Once all conflicts are resolved and the PR is green, merge it.
 
@@ -126,7 +118,12 @@ jobs:
           Run **MMB - Release Packages** to build and publish Python packages and
           Docker images from the updated \`release\` branch.
           PREOF
-          )"
+          sed -i "s|UPSTREAM_TAG|${BASE_TAG}|g" /tmp/pr-body.md
+          gh pr create \
+            --base release \
+            --head "$PREP_BRANCH" \
+            --title "chore: merge upstream ${BASE_TAG} into release [CONFLICTS]" \
+            --body-file /tmp/pr-body.md
 
       - name: Summary
         if: always()
