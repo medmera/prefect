@@ -1,0 +1,76 @@
+name: MMB - Sync Main & Tags
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Perform a dry run without making changes"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PREFECT_REPO_PAT }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up upstream remote
+        run: |
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/PrefectHQ/prefect.git
+          fi
+          git remote -v
+
+      - name: Fetch upstream main and all tags
+        run: git fetch upstream main --tags
+
+      - name: Sync main (dry run)
+        if: inputs.dry_run == true
+        run: |
+          echo "DRY RUN - no changes will be made"
+          echo ""
+          echo "Current fork main: $(git rev-parse --short origin/main)"
+          echo "Upstream main:     $(git rev-parse --short upstream/main)"
+          echo ""
+          echo "Commits behind upstream:"
+          git log --oneline origin/main..upstream/main | head -20 || echo "  (none - already up to date)"
+          echo ""
+          echo "Tags that would be pushed to origin:"
+          git tag --list | sort -V | tail -10
+
+      - name: Fast-forward main and push tags
+        if: inputs.dry_run == false
+        run: |
+          git push origin upstream/main:refs/heads/main
+          git push origin --tags
+
+      - name: Create summary
+        if: always()
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "## MMB - Sync Main & Tags" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: **${JOB_STATUS}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Current main HEAD:**" >> $GITHUB_STEP_SUMMARY
+          git log -1 --oneline origin/main 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "n/a" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Latest tags on origin (top 5):**" >> $GITHUB_STEP_SUMMARY
+          git ls-remote --tags origin | grep -v '\^{}' | awk '{print $2}' | sed 's|refs/tags/||' | sort -V | tail -5 | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || echo "- (none)" >> $GITHUB_STEP_SUMMARY
