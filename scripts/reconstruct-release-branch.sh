@@ -122,14 +122,14 @@ identify_mmb_commits() {
     local base_tag=$1
     local current_release=$2
     
-    print_step "Identifying MMB-specific commits between ${base_tag} and ${current_release}..."
+    print_step "Identifying MMB-specific commits between ${base_tag} and ${current_release}..." >&2
     
     # Get commits that are on release but not on the tag
     local commits=$(git rev-list --reverse "${base_tag}..${current_release}" 2>/dev/null || echo "")
     
     if [ -z "$commits" ]; then
-        print_warning "No commits found between ${base_tag} and ${current_release}"
-        echo ""
+        print_warning "No commits found between ${base_tag} and ${current_release}" >&2
+        echo "" >&2
         return 1
     fi
     
