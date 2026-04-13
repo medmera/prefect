@@ -50,7 +50,8 @@ Options:
 
 The script:
   1. Fetches all remotes and tags
-  2. Creates release-prep/<tag> from origin/release
+  2. Creates release-prep/<tag> from origin/release, or resets an existing
+     remote prep branch to match release (safe to rerun after a failed PR step)
   3. Merges <tag> into that branch
   4. If conflicts: commits conflict markers and sets CONFLICTS output
   5. Pushes the branch (unless --dry-run)
@@ -141,7 +142,11 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     print_step "DRY RUN — no changes will be made"
     echo ""
-    echo "Would create branch: ${PREP_BRANCH}"
+    if git ls-remote --exit-code "$ORIGIN_REMOTE" "refs/heads/${PREP_BRANCH}" >/dev/null 2>&1; then
+        echo "Would reset existing branch: ${PREP_BRANCH}"
+    else
+        echo "Would create branch: ${PREP_BRANCH}"
+    fi
     echo "  from: ${ORIGIN_REMOTE}/${RELEASE_BRANCH} (${RELEASE_COMMIT:0:10})"
     echo "  merge: ${BASE_TAG} (${TAG_COMMIT:0:10})"
     echo ""
@@ -153,19 +158,22 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
-# ── Check prep branch doesn't already exist ────────────────────────────────────
+# ── Prep branch: create or reset from release ────────────────────────────────
 
+PREP_BRANCH_EXISTS_ON_ORIGIN=false
 if git ls-remote --exit-code "$ORIGIN_REMOTE" "refs/heads/${PREP_BRANCH}" >/dev/null 2>&1; then
-    print_error "Branch '${PREP_BRANCH}' already exists on origin."
-    print_error "Delete it first with: git push origin --delete ${PREP_BRANCH}"
-    exit 1
+    PREP_BRANCH_EXISTS_ON_ORIGIN=true
+    print_step "Branch '${PREP_BRANCH}' already exists on ${ORIGIN_REMOTE}; resetting from ${ORIGIN_REMOTE}/${RELEASE_BRANCH} and re-merging ${BASE_TAG} (retry / idempotent run)."
+else
+    print_step "Creating ${PREP_BRANCH} from ${ORIGIN_REMOTE}/${RELEASE_BRANCH}..."
 fi
 
-# ── Create prep branch and merge ──────────────────────────────────────────────
-
-print_step "Creating ${PREP_BRANCH} from ${ORIGIN_REMOTE}/${RELEASE_BRANCH}..."
-git checkout -b "${PREP_BRANCH}" "${ORIGIN_REMOTE}/${RELEASE_BRANCH}"
-print_success "Branch created"
+git checkout -B "${PREP_BRANCH}" "${ORIGIN_REMOTE}/${RELEASE_BRANCH}"
+if [[ "$PREP_BRANCH_EXISTS_ON_ORIGIN" == "true" ]]; then
+    print_success "Branch reset to match ${ORIGIN_REMOTE}/${RELEASE_BRANCH}"
+else
+    print_success "Branch created"
+fi
 
 echo ""
 print_step "Merging ${BASE_TAG} into ${PREP_BRANCH}..."
@@ -198,7 +206,11 @@ fi
 
 echo ""
 print_step "Pushing ${PREP_BRANCH} to ${ORIGIN_REMOTE}..."
-git push "${ORIGIN_REMOTE}" "${PREP_BRANCH}"
+if [[ "$PREP_BRANCH_EXISTS_ON_ORIGIN" == "true" ]]; then
+    git push --force-with-lease "${ORIGIN_REMOTE}" "${PREP_BRANCH}"
+else
+    git push "${ORIGIN_REMOTE}" "${PREP_BRANCH}"
+fi
 print_success "Branch pushed: ${ORIGIN_REMOTE}/${PREP_BRANCH}"
 
 # ── Output for workflow consumption ───────────────────────────────────────────
