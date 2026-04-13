@@ -7,11 +7,6 @@ ARG PYTHON_VERSION=3.10
 # Any image tag can be used, but it must have apt and pip.
 ARG BASE_IMAGE=python:${PYTHON_VERSION}-slim
 # The version used to build the Python distributable.
-<<<<<<< HEAD
-ARG BUILD_PYTHON_VERSION=3.9
-# THe version used to build the UI distributable.
-ARG NODE_VERSION=20.19.0
-=======
 ARG BUILD_PYTHON_VERSION=3.10
 # The version used to build the V1 UI distributable.
 ARG NODE_VERSION=20.19.0
@@ -20,7 +15,6 @@ ARG NODE_V2_VERSION=22.12.0
 # SQLite version — must match the tag published to prefecthq/prefect-sqlite on DockerHub
 # See Dockerfile.sqlite-builder and .github/workflows/sqlite-builder.yaml
 ARG SQLITE_VERSION=3.50.4
->>>>>>> 3.6.26
 # Any extra Python requirements to install
 ARG EXTRA_PIP_PACKAGES=""
 
@@ -160,11 +154,8 @@ RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
     apt-get install --no-install-recommends -y \
     tini=0.19.* \
     build-essential \
-<<<<<<< HEAD
     git \
     media-types \
-=======
->>>>>>> 3.6.26
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install git - for Bookworm, we need to use Trixie sources since git >= 2.47.3 is required

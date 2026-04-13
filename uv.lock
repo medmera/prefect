@@ -4367,11 +4367,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=15.0.1,<17.0" },
     { name = "whenever", marker = "python_full_version >= '3.13'", specifier = ">=0.7.3,<0.11.0" },
 ]
-<<<<<<< HEAD
-provides-extras = ["aws", "azure", "bitbucket", "dask", "databricks", "dbt", "docker", "email", "gcp", "gcp-iap", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
-=======
-provides-extras = ["aws", "azure", "bitbucket", "buildx", "bundles", "dask", "databricks", "dbt", "docker", "email", "gcp", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
->>>>>>> 3.6.26
+provides-extras = ["aws", "azure", "bitbucket", "buildx", "bundles", "dask", "databricks", "dbt", "docker", "email", "gcp", "gcp-iap", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
 
 [package.metadata.requires-dev]
 benchmark = [
