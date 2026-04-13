@@ -151,14 +151,14 @@ jobs:
       - name: Display current test matrix
         run: echo '${{ toJSON(matrix) }}'
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
           fetch-depth: 0
           filter: blob:none
 
-      - name: Set up uv and Python ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        name: Set up uv and Python ${{ matrix.python-version }}
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -194,12 +194,12 @@ jobs:
     name: Verify test selection coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        name: Set up uv
         with:
           python-version: ${{ env.MMB_PYTHON_VERSION }}
 
@@ -256,17 +256,17 @@ jobs:
       - name: Display current test matrix
         run: echo '${{ toJSON(matrix) }}'
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
           fetch-depth: 0
           filter: blob:none
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
 
-      - name: Set up uv and Python ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        name: Set up uv and Python ${{ matrix.python-version }}
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -285,7 +285,7 @@ jobs:
           echo "NODE_VERSION=$(cat .nvmrc)" >> $GITHUB_OUTPUT
 
       - name: Build test image (local load, no registry)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
         env:
           DOCKER_BUILD_SUMMARY: false
           DOCKER_RECORD_UPLOAD: false
@@ -347,14 +347,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
           fetch-depth: 0
           filter: blob:none
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        name: Set up uv
         with:
           enable-cache: true
           python-version: ${{ env.MMB_PYTHON_VERSION }}

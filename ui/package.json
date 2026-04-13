@@ -23,7 +23,8 @@
     "vue-router": "4.5.0"
   },
   "overrides": {
-    "lodash": "4.18.1"
+    "lodash": "4.18.1",
+    "dompurify@<=3.3.2": "3.3.2"
   },
   "devDependencies": {
     "@prefecthq/eslint-config": "1.0.32",
