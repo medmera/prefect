@@ -84,6 +84,8 @@ dependencies = [
     "pluggy>=1.6.0",
     "pydocket>=0.17.7",
     "fakeredis<2.35.0",
+    "google-cloud-storage>=3.10.1",
+    "referencing>=0.37.0",
 ]
 [project.urls]
 Changelog = "https://github.com/PrefectHQ/prefect/releases"
