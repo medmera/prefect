@@ -85,12 +85,13 @@ class CoreFlowPolicy(FlowRunOrchestrationPolicy):
                 ]
             ],
             [
+                PreserveDeploymentConcurrencyLeaseId,
                 PreventDuplicateTransitions,
                 HandleFlowTerminalStateTransitions,
                 EnforceCancellingToCancelledTransition,
                 BypassCancellingFlowRunsWithNoInfra,
                 PreventPendingTransitions,
-                CopyDeploymentConcurrencyLeaseID,
+                ValidateDeploymentConcurrencyAtRunning,
                 SecureFlowConcurrencySlots,
                 RemoveDeploymentConcurrencyLeaseForOldClientVersions,
                 EnsureOnlyScheduledFlowsMarkedLate,
@@ -241,6 +242,7 @@ class MarkLateRunsPolicy(FlowRunOrchestrationPolicy):
     ]:
         return [
             EnsureOnlyScheduledFlowsMarkedLate,
+            EnforceDeploymentConcurrencyOnLate,
             InstrumentFlowRunStateTransitions,
         ]
 
@@ -346,9 +348,23 @@ class SecureTaskConcurrencySlots(TaskRunOrchestrationRule):
                     )
                     if not acquired:
                         await session.rollback()
-                        # Slots not available, delay transition
+                        # Use avg_slot_occupancy_seconds from the most
+                        # contended limit, capped at the configured max, to
+                        # avoid fixed-delay batching where all waiting tasks
+                        # wake up simultaneously.
+                        max_wait = (
+                            settings.server.tasks.tag_concurrency_slot_wait_seconds
+                        )
+                        blocking_limit = max(
+                            active_v2_limits,
+                            key=lambda lim: lim.active_slots / lim.limit,
+                        )
+                        average_interval = min(
+                            blocking_limit.avg_slot_occupancy_seconds or max_wait,
+                            max_wait,
+                        )
                         delay_seconds = clamped_poisson_interval(
-                            average_interval=settings.server.tasks.tag_concurrency_slot_wait_seconds,
+                            average_interval=average_interval,
                         )
                         await self.delay_transition(
                             delay_seconds=round(delay_seconds),
@@ -587,14 +603,27 @@ class SecureFlowConcurrencySlots(FlowRunOrchestrationRule):
         if acquired:
             lease_storage = get_concurrency_lease_storage()
             settings = get_current_settings()
+
+            concurrency_options = deployment.concurrency_options
+            grace_period = None
+            if concurrency_options is not None:
+                if isinstance(concurrency_options, dict):
+                    concurrency_options = core.ConcurrencyOptions.model_validate(
+                        concurrency_options
+                    )
+                grace_period = concurrency_options.grace_period_seconds
+            # Fall back to server setting if grace_period_seconds is not explicitly set
+            if grace_period is None:
+                grace_period = (
+                    settings.server.concurrency.initial_deployment_lease_duration
+                )
+
             lease = await lease_storage.create_lease(
                 resource_ids=[deployment.concurrency_limit_id],
                 metadata=ConcurrencyLimitLeaseMetadata(
                     slots=1,
                 ),
-                ttl=datetime.timedelta(
-                    seconds=settings.server.concurrency.initial_deployment_lease_duration
-                ),
+                ttl=datetime.timedelta(seconds=grace_period),
             )
             proposed_state.state_details.deployment_concurrency_lease_id = lease.id
 
@@ -670,9 +699,13 @@ class SecureFlowConcurrencySlots(FlowRunOrchestrationRule):
             logger.error(f"Error releasing concurrency slots on cleanup: {e}")
 
 
-class CopyDeploymentConcurrencyLeaseID(FlowRunOrchestrationRule):
+class ValidateDeploymentConcurrencyAtRunning(FlowRunOrchestrationRule):
     """
-    Copies the deployment concurrency lease ID to the proposed state.
+    Validates and renews deployment concurrency leases at the PENDING→RUNNING transition.
+
+    This prevents concurrency violations that occur when the lease reaper reclaims slots
+    from PENDING flows. Without this validation, a flow can lose its slot while provisioning
+    infrastructure and still transition to RUNNING, violating the concurrency limit.
     """
 
     FROM_STATES = {states.StateType.PENDING}
@@ -687,10 +720,110 @@ class CopyDeploymentConcurrencyLeaseID(FlowRunOrchestrationRule):
         if initial_state is None or proposed_state is None:
             return
 
-        if not proposed_state.state_details.deployment_concurrency_lease_id:
-            proposed_state.state_details.deployment_concurrency_lease_id = (
-                initial_state.state_details.deployment_concurrency_lease_id
-            )
+        # Copy lease ID to proposed state to maintain it through the transition
+        lease_id = initial_state.state_details.deployment_concurrency_lease_id
+        proposed_state.state_details.deployment_concurrency_lease_id = lease_id
+
+        if not lease_id:
+            return
+
+        # Only validate leases for clients that can maintain them (3.4.11+)
+        # Older clients don't renew leases, so validating would cause false failures
+        client_version = context.client_version or Version("2.0.0")
+        if isinstance(client_version, str):
+            client_version = Version(client_version)
+        if client_version < MIN_CLIENT_VERSION_FOR_CONCURRENCY_LIMIT_LEASING:
+            return
+
+        # Need deployment context to validate and potentially re-acquire slots
+        if (
+            not context.session
+            or not isinstance(context, FlowOrchestrationContext)
+            or not context.run.deployment_id
+        ):
+            return
+
+        deployment = await deployments.read_deployment(
+            session=context.session,
+            deployment_id=context.run.deployment_id,
+        )
+
+        if not deployment or not deployment.global_concurrency_limit:
+            return
+
+        concurrency_options = deployment.concurrency_options
+        if concurrency_options is not None:
+            if isinstance(concurrency_options, dict):
+                concurrency_options = core.ConcurrencyOptions.model_validate(
+                    concurrency_options
+                )
+            grace_period = concurrency_options.grace_period_seconds
+        else:
+            grace_period = None
+
+        # Fall back to server setting if grace_period_seconds is not explicitly set
+        if grace_period is None:
+            settings = get_current_settings()
+            grace_period = settings.server.concurrency.initial_deployment_lease_duration
+
+        # Attempt atomic renewal to prevent race conditions where the lease
+        # exists but hasn't expired yet
+        lease_storage = get_concurrency_lease_storage()
+        renewed = await lease_storage.renew_lease(
+            lease_id=lease_id,
+            ttl=datetime.timedelta(seconds=grace_period),
+        )
+
+        if renewed:
+            return
+
+        # Lease was reaped - attempt re-acquisition for resilience. If no other
+        # flows need the slot, allow this flow to continue rather than failing it
+        slots_acquired = await concurrency_limits_v2.bulk_increment_active_slots(
+            session=context.session,
+            concurrency_limit_ids=[deployment.concurrency_limit_id],
+            slots=1,
+        )
+
+        if slots_acquired:
+            # Slot available - create new lease and continue. This provides
+            # resilience when a flow's lease expires but no other flows are competing
+            await (
+                context.session.flush()
+            )  # Ensure DB update is visible before creating lease
+            try:
+                new_lease = await lease_storage.create_lease(
+                    resource_ids=[deployment.concurrency_limit_id],
+                    ttl=datetime.timedelta(seconds=grace_period),
+                    metadata=ConcurrencyLimitLeaseMetadata(
+                        slots=1,
+                        holder=ConcurrencyLeaseHolder(
+                            type="flow_run", id=str(context.run.id)
+                        ),
+                    ),
+                )
+                proposed_state.state_details.deployment_concurrency_lease_id = (
+                    new_lease.id
+                )
+                return
+            except Exception:
+                # Lease creation failed - release the slot we acquired
+                await concurrency_limits_v2.bulk_decrement_active_slots(
+                    session=context.session,
+                    concurrency_limit_ids=[deployment.concurrency_limit_id],
+                    slots=1,
+                )
+                raise
+
+        # No slots available. Must cancel because infrastructure is already
+        # provisioned and we cannot reschedule at this point
+        await self.reject_transition(
+            state=states.Cancelled(
+                message="Deployment concurrency slot lost during provisioning - "
+                "no slots available to continue execution"
+            ),
+            reason="Deployment concurrency limit reached after lease expiry.",
+        )
 
 
 class RemoveDeploymentConcurrencyLeaseForOldClientVersions(FlowRunOrchestrationRule):
@@ -1539,6 +1672,27 @@ class PreventPendingTransitions(GenericOrchestrationRule):
         if initial_state is None or proposed_state is None:
             return
 
+        # Allow PENDING→PENDING transitions when the state name changes and
+        # the proposed state is not the default "Pending" name. This enables
+        # progression through named sub-states (e.g. Pending → Submitting →
+        # InfrastructurePending) while still blocking a second worker from
+        # re-proposing Pending after the run has already advanced.
+        if (
+            initial_state.type == StateType.PENDING
+            and proposed_state.type == StateType.PENDING
+            and initial_state.name != proposed_state.name
+            and proposed_state.name != "Pending"
+        ):
+            # Carry forward state_details that were set by earlier
+            # orchestration rules on the initial PENDING state.
+            proposed_state.state_details.scheduled_time = (
+                initial_state.state_details.scheduled_time
+            )
+            proposed_state.state_details.deployment_concurrency_lease_id = (
+                initial_state.state_details.deployment_concurrency_lease_id
+            )
+            return
+
         await self.abort_transition(
             reason=(
                 f"This run is in a {initial_state.type.name} state and cannot"
@@ -1566,6 +1720,69 @@ class EnsureOnlyScheduledFlowsMarkedLate(FlowRunOrchestrationRule):
         if marking_flow_late and not initial_state.is_scheduled():
             await self.reject_transition(
                 state=None, reason="Only scheduled flows can be marked late."
+            )
+
+
+class EnforceDeploymentConcurrencyOnLate(FlowRunOrchestrationRule):
+    """Enforce the CANCEL_NEW deployment concurrency strategy when marking runs late.
+
+    When a flow run would be marked Late and its deployment uses the CANCEL_NEW
+    collision strategy with a fully occupied concurrency limit, this rule rejects
+    the Late transition and replaces it with a Cancelled state.
+
+    This closes the gap where CANCEL_NEW is normally enforced at the * -> PENDING
+    transition (by SecureFlowConcurrencySlots), but runs that never reach PENDING
+    because they go late would accumulate in a Late state instead of being cancelled.
+    """
+
+    FROM_STATES = {StateType.SCHEDULED}
+    TO_STATES = {StateType.SCHEDULED}
+
+    async def before_transition(
+        self,
+        initial_state: states.State[Any] | None,
+        proposed_state: states.State[Any] | None,
+        context: OrchestrationContext[orm_models.FlowRun, core.FlowRunPolicy],
+    ) -> None:
+        if initial_state is None or proposed_state is None:
+            return
+
+        if not (proposed_state.is_scheduled() and proposed_state.name == "Late"):
+            return
+
+        if not context.run.deployment_id:
+            return
+
+        deployment = await deployments.read_deployment(
+            session=context.session,
+            deployment_id=context.run.deployment_id,
+        )
+        if not deployment or not deployment.concurrency_limit_id:
+            return
+
+        concurrency_options = deployment.concurrency_options
+        if isinstance(concurrency_options, dict):
+            concurrency_options = core.ConcurrencyOptions.model_validate(
+                concurrency_options
+            )
+        if (
+            not concurrency_options
+            or concurrency_options.collision_strategy
+            != core.ConcurrencyLimitStrategy.CANCEL_NEW
+        ):
+            return
+
+        limit = deployment.global_concurrency_limit
+        if not limit:
+            return
+
+        if limit.active_slots >= limit.limit:
+            await self.reject_transition(
+                state=states.Cancelled(message="Deployment concurrency limit reached."),
+                reason=(
+                    "Deployment concurrency limit is full and uses the"
+                    " CANCEL_NEW strategy."
+                ),
             )
 
 
@@ -1621,7 +1838,7 @@ class EnforceCancellingToCancelledTransition(TaskRunOrchestrationRule):
     Rejects transitions from Cancelling to any terminal state except for Cancelled.
     """
 
-    FROM_STATES = {StateType.CANCELLED, StateType.CANCELLING}
+    FROM_STATES = {StateType.CANCELLING}
     TO_STATES = ALL_ORCHESTRATION_STATES - {StateType.CANCELLED}
 
     async def before_transition(
@@ -1681,6 +1898,34 @@ class BypassCancellingFlowRunsWithNoInfra(FlowRunOrchestrationRule):
             await self.reject_transition(
                 state=states.Cancelled(),
                 reason="Suspended flow run has no infrastructure to terminate.",
+            )
+
+
+class PreserveDeploymentConcurrencyLeaseId(FlowRunUniversalTransform):
+    """
+    Preserves the deployment concurrency lease ID across state transitions.
+
+    Workers send deployment_concurrency_lease_id: null in the proposed state JSON
+    body (e.g., for PENDING→PENDING(Submitting)). Pydantic v2 treats null JSON
+    fields as explicitly set, so the lease ID would otherwise be silently dropped.
+    This transform copies the lease ID forward whenever the initial state has one
+    and the proposed state does not.
+    """
+
+    async def before_transition(
+        self,
+        context: OrchestrationContext[orm_models.FlowRun, core.FlowRunPolicy],
+    ) -> None:
+        if context.initial_state is None or context.proposed_state is None:
+            return
+        lease_id = context.initial_state.state_details.deployment_concurrency_lease_id
+        if (
+            lease_id is not None
+            and context.proposed_state.state_details.deployment_concurrency_lease_id
+            is None
+        ):
+            context.proposed_state.state_details.deployment_concurrency_lease_id = (
+                lease_id
             )
 
 

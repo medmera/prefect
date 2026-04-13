@@ -12,17 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from prefect.server.database import PrefectDBInterface, db_injector
 from prefect.server.database.orm_models import ORMEventResource
-from prefect.server.events.filters import EventFilter
 from prefect.server.events.schemas.events import (
     ReceivedEvent,
     RelatedResource,
     Resource,
 )
 from prefect.server.events.services import event_persister
-from prefect.server.events.services.event_persister import batch_delete
-from prefect.server.events.storage.database import query_events, write_events
+from prefect.server.events.storage.database import write_events
 from prefect.server.utilities.messaging import CapturedMessage, Message, MessageHandler
-from prefect.settings import PREFECT_EVENTS_RETENTION_PERIOD, temporary_settings
 from prefect.types import DateTime
 from prefect.types._datetime import now
 
@@ -352,68 +349,133 @@ async def test_flushes_messages_periodically(
         assert (await get_event_count(session)) == 9
 
 
-async def test_trims_messages_periodically(
-    event: ReceivedEvent, session: AsyncSession, db: PrefectDBInterface
+async def test_drops_events_when_queue_is_full(
+    event: ReceivedEvent,
+    caplog: pytest.LogCaptureFixture,
 ):
-    inserted_timestamps = []
-    # Create entries with slightly different insert times. Since the event_resources are filtered based on the
-    # "updated" column, where sqlite itself sets the timestamp, we need to actually delay the inserts.
-    for _ in range(3):
-        timestamp = now("UTC")
-        await write_events(
-            session, [event.model_copy(update={"id": uuid4(), "occurred": timestamp})]
-        )
-        await session.commit()  # Each commit ensures a new transaction timestamp for PostgreSQL's now() function
-        inserted_timestamps.append(timestamp)
-        await asyncio.sleep(0.6)  # The whole insert should be 600ms * 3 = about 1.8s
+    """When the queue is full, new events should be dropped with a warning."""
+    async with event_persister.create_handler(
+        batch_size=100,  # Don't trigger flush on batch size
+        flush_every=timedelta(days=100),  # Don't trigger periodic flush
+        queue_max_size=5,  # Small queue for testing
+    ) as handler:
+        # Fill the queue
+        for _ in range(5):
+            event.id = uuid4()
+            message = CapturedMessage(
+                data=event.model_dump_json().encode(), attributes={}
+            )
+            await handler(message)
 
-    # Half the entries are older than this, half are younger
-    cutoff_date = inserted_timestamps[int(len(inserted_timestamps) / 2)] - timedelta(
-        milliseconds=300
-    )
+        # This event should be dropped
+        event.id = uuid4()
+        dropped_event_id = event.id
+        message = CapturedMessage(data=event.model_dump_json().encode(), attributes={})
+        await handler(message)
 
-    initial_events, event_count, _ = await query_events(session, filter=EventFilter())
-    assert event_count == 3
-    assert len(initial_events) == 3
-    assert any(event.occurred < cutoff_date for event in initial_events)
-    assert any(event.occurred >= cutoff_date for event in initial_events)
-
-    initial_resources = list(await get_resources(session, None, db))
-    assert len(initial_resources) == 12
-    assert any(resource.occurred < cutoff_date for resource in initial_resources)
-    assert any(resource.occurred >= cutoff_date for resource in initial_resources)
-
-    # Prefect assumes a timedelta for the retention period, here we dynamically compute this to match the cutoff we want
-    retention_period = now("UTC") - cutoff_date
-    with temporary_settings({PREFECT_EVENTS_RETENTION_PERIOD: retention_period}):
-        async with event_persister.create_handler(
-            flush_every=timedelta(seconds=0.001),
-            trim_every=timedelta(seconds=0.001),
-        ):
-            await asyncio.sleep(0.1)  # this is 100x the time necessary
-
-    remaining_events, event_count, _ = await query_events(session, filter=EventFilter())
-    assert event_count == 2
-    assert len(remaining_events) == 2
-    assert all(event.occurred >= cutoff_date for event in remaining_events)
-
-    remaining_resources = await get_resources(session, None, db)
-    assert len(remaining_resources) == 8
-    assert all(resource.occurred >= cutoff_date for resource in remaining_resources)
+    assert "Event queue full" in caplog.text
+    assert str(dropped_event_id) in caplog.text
 
 
-async def test_batch_delete(
-    event: ReceivedEvent, session: AsyncSession, db: PrefectDBInterface
+async def test_drops_events_after_max_flush_retries(
+    event: ReceivedEvent,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ):
-    await write_events(
-        session, [event.model_copy(update={"id": uuid4()}) for _ in range(10)]
+    """After max_flush_retries consecutive failures, events should be dropped."""
+    call_count = 0
+
+    async def failing_write_events(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise Exception("Simulated DB failure")
+
+    monkeypatch.setattr(
+        "prefect.server.events.services.event_persister.write_events",
+        failing_write_events,
     )
 
-    number_deleted = await batch_delete(
-        session, db.Event, db.Event.occurred <= now("UTC"), batch_size=3
+    async with event_persister.create_handler(
+        batch_size=1,
+        flush_every=timedelta(days=100),
+        max_flush_retries=3,
+    ) as handler:
+        for _ in range(3):
+            event.id = uuid4()
+            message = CapturedMessage(
+                data=event.model_dump_json().encode(), attributes={}
+            )
+            await handler(message)  # Each triggers flush which fails
+
+    assert call_count == 3
+    assert "Max flush retries" in caplog.text
+    assert "dropping" in caplog.text
+
+
+async def test_successful_flush_resets_retry_counter(
+    event: ReceivedEvent,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A successful flush should reset the consecutive failure counter."""
+    call_count = 0
+
+    async def sometimes_failing_write_events(session, events):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            raise Exception("Simulated DB failure")
+        return await write_events(session=session, events=events)
+
+    monkeypatch.setattr(
+        "prefect.server.events.services.event_persister.write_events",
+        sometimes_failing_write_events,
     )
 
-    assert number_deleted == 10
-    queried_events, event_count, _ = await query_events(session, filter=EventFilter())
-    assert event_count == 0
-    assert len(queried_events) == 0
+    async with event_persister.create_handler(
+        batch_size=1,
+        flush_every=timedelta(days=100),
+        max_flush_retries=3,
+    ) as handler:
+        # Fail twice, then succeed on third attempt
+        for _ in range(3):
+            event.id = uuid4()
+            message = CapturedMessage(
+                data=event.model_dump_json().encode(), attributes={}
+            )
+            await handler(message)
+
+    # Event should be persisted after retry succeeded
+    assert (await get_event_count(session)) >= 1
+
+
+async def test_logs_warning_at_high_queue_capacity(
+    event: ReceivedEvent,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Should log warning when queue reaches 80% capacity."""
+    async with event_persister.create_handler(
+        batch_size=100,  # Won't trigger flush
+        flush_every=timedelta(days=100),
+        queue_max_size=10,  # Small queue: 80% = 8 events
+    ) as handler:
+        # Fill to 90% capacity (9 events)
+        for _ in range(9):
+            event.id = uuid4()
+            message = CapturedMessage(
+                data=event.model_dump_json().encode(), attributes={}
+            )
+            await handler(message)
+
+    # Final flush in __aexit__ should log the warning since queue > 80%
+    assert "capacity" in caplog.text
+
+
+async def test_event_persister_settings_have_correct_defaults():
+    """Verify the new settings exist with correct default values."""
+    from prefect.settings.context import get_current_settings
+
+    settings = get_current_settings().server.services.event_persister
+    assert settings.queue_max_size == 50_000
+    assert settings.max_flush_retries == 5

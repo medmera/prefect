@@ -1,9 +1,10 @@
 import type { ColumnDef } from "@tanstack/react-table";
 import { format, parseISO } from "date-fns";
 import type { components } from "@/api/prefect";
+import { StateBadge } from "@/components/ui/state-badge";
 import { DeploymentCell, WorkPoolCell } from "./cells";
 
-type FlowRun = components["schemas"]["FlowRun"];
+type FlowRun = components["schemas"]["FlowRunResponse"];
 
 export const columns: ColumnDef<FlowRun>[] = [
 	{
@@ -19,20 +20,13 @@ export const columns: ColumnDef<FlowRun>[] = [
 	{
 		accessorKey: "state",
 		header: "State",
-		cell: ({ row }) => (
-			<span
-				className={`px-2 py-1 rounded-full text-xs font-medium
-        ${
-					row.original.state?.type === "COMPLETED"
-						? "bg-green-100 text-green-800"
-						: row.original.state?.type === "FAILED"
-							? "bg-red-100 text-red-800"
-							: "bg-yellow-100 text-yellow-800"
-				}`}
-			>
-				{row.original.state?.name}
-			</span>
-		),
+		cell: ({ row }) =>
+			row.original.state?.type ? (
+				<StateBadge
+					type={row.original.state.type}
+					name={row.original.state.name}
+				/>
+			) : null,
 	},
 	{
 		accessorKey: "name",
@@ -61,7 +55,7 @@ export const columns: ColumnDef<FlowRun>[] = [
 			row.original.tags?.map((tag) => (
 				<span
 					key={tag}
-					className="bg-gray-100 text-gray-800 text-xs font-medium px-2 py-0.5 rounded"
+					className="bg-secondary text-secondary-foreground text-xs font-medium px-2 py-0.5 rounded"
 				>
 					{tag}
 				</span>

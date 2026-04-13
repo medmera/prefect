@@ -7,7 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import List, Optional
 from unittest import mock
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 from uuid import UUID, uuid4
 
 import anyio
@@ -16,6 +16,8 @@ import pytest
 from prefect import Task, flow, tags, task
 from prefect.cache_policies import FLOW_PARAMETERS, INPUTS, TASK_SOURCE
 from prefect.client.orchestration import PrefectClient, SyncPrefectClient
+from prefect.client.schemas import StateDetails
+from prefect.client.schemas.filters import TaskRunFilter, TaskRunFilterName
 from prefect.client.schemas.objects import StateType
 from prefect.concurrency.asyncio import concurrency as aconcurrency
 from prefect.concurrency.sync import concurrency
@@ -31,7 +33,7 @@ from prefect.logging import get_run_logger
 from prefect.results import ResultRecord, ResultStore
 from prefect.server.schemas.core import ConcurrencyLimitV2
 from prefect.settings import PREFECT_TASK_DEFAULT_RETRIES, temporary_settings
-from prefect.states import Completed, Failed, Pending, Running, State
+from prefect.states import AwaitingRetry, Completed, Failed, Pending, Running, State
 from prefect.task_engine import (
     AsyncTaskRunEngine,
     SyncTaskRunEngine,
@@ -41,6 +43,7 @@ from prefect.task_engine import (
 from prefect.task_runners import ThreadPoolTaskRunner
 from prefect.testing.utilities import exceptions_equal
 from prefect.transactions import transaction
+from prefect.types._datetime import now
 from prefect.utilities.callables import get_call_parameters
 from prefect.utilities.engine import propose_state
 
@@ -1327,8 +1330,8 @@ class TestTaskRetries:
         events_pipeline,
         monkeypatch,
     ):
-        mock_sleep = AsyncMock()
-        monkeypatch.setattr(anyio, "sleep", mock_sleep)
+        mock_sleep = Mock()
+        monkeypatch.setattr(time, "sleep", mock_sleep)
 
         @task(retries=3, retry_delay_seconds=retry_delay_seconds)
         def flaky_function():
@@ -1363,7 +1366,9 @@ class TestTaskCrashDetection:
     async def test_interrupt_in_task_function_crashes_task(
         self, prefect_client, interrupt_type, events_pipeline
     ):
-        @task
+        task_name = f"my-task-{uuid4()}"
+
+        @task(name=task_name)
         async def my_task():
             raise interrupt_type()
 
@@ -1371,7 +1376,9 @@ class TestTaskCrashDetection:
             await my_task()
 
         await events_pipeline.process_events()
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         task_run = task_runs[0]
         assert task_run.state.is_crashed()
@@ -1384,7 +1391,9 @@ class TestTaskCrashDetection:
     async def test_interrupt_in_task_function_crashes_task_sync(
         self, prefect_client, events_pipeline, interrupt_type
     ):
-        @task
+        task_name = f"my-task-{uuid4()}"
+
+        @task(name=task_name)
         def my_task():
             raise interrupt_type()
 
@@ -1392,7 +1401,9 @@ class TestTaskCrashDetection:
             my_task()
 
         await events_pipeline.process_events()
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         task_run = task_runs[0]
         assert task_run.state.is_crashed()
@@ -1408,8 +1419,9 @@ class TestTaskCrashDetection:
         monkeypatch.setattr(
             SyncTaskRunEngine, "begin_run", MagicMock(side_effect=interrupt_type)
         )
+        task_name = f"my-task-{uuid4()}"
 
-        @task
+        @task(name=task_name)
         def my_task():
             pass
 
@@ -1417,7 +1429,9 @@ class TestTaskCrashDetection:
             my_task()
 
         await events_pipeline.process_events()
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         task_run = task_runs[0]
         assert task_run.state.is_crashed()
@@ -1433,8 +1447,9 @@ class TestTaskCrashDetection:
         monkeypatch.setattr(
             AsyncTaskRunEngine, "begin_run", MagicMock(side_effect=interrupt_type)
         )
+        task_name = f"my-task-{uuid4()}"
 
-        @task
+        @task(name=task_name)
         async def my_task():
             pass
 
@@ -1442,7 +1457,9 @@ class TestTaskCrashDetection:
             await my_task()
 
         await events_pipeline.process_events()
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         task_run = task_runs[0]
         assert task_run.state.is_crashed()
@@ -1679,8 +1696,9 @@ class TestTaskTimeTracking:
         monkeypatch.setattr(
             SyncTaskRunEngine, "begin_run", MagicMock(side_effect=SystemExit)
         )
+        task_name = f"my-task-{uuid4()}"
 
-        @task
+        @task(name=task_name)
         def my_task():
             pass
 
@@ -1688,7 +1706,9 @@ class TestTaskTimeTracking:
             my_task()
 
         await events_pipeline.process_events()
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         run = task_runs[0]
 
@@ -1700,8 +1720,9 @@ class TestTaskTimeTracking:
         monkeypatch.setattr(
             AsyncTaskRunEngine, "begin_run", MagicMock(side_effect=SystemExit)
         )
+        task_name = f"my-task-{uuid4()}"
 
-        @task
+        @task(name=task_name)
         async def my_task():
             pass
 
@@ -1710,7 +1731,9 @@ class TestTaskTimeTracking:
 
         await events_pipeline.process_events()
 
-        task_runs = await prefect_client.read_task_runs()
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(name=TaskRunFilterName(any_=[task_name]))
+        )
         assert len(task_runs) == 1
         run = task_runs[0]
 
@@ -1927,10 +1950,10 @@ class TestTimeout:
     async def test_timeout_concurrency_slot_released_sync(
         self, concurrency_limit_v2: ConcurrencyLimitV2, prefect_client: PrefectClient
     ):
-        @task(timeout_seconds=0.5)
+        @task(timeout_seconds=2)
         def expensive_task():
             with concurrency(concurrency_limit_v2.name):
-                time.sleep(1)
+                time.sleep(10)
 
         with pytest.raises(TimeoutError):
             expensive_task()
@@ -1955,6 +1978,103 @@ class TestTimeout:
             concurrency_limit_v2.name
         )
         assert response.active_slots == 0
+
+    async def test_does_not_raise_timeout_error_when_async_task_is_cancelled(self):
+        @task(timeout_seconds=10)
+        async def async_task():
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await async_task()
+
+
+class TestSyncTaskTimeoutWarning:
+    """Tests for the warning emitted when a sync task with timeout runs in a worker thread."""
+
+    def test_warning_emitted_when_sync_task_with_timeout_runs_in_worker_thread(
+        self, caplog
+    ):
+        """Test that a warning is emitted when a sync task with timeout runs in a worker thread."""
+
+        @task(timeout_seconds=10)
+        def my_task():
+            return "result"
+
+        @flow
+        def my_flow():
+            # Submit runs the task in a thread pool
+            future = my_task.submit()
+            return future.result()
+
+        with caplog.at_level(logging.WARNING):
+            result = my_flow()
+
+        # Check that warning was emitted
+        assert any(
+            "running in a worker thread" in record.message for record in caplog.records
+        )
+        assert result == "result"
+
+    def test_no_warning_when_sync_task_with_timeout_runs_on_main_thread(self, caplog):
+        """Test that no warning is emitted when a sync task with timeout runs on main thread."""
+
+        @task(timeout_seconds=10)
+        def my_task():
+            return "result"
+
+        @flow
+        def my_flow():
+            # Direct call runs on main thread
+            return my_task()
+
+        with caplog.at_level(logging.WARNING):
+            result = my_flow()
+
+        # Check that no timeout warning was emitted
+        assert not any(
+            "running in a worker thread" in record.message for record in caplog.records
+        )
+        assert result == "result"
+
+    def test_no_warning_when_sync_task_has_no_timeout(self, caplog):
+        """Test that no warning is emitted when a sync task has no timeout."""
+
+        @task
+        def my_task():
+            return "result"
+
+        @flow
+        def my_flow():
+            future = my_task.submit()
+            return future.result()
+
+        with caplog.at_level(logging.WARNING):
+            result = my_flow()
+
+        assert not any(
+            "running in a worker thread" in record.message for record in caplog.records
+        )
+        assert result == "result"
+
+    async def test_no_warning_for_async_task_with_timeout(self, caplog):
+        """Test that no warning is emitted for async tasks with timeout."""
+
+        @task(timeout_seconds=10)
+        async def my_task():
+            return "result"
+
+        @flow
+        async def my_flow():
+            future = my_task.submit()
+            return future.result()
+
+        with caplog.at_level(logging.WARNING):
+            result = await my_flow()
+
+        assert not any(
+            "running in a worker thread" in record.message for record in caplog.records
+        )
+        assert result == "result"
 
 
 class TestPersistence:
@@ -2050,14 +2170,14 @@ class TestCachePolicy:
         # cache expired, new result
         assert third_result not in [first_result, second_result], "Cache did not expire"
 
-    async def test_cache_expiration_expires(self, prefect_client, tmp_path):
+    async def test_cache_expiration_expires(self, advance_time, tmp_path):
         fs = LocalFileSystem(basepath=tmp_path)
         await fs.save("test-once")
 
         @task(
             persist_result=True,
             result_storage_key="expiring-foo-bar",
-            cache_expiration=timedelta(seconds=0.0),
+            cache_expiration=timedelta(seconds=1.0),
             result_storage=fs,
         )
         async def async_task():
@@ -2065,7 +2185,10 @@ class TestCachePolicy:
 
         first_state = await async_task(return_state=True)
         assert first_state.is_completed()
-        await asyncio.sleep(0.1)
+
+        # Use deterministic time advancement instead of asyncio.sleep to
+        # avoid race conditions under CI load
+        advance_time(timedelta(seconds=1.1))
 
         second_state = await async_task(return_state=True)
         assert second_state.is_completed()
@@ -2137,7 +2260,7 @@ class TestCachePolicy:
             second_val = my_random_task(x, cmplx_input=thread, return_state=True)
             return first_val, second_val
 
-        first, second = my_param_flow(4200)
+        first, second = my_param_flow(1_000_000_000)
         assert first.name == "Completed"
         assert second.name == "Completed"
 
@@ -2617,7 +2740,7 @@ class TestTaskConcurrencyLimits:
             task_run_id = TaskRunContext.get().task_run.id
             return 42
 
-        with mock.patch("prefect.task_engine.aconcurrency") as mock_aconcurrency:
+        with mock.patch("prefect.task_engine._aconcurrency") as mock_aconcurrency:
             # Set up the mock to act as an async context manager
             mock_aconcurrency.return_value.__aenter__ = mock.AsyncMock(
                 return_value=None
@@ -2645,7 +2768,7 @@ class TestTaskConcurrencyLimits:
             task_run_id = TaskRunContext.get().task_run.id
             return 42
 
-        with mock.patch("prefect.task_engine.concurrency") as mock_concurrency:
+        with mock.patch("prefect.task_engine._concurrency") as mock_concurrency:
             # Set up the mock to act as a context manager
             mock_concurrency.return_value.__enter__ = mock.Mock(return_value=None)
             mock_concurrency.return_value.__exit__ = mock.Mock(return_value=None)
@@ -2691,7 +2814,7 @@ class TestTaskConcurrencyLimits:
 
         # Mock the V2 concurrency function at the task_engine level
         with mock.patch(
-            "prefect.task_engine.concurrency",
+            "prefect.task_engine._concurrency",
             side_effect=side_effect,
         ):
             # The task call itself should raise because the mocked function raises
@@ -2741,7 +2864,7 @@ class TestTaskConcurrencyLimits:
 
         # Mock the V2 async concurrency function at the task_engine level
         with mock.patch(
-            "prefect.task_engine.aconcurrency",
+            "prefect.task_engine._aconcurrency",
             side_effect=side_effect,
         ):
             # The task call itself should raise because the mocked function raises
@@ -2771,7 +2894,7 @@ class TestTaskConcurrencyLimits:
             task_run_id = TaskRunContext.get().task_run.id
             return 42
 
-        with mock.patch("prefect.task_engine.concurrency") as mock_concurrency:
+        with mock.patch("prefect.task_engine._concurrency") as mock_concurrency:
             # Set up the mock to act as a context manager
             mock_concurrency.return_value.__enter__ = mock.Mock(return_value=None)
             mock_concurrency.return_value.__exit__ = mock.Mock(return_value=None)
@@ -2798,7 +2921,7 @@ class TestTaskConcurrencyLimits:
             task_run_id = TaskRunContext.get().task_run.id
             return 42
 
-        with mock.patch("prefect.task_engine.aconcurrency") as mock_aconcurrency:
+        with mock.patch("prefect.task_engine._aconcurrency") as mock_aconcurrency:
             # Set up the mock to act as an async context manager
             mock_aconcurrency.return_value.__aenter__ = mock.AsyncMock(
                 return_value=None
@@ -2823,7 +2946,7 @@ class TestTaskConcurrencyLimits:
         async def bar():
             return 42
 
-        with mock.patch("prefect.task_engine.aconcurrency") as mock_aconcurrency:
+        with mock.patch("prefect.task_engine._aconcurrency") as mock_aconcurrency:
             # Set up the mock to act as an async context manager
             mock_aconcurrency.return_value.__aenter__ = mock.AsyncMock(
                 return_value=None
@@ -2846,7 +2969,7 @@ class TestTaskConcurrencyLimits:
         def bar():
             return 42
 
-        with mock.patch("prefect.task_engine.concurrency") as mock_concurrency:
+        with mock.patch("prefect.task_engine._concurrency") as mock_concurrency:
             # Set up the mock to act as a sync context manager
             mock_concurrency.return_value.__enter__ = mock.MagicMock(return_value=None)
             mock_concurrency.return_value.__exit__ = mock.MagicMock(return_value=None)
@@ -2871,7 +2994,7 @@ class TestTaskConcurrencyLimits:
             task_run_id = TaskRunContext.get().task_run.id
             return 42
 
-        with mock.patch("prefect.task_engine.aconcurrency") as mock_aconcurrency:
+        with mock.patch("prefect.task_engine._aconcurrency") as mock_aconcurrency:
             # Set up the mock to act as an async context manager
             mock_aconcurrency.return_value.__aenter__ = mock.AsyncMock(
                 return_value=None
@@ -3290,3 +3413,204 @@ class TestTransactionHooks:
             foo()
 
         spy.assert_called_once()
+
+
+class TestTaskTagConcurrencyWarnings:
+    """Tests to ensure that automatic tag-based concurrency checks don't produce noisy warnings."""
+
+    def test_task_with_tags_no_concurrency_limit_no_warning_sync(self, caplog):
+        """Verify sync tasks with tags don't log warnings when no concurrency limit exists."""
+
+        @task(tags=["test-tag"])
+        def tagged_task():
+            return 42
+
+        with caplog.at_level(logging.WARNING):
+            result = tagged_task()
+
+        assert result == 42
+
+        # Check that there are no WARNING logs about missing concurrency limits
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Concurrency limits" in record.message
+            and "do not exist" in record.message
+        ]
+        assert len(warning_records) == 0, (
+            f"Expected no concurrency warnings, but found {len(warning_records)}: "
+            f"{[r.message for r in warning_records]}"
+        )
+
+    async def test_task_with_tags_no_concurrency_limit_no_warning_async(self, caplog):
+        """Verify async tasks with tags don't log warnings when no concurrency limit exists."""
+
+        @task(tags=["test-tag"])
+        async def tagged_task():
+            return 42
+
+        with caplog.at_level(logging.WARNING):
+            result = await tagged_task()
+
+        assert result == 42
+
+        # Check that there are no WARNING logs about missing concurrency limits
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Concurrency limits" in record.message
+            and "do not exist" in record.message
+        ]
+        assert len(warning_records) == 0, (
+            f"Expected no concurrency warnings, but found {len(warning_records)}: "
+            f"{[r.message for r in warning_records]}"
+        )
+
+    def test_task_with_multiple_tags_no_concurrency_limit_no_warning_sync(self, caplog):
+        """Verify sync tasks with multiple tags don't log warnings when no concurrency limits exist."""
+
+        @task(tags=["tag1", "tag2", "tag3"])
+        def multi_tagged_task():
+            return "success"
+
+        with caplog.at_level(logging.WARNING):
+            result = multi_tagged_task()
+
+        assert result == "success"
+
+        # Check that there are no WARNING logs about missing concurrency limits
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Concurrency limits" in record.message
+            and "do not exist" in record.message
+        ]
+        assert len(warning_records) == 0, (
+            f"Expected no concurrency warnings, but found {len(warning_records)}: "
+            f"{[r.message for r in warning_records]}"
+        )
+
+    def test_explicit_concurrency_call_with_nonexistent_limit_shows_warning(
+        self, caplog
+    ):
+        """Verify explicit concurrency() calls still show warnings when limit doesn't exist."""
+
+        @task
+        def task_with_explicit_concurrency():
+            with concurrency("nonexistent-limit"):
+                return "done"
+
+        with caplog.at_level(logging.WARNING):
+            result = task_with_explicit_concurrency()
+
+        assert result == "done"
+
+        # Check that there IS a WARNING log about missing concurrency limit
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Concurrency limits" in record.message
+            and "do not exist" in record.message
+        ]
+        assert len(warning_records) == 1, (
+            f"Expected exactly 1 concurrency warning for explicit call, "
+            f"but found {len(warning_records)}"
+        )
+        assert "nonexistent-limit" in warning_records[0].message
+
+    async def test_explicit_concurrency_call_with_nonexistent_limit_shows_warning_async(
+        self, caplog
+    ):
+        """Verify explicit async concurrency() calls still show warnings when limit doesn't exist."""
+
+        @task
+        async def task_with_explicit_concurrency():
+            async with aconcurrency("nonexistent-limit"):
+                return "done"
+
+        with caplog.at_level(logging.WARNING):
+            result = await task_with_explicit_concurrency()
+
+        assert result == "done"
+
+        # Check that there IS a WARNING log about missing concurrency limit
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Concurrency limits" in record.message
+            and "do not exist" in record.message
+        ]
+        assert len(warning_records) == 1, (
+            f"Expected exactly 1 concurrency warning for explicit call, "
+            f"but found {len(warning_records)}"
+        )
+        assert "nonexistent-limit" in warning_records[0].message
+
+
+class TestWaitUntilReadySync:
+    def test_is_noop_when_no_scheduled_time(self):
+        """When there's no scheduled time, wait_until_ready is a no-op."""
+
+        @task
+        def my_task():
+            return 42
+
+        engine = SyncTaskRunEngine(task=my_task)
+        with engine.initialize_run():
+            # Initial state is pending
+            assert engine.state.is_pending()
+            # Call wait_until_ready - should be a no-op since no scheduled_time
+            engine.wait_until_ready()
+            # State should still be pending (transition to running happens elsewhere)
+            assert engine.state.is_pending()
+
+    def test_transitions_to_running_with_past_scheduled_time(self):
+        """When scheduled_time is in the past, transitions to Running immediately."""
+
+        @task
+        def my_task():
+            return 42
+
+        engine = SyncTaskRunEngine(task=my_task)
+        with engine.initialize_run():
+            # Set up a state with a scheduled time in the past
+            scheduled_time = now("UTC") - timedelta(seconds=10)
+            new_state = Pending(
+                state_details=StateDetails(scheduled_time=scheduled_time)
+            )
+            engine.task_run.state = new_state
+
+            start = time.time()
+            engine.wait_until_ready()
+            elapsed = time.time() - start
+
+            # Should not have waited (or very minimal time)
+            assert elapsed < 0.5
+            # State should now be Running
+            assert engine.state.is_running()
+
+    def test_transitions_to_retrying_when_awaiting_retry(self):
+        """When state name is 'AwaitingRetry', transitions to Retrying state."""
+
+        @task
+        def my_task():
+            return 42
+
+        engine = SyncTaskRunEngine(task=my_task)
+        with engine.initialize_run():
+            # Set up an AwaitingRetry state with a scheduled time in the past
+            scheduled_time = now("UTC") - timedelta(seconds=1)
+            new_state = AwaitingRetry(
+                state_details=StateDetails(scheduled_time=scheduled_time)
+            )
+            engine.task_run.state = new_state
+
+            engine.wait_until_ready()
+
+            # State should now be Retrying (not Running)
+            assert engine.state.name == "Retrying"

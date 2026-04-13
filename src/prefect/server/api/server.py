@@ -9,6 +9,7 @@ import atexit
 import base64
 import contextlib
 import gc
+import hmac
 import logging
 import mimetypes
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import timedelta
 from functools import wraps
 from hashlib import sha256
 from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
@@ -30,6 +32,7 @@ import httpx
 import sqlalchemy as sa
 import sqlalchemy.exc
 import sqlalchemy.orm.exc
+from docket import Docket
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -45,10 +48,13 @@ import prefect
 import prefect.server.api as api
 import prefect.settings
 from prefect._internal.compatibility.starlette import status
+from prefect._internal.observability import configure_logfire
 from prefect.client.constants import SERVER_API_VERSION
 from prefect.logging import get_logger
+from prefect.server.api.background_workers import background_worker
 from prefect.server.api.dependencies import EnforceMinimumAPIVersion
 from prefect.server.exceptions import ObjectNotFoundError
+from prefect.server.schemas.ui import UISettings
 from prefect.server.services.base import RunInEphemeralServers, RunInWebservers, Service
 from prefect.server.utilities.database import get_dialect
 from prefect.settings import (
@@ -64,22 +70,11 @@ from prefect.settings import (
 )
 from prefect.utilities.hashing import hash_objects
 
-if os.environ.get("PREFECT_LOGFIRE_ENABLED"):
-    import logfire  # pyright: ignore
-
-    token: str | None = os.environ.get("PREFECT_LOGFIRE_WRITE_TOKEN")
-    if token is None:
-        raise ValueError(
-            "PREFECT_LOGFIRE_WRITE_TOKEN must be set when PREFECT_LOGFIRE_ENABLED is true"
-        )
-
-    logfire.configure(token=token)  # pyright: ignore
-else:
-    logfire = None
+logfire: Any | None = configure_logfire()
 
 TITLE = "Prefect Server"
-API_TITLE = "Prefect Prefect REST API"
-UI_TITLE = "Prefect Prefect REST API UI"
+API_TITLE = "Prefect REST API"
+UI_TITLE = "Prefect REST API UI"
 API_VERSION: str = prefect.__version__
 # migrations should run only once per app start; the ephemeral API can potentially
 # create multiple apps in a single process
@@ -164,6 +159,7 @@ def _install_sqlite_locked_log_filter() -> None:
 
     filter_ = _SQLiteLockedOperationalErrorFilter()
     logging.getLogger("uvicorn.error").addFilter(filter_)
+    logging.getLogger("docket.worker").addFilter(filter_)
     _SQLITE_LOCKED_LOG_FILTER = filter_
 
 
@@ -419,19 +415,40 @@ def create_api_app(
     if final:
         gc.collect()
 
+    @api_app.middleware("http")
+    async def default_content_type(request: Request, call_next: Any):  # type: ignore[reportUnusedFunction]
+        # Older Prefect clients (<3.6.19) sent JSON bodies via httpx's
+        # content= parameter, which omits the Content-Type header.
+        # FastAPI >=0.132.0 requires Content-Type: application/json to
+        # parse request bodies. Default it here for backward compat.
+        if (
+            request.method in {"POST", "PUT", "PATCH"}
+            and "content-type" not in request.headers
+            and int(request.headers.get("content-length", "0")) > 0
+        ):
+            request.scope["headers"] = [
+                *request.scope["headers"],
+                (b"content-type", b"application/json"),
+            ]
+        return await call_next(request)
+
     auth_string = prefect.settings.PREFECT_SERVER_API_AUTH_STRING.value()
 
     if auth_string is not None:
+        health_check_paths = {health_check_path, "/ready"}
 
         @api_app.middleware("http")
         async def token_validation(request: Request, call_next: Any):  # type: ignore[reportUnusedFunction]
             header_token = request.headers.get("Authorization")
 
-            # used for probes in k8s and such
-            if (
-                request.url.path.endswith(("health", "ready"))
-                and request.method.upper() == "GET"
-            ):
+            # Allow unauthenticated health/ready probes (e.g. k8s).
+            # Use scope["path"] (not request.url.path) because url.path
+            # can be spoofed via Host header manipulation. Use exact path
+            # matching (not suffix matching) to prevent auth bypass via
+            # crafted paths like /variables/name/system-health.
+            scope = request.scope
+            app_path = scope["path"].removeprefix(scope.get("root_path", ""))
+            if app_path in health_check_paths and request.method.upper() == "GET":
                 return await call_next(request)
             try:
                 if header_token is None:
@@ -447,7 +464,7 @@ def create_api_app(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"exception_message": "Unauthorized"},
                 )
-            if decoded != auth_string:
+            if not hmac.compare_digest(decoded, auth_string):
                 return JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"exception_message": "Unauthorized"},
@@ -462,11 +479,22 @@ def create_api_app(
 def create_ui_app(ephemeral: bool) -> FastAPI:
     ui_app = FastAPI(title=UI_TITLE)
     base_url = prefect.settings.PREFECT_UI_SERVE_BASE.value()
-    cache_key = f"{prefect.__version__}:{base_url}"
+
+    # Determine which UI to serve based on setting
+    v2_enabled = prefect.settings.get_current_settings().server.ui.v2_enabled
+
+    if v2_enabled:
+        source_static_path = prefect.__ui_v2_static_path__
+        static_subpath = prefect.__ui_v2_static_subpath__
+        cache_key = f"v2:{prefect.__version__}:{base_url}"
+    else:
+        source_static_path = prefect.__ui_static_path__
+        static_subpath = prefect.__ui_static_subpath__
+        cache_key = f"v1:{prefect.__version__}:{base_url}"
+
     stripped_base_url = base_url.rstrip("/")
-    static_dir = (
-        prefect.settings.PREFECT_UI_STATIC_DIRECTORY.value()
-        or prefect.__ui_static_subpath__
+    static_dir = prefect.settings.PREFECT_UI_STATIC_DIRECTORY.value() or str(
+        static_subpath
     )
     reference_file_name = "UI_SERVE_BASE"
 
@@ -476,15 +504,15 @@ def create_ui_app(ephemeral: bool) -> FastAPI:
         mimetypes.add_type("application/javascript", ".js")
 
     @ui_app.get(f"{stripped_base_url}/ui-settings")
-    def ui_settings() -> dict[str, Any]:  # type: ignore[reportUnusedFunction]
-        return {
-            "api_url": prefect.settings.PREFECT_UI_API_URL.value(),
-            "csrf_enabled": prefect.settings.PREFECT_SERVER_CSRF_PROTECTION_ENABLED.value(),
-            "auth": "BASIC"
+    def ui_settings() -> UISettings:  # type: ignore[reportUnusedFunction]
+        return UISettings(
+            api_url=prefect.settings.PREFECT_UI_API_URL.value(),
+            csrf_enabled=prefect.settings.PREFECT_SERVER_CSRF_PROTECTION_ENABLED.value(),
+            auth="BASIC"
             if prefect.settings.PREFECT_SERVER_API_AUTH_STRING.value()
             else None,
-            "flags": [],
-        }
+            flags=[],
+        )
 
     def reference_file_matches_base_url() -> bool:
         reference_file_path = os.path.join(static_dir, reference_file_name)
@@ -502,7 +530,7 @@ def create_ui_app(ephemeral: bool) -> FastAPI:
         if not os.path.exists(static_dir):
             os.makedirs(static_dir)
 
-        copy_directory(str(prefect.__ui_static_path__), str(static_dir))
+        copy_directory(str(source_static_path), str(static_dir))
         replace_placeholder_string_in_files(
             str(static_dir),
             "/PREFECT_UI_SERVE_BASE_REPLACE_PLACEHOLDER",
@@ -518,14 +546,28 @@ def create_ui_app(ephemeral: bool) -> FastAPI:
     ui_app.add_middleware(GZipMiddleware)
 
     if (
-        os.path.exists(prefect.__ui_static_path__)
+        os.path.exists(source_static_path)
         and prefect.settings.PREFECT_UI_ENABLED.value()
         and not ephemeral
     ):
+        # Log which UI version is being served
+        if v2_enabled:
+            logger.info("Serving experimental V2 UI")
+
         # If the static files have already been copied, check if the base_url has changed
         # If it has, we delete the subpath directory and copy the files again
         if not reference_file_matches_base_url():
-            create_ui_static_subpath()
+            try:
+                create_ui_static_subpath()
+            except PermissionError as exc:
+                logger.error(
+                    "Failed to create UI static directory at %s: %s. "
+                    "The UI will not be available. "
+                    "To resolve this, set PREFECT_UI_STATIC_DIRECTORY to a writable directory.",
+                    static_dir,
+                    exc,
+                )
+                return ui_app
 
         ui_app.mount(
             PREFECT_UI_SERVE_BASE.value(),
@@ -549,6 +591,7 @@ def _memoize_block_auto_registration(
     import toml
 
     import prefect.plugins
+    from prefect._internal.compatibility.backports import tomllib
     from prefect.blocks.core import Block
     from prefect.server.models.block_registration import _load_collection_blocks_data
     from prefect.utilities.dispatch import get_registry_for_type
@@ -575,9 +618,9 @@ def _memoize_block_auto_registration(
         memo_store_path = PREFECT_MEMO_STORE_PATH.value()
         try:
             if memo_store_path.exists():
-                saved_blocks_loading_hash = toml.load(memo_store_path).get(
-                    "block_auto_registration"
-                )
+                saved_blocks_loading_hash = tomllib.loads(
+                    memo_store_path.read_text(encoding="utf-8")
+                ).get("block_auto_registration")
                 if (
                     saved_blocks_loading_hash is not None
                     and current_blocks_loading_hash == saved_blocks_loading_hash
@@ -695,6 +738,19 @@ def create_app(
         )
 
         async with AsyncExitStack() as stack:
+            docket = await stack.enter_async_context(
+                Docket(
+                    name=settings.server.docket.name,
+                    url=settings.server.docket.url,
+                    execution_ttl=timedelta(0),
+                )
+            )
+            await stack.enter_async_context(
+                background_worker(
+                    docket, ephemeral=ephemeral, webserver_only=webserver_only
+                )
+            )
+            api_app.state.docket = docket
             if Services:
                 await stack.enter_async_context(Services.running())
             LIFESPAN_RAN_FOR_APP.add(app)
@@ -795,9 +851,6 @@ def create_app(
             routes=api_app.routes,
         )
         new_schema = partial_schema.copy()
-        new_schema["paths"] = {}
-        for path, value in partial_schema["paths"].items():
-            new_schema["paths"][f"/api{path}"] = value
 
         new_schema["info"]["x-logo"] = {"url": "static/prefect-logo-mark-gradient.png"}
         return new_schema
@@ -828,6 +881,7 @@ class SubprocessASGIServer:
     def __init__(self, port: Optional[int] = None):
         # This ensures initialization happens only once
         if not hasattr(self, "_initialized"):
+            self._instance_key: Optional[int] = port
             self.port: Optional[int] = port
             self.server_process: subprocess.Popen[Any] | None = None
             self.running: bool = False
@@ -969,8 +1023,12 @@ class SubprocessASGIServer:
                 self.server_process.wait()
             finally:
                 self.server_process = None
-        if self.port in self._instances:
-            del self._instances[self.port]
+        # Use _instance_key (the original port passed to __new__) for cleanup,
+        # since self.port may have changed during start() when an available port
+        # was assigned.
+        instance_key = getattr(self, "_instance_key", self.port)
+        if instance_key in self._instances:
+            del self._instances[instance_key]
         if self.running:
             self.running = False
 

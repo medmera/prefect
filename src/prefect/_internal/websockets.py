@@ -5,17 +5,14 @@ This module provides shared WebSocket proxy connection logic and SSL configurati
 to avoid duplication between events and logs clients.
 """
 
-import os
 import ssl
 import warnings
-from typing import Any, Generator, Optional
+from functools import wraps
+from typing import Any, Optional
 from urllib.parse import urlparse
-from urllib.request import proxy_bypass
 
 import certifi
-from python_socks.async_.asyncio import Proxy
-from typing_extensions import Self
-from websockets.asyncio.client import ClientConnection, connect
+from websockets.asyncio.client import connect
 
 try:
     from prefect.client.iap_auth import IAPTokenManager
@@ -45,25 +42,54 @@ def create_ssl_context_for_websocket(uri: str) -> Optional[ssl.SSLContext]:
         return ssl.create_default_context(cafile=cert_file)
 
 
-class WebsocketProxyConnect(connect):
+@wraps(connect)
+def websocket_connect(uri: str, **kwargs: Any) -> connect:
     """
-    WebSocket connection class with proxy and SSL support.
+    Create a WebSocket connection with proxy and SSL support.
 
-    Extends the websockets.asyncio.client.connect class to add HTTP/HTTPS
-    proxy support via environment variables, proxy bypass logic, and SSL
-    certificate verification.
+    Proxy support is automatic via HTTP_PROXY/HTTPS_PROXY environment variables.
+    The websockets library handles proxy detection and connection automatically.
     """
+    # Configure SSL context for HTTPS connections
+    ssl_context = create_ssl_context_for_websocket(uri)
+    if ssl_context:
+        kwargs.setdefault("ssl", ssl_context)
 
-    def __init__(self: Self, uri: str, **kwargs: Any):
-        # super() is intentionally deferred to the _proxy_connect method
-        # to allow for the socket to be established first
+    # Add custom headers from settings
+    custom_headers = get_current_settings().client.custom_headers
+    if custom_headers:
+        # Get existing additional_headers or create new dict
+        additional_headers = kwargs.get("additional_headers", {})
+        if not isinstance(additional_headers, dict):
+            additional_headers = {}
 
-        self.uri = uri
-        self._kwargs = kwargs
+        for header_name, header_value in custom_headers.items():
+            # Check for protected headers that shouldn't be overridden
+            if header_name.lower() in {
+                "user-agent",
+                "sec-websocket-key",
+                "sec-websocket-version",
+                "sec-websocket-extensions",
+                "sec-websocket-protocol",
+                "connection",
+                "upgrade",
+                "host",
+            }:
+                warnings.warn(
+                    f"Custom header '{header_name}' is ignored because it conflicts with "
+                    f"a protected WebSocket header. Protected headers include: "
+                    f"User-Agent, Sec-WebSocket-Key, Sec-WebSocket-Version, "
+                    f"Sec-WebSocket-Extensions, Sec-WebSocket-Protocol, Connection, "
+                    f"Upgrade, Host",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                additional_headers[header_name] = header_value
 
-        u = urlparse(uri)
-        host = u.hostname
+        kwargs["additional_headers"] = additional_headers
 
+<<<<<<< HEAD
         if not host:
             raise ValueError(f"Invalid URI {uri}, no hostname found")
 
@@ -158,3 +184,6 @@ def websocket_connect(uri: str, **kwargs: Any) -> WebsocketProxyConnect:
         }
 
     return WebsocketProxyConnect(uri, **kwargs)
+=======
+    return connect(uri, **kwargs)
+>>>>>>> 3.6.26

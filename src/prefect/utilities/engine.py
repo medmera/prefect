@@ -3,6 +3,7 @@ import contextlib
 import os
 import signal
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Generator
 from functools import partial
 from logging import Logger
@@ -267,20 +268,29 @@ async def resolve_inputs(
         else:
             return expr
 
-        # Do not allow uncompleted upstreams except failures when `allow_failure` has
-        # been used
+        # Do not allow uncompleted upstreams unless `allow_failure` has been used
+        # for failed or failure-derived (PENDING/NotReady) states
         if not state.is_completed() and not (
             # TODO: Note that the contextual annotation here is only at the current level
             #       if `allow_failure` is used then another annotation is used, this will
             #       incorrectly evaluate to false — to resolve this, we must track all
             #       annotations wrapping the current expression but this is not yet
             #       implemented.
-            isinstance(context.get("annotation"), allow_failure) and state.is_failed()
+            isinstance(context.get("annotation"), allow_failure)
+            and (state.is_failed() or (state.is_pending() and state.name == "NotReady"))
         ):
             raise UpstreamTaskError(
                 f"Upstream task run '{state.state_details.task_run_id}' did not reach a"
                 " 'COMPLETED' state."
             )
+
+        # When allow_failure is used and the state is not final (e.g. PENDING/NotReady
+        # from a cascading upstream failure), return state.data directly since
+        # result_by_state is only populated for final states.
+        if not state.is_final() and isinstance(
+            context.get("annotation"), allow_failure
+        ):
+            return state.data
 
         return result_by_state.get(state)
 
@@ -302,7 +312,8 @@ async def resolve_inputs(
             raise PrefectException(
                 f"Failed to resolve inputs in parameter {parameter!r}. If your"
                 " parameter type is not supported, consider using the `quote`"
-                " annotation to skip resolution of inputs."
+                " annotation to skip resolution of inputs, or the `opaque`"
+                " annotation to resolve the value without traversing its contents."
             ) from exc
 
     return resolved_parameters
@@ -509,10 +520,42 @@ def get_state_for_result(obj: Any) -> Optional[tuple[State, RunType]]:
     Get the state related to a result object.
 
     `link_state_to_result` must have been called first.
+
+    For objects that support `__weakref__`, the entry stored by
+    `link_state_to_result` carries a weak reference back to the original
+    object. We verify here that the entry's weak reference still points
+    to the *same* object that registered the entry — not just to *some*
+    object that happens to share its `id()`. This prevents stale hits
+    caused by CPython recycling a freed memory address. Stale entries
+    are evicted on detection.
+
+    For objects that do not support `__weakref__` (plain `dict`, `list`,
+    `set`, `str`, `int`, `tuple`, ...), the entry has no weak reference
+    and we fall back to the legacy `id()`-only lookup. This preserves
+    today's behavior for those types — including the latent stale-id
+    bug — and isolates the limitation to a single named code path.
     """
+    # See https://github.com/PrefectHQ/prefect/issues/20558 for background
+    # on the stale-id bug and the broader product discussion around
+    # non-weakref-able types.
     flow_run_context = FlowRunContext.get()
-    if flow_run_context:
-        return flow_run_context.run_results.get(id(obj))
+    if flow_run_context is None:
+        return None
+
+    entry = flow_run_context.run_results.get(id(obj))
+    if entry is None:
+        return None
+
+    state, run_type, ref = entry
+    if ref is not None and ref() is not obj:
+        # Stale: the original object that registered this entry is
+        # either gone (ref() is None) or this `obj` is a different
+        # object that happens to share the recycled `id()`. Evict and
+        # miss.
+        flow_run_context.run_results.pop(id(obj), None)
+        return None
+
+    return state, run_type
 
 
 def link_state_to_flow_run_result(state: State, result: Any) -> None:
@@ -544,12 +587,28 @@ def link_state_to_result(state: State, result: Any, run_type: RunType) -> None:
 
         Note: the int `1` will not be mapped to the state because it is a singleton.
 
+    Identity tracking:
+        For objects that support `__weakref__` (most user-defined classes,
+        pydantic models, dataclasses), each entry stores a weak reference
+        back to the original object. `get_state_for_result` verifies that
+        the weak reference still points to the *same* object before
+        returning a hit, so a recycled memory address can never silently
+        inherit a previous task's state.
+
+        For objects that do not support `__weakref__` (plain `dict`,
+        `list`, `set`, `str`, `int`, `tuple`, ...), the entry has no weak
+        reference and the legacy `id()`-only lookup is used. The known
+        stale-id limitation is preserved for those types and isolated to
+        a single named code path.
+
     Other Notes:
     We do not hash the result because:
     - If changes are made to the object in the flow between task calls, we can still
       track that they are related.
     - Hashing can be expensive.
     - Not all objects are hashable.
+    - Hash-based keying would also conflate equal-but-distinct objects
+      from unrelated tasks.
 
     We do not set an attribute, e.g. `__prefect_state__`, on the result because:
 
@@ -558,7 +617,6 @@ def link_state_to_result(state: State, result: Any, run_type: RunType) -> None:
     - The field can be preserved on copy.
     - We cannot set this attribute on Python built-ins.
     """
-
     flow_run_context = FlowRunContext.get()
     # Drop the data field to avoid holding a strong reference to the result
     # Holding large user objects in memory can cause memory bloat
@@ -581,7 +639,21 @@ def link_state_to_result(state: State, result: Any, run_type: RunType) -> None:
             ):
                 state.state_details.untrackable_result = True
                 return
-            flow_run_context.run_results[id(obj)] = (linked_state, run_type)
+
+            # Attach a weak reference for identity verification on
+            # lookup. `type(obj).__weakrefoffset__` is the canonical
+            # CPython check for whether instances of a type support
+            # `__weakref__` — it's non-zero for user classes / pydantic
+            # models / dataclasses and zero for builtins like `dict`,
+            # `list`, `str`, `int`, `tuple`, `set`. Using the offset
+            # avoids the cost of catching `TypeError` from a doomed
+            # `weakref.ref(obj)` call on every non-weakref-able result.
+            if type(obj).__weakrefoffset__:
+                ref = weakref.ref(obj)
+            else:
+                ref = None
+
+            flow_run_context.run_results[id(obj)] = (linked_state, run_type, ref)
 
         visit_collection(expr=result, visit_fn=link_if_trackable, max_depth=1)
 
@@ -746,20 +818,27 @@ def resolve_to_final_result(expr: Any, context: dict[str, Any]) -> Any:
 
     assert state
 
-    # Do not allow uncompleted upstreams except failures when `allow_failure` has
-    # been used
+    # Do not allow uncompleted upstreams unless `allow_failure` has been used
+    # for failed or failure-derived (PENDING/NotReady) states
     if not state.is_completed() and not (
         # TODO: Note that the contextual annotation here is only at the current level
         #       if `allow_failure` is used then another annotation is used, this will
         #       incorrectly evaluate to false — to resolve this, we must track all
         #       annotations wrapping the current expression but this is not yet
         #       implemented.
-        isinstance(context.get("annotation"), allow_failure) and state.is_failed()
+        isinstance(context.get("annotation"), allow_failure)
+        and (state.is_failed() or (state.is_pending() and state.name == "NotReady"))
     ):
         raise UpstreamTaskError(
             f"Upstream task run '{state.state_details.task_run_id}' did not reach a"
             " 'COMPLETED' state."
         )
+
+    # When allow_failure is used and the state is not final (e.g. PENDING/NotReady
+    # from a cascading upstream failure), we cannot call state.result() because it
+    # raises UnfinishedRun.  Return the state's data directly instead.
+    if not state.is_final() and isinstance(context.get("annotation"), allow_failure):
+        return state.data
 
     result: Any = state.result(raise_on_failure=False, _sync=True)  # pyright: ignore[reportCallIssue] _sync messes up type inference and can be removed once async_dispatch is removed
 
@@ -819,7 +898,8 @@ def resolve_inputs_sync(
             raise PrefectException(
                 f"Failed to resolve inputs in parameter {parameter!r}. If your"
                 " parameter type is not supported, consider using the `quote`"
-                " annotation to skip resolution of inputs."
+                " annotation to skip resolution of inputs, or the `opaque`"
+                " annotation to resolve the value without traversing its contents."
             ) from exc
 
     return resolved_parameters

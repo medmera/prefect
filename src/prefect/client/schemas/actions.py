@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import datetime
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union
+from typing import Annotated, Any, Callable, Optional, TypeVar, Union
 from uuid import UUID, uuid4
 
 import jsonschema
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 import prefect.client.schemas.objects as objects
 from prefect._internal.schemas.bases import ActionBaseModel
 from prefect._internal.schemas.validators import (
     convert_to_strings,
+    normalize_schedule_rrule,
     remove_old_deployment_fields,
     validate_name_present_on_nonanonymous_blocks,
     validate_schedule_max_scheduled_runs,
 )
+from prefect._result_records import ResultRecordMetadata
 from prefect.client.schemas.objects import (
     StateDetails,
     StateType,
@@ -50,9 +60,6 @@ from prefect.types.names import (
 from prefect.utilities.collections import visit_collection
 from prefect.utilities.pydantic import get_class_fields_only
 
-if TYPE_CHECKING:
-    from prefect._result_records import ResultRecordMetadata
-
 R = TypeVar("R")
 
 
@@ -63,7 +70,7 @@ class StateCreate(ActionBaseModel):
     name: Optional[str] = Field(default=None)
     message: Optional[str] = Field(default=None, examples=["Run started"])
     state_details: StateDetails = Field(default_factory=StateDetails)
-    data: Union["ResultRecordMetadata", Any] = Field(
+    data: Union[ResultRecordMetadata, Any] = Field(
         default=None,
     )
 
@@ -93,8 +100,21 @@ class FlowUpdate(ActionBaseModel):
     )
 
 
+# Bare RRule schedules arriving via the API write path get an explicit
+# DTSTART injected here so the scheduler doesn't fall back to the legacy
+# 2020 anchor on every loop. The validator is attached to the *field*
+# (via Annotated) rather than to RRuleSchedule itself — if it lived on
+# the schedule class, it would also fire on every DB read and re-phase
+# INTERVAL>1 schedules. See PrefectHQ/prefect#21362.
+#
+# Fields that accept `None` (e.g. `DeploymentScheduleUpdate.schedule`)
+# use `Optional[NormalizedSchedule]` directly — Pydantic only runs the
+# `AfterValidator` on the non-None branch.
+NormalizedSchedule = Annotated[SCHEDULE_TYPES, AfterValidator(normalize_schedule_rrule)]
+
+
 class DeploymentScheduleCreate(ActionBaseModel):
-    schedule: SCHEDULE_TYPES = Field(
+    schedule: NormalizedSchedule = Field(
         default=..., description="The schedule for the deployment."
     )
     active: bool = Field(
@@ -111,6 +131,10 @@ class DeploymentScheduleCreate(ActionBaseModel):
     slug: Optional[str] = Field(
         default=None,
         description="A unique identifier for the schedule.",
+    )
+    replaces: Optional[str] = Field(
+        default=None,
+        description="The slug of an existing schedule that this schedule replaces. Used for renaming slugs.",
     )
 
     @field_validator("active", mode="wrap")
@@ -171,7 +195,7 @@ class DeploymentScheduleCreate(ActionBaseModel):
 
 
 class DeploymentScheduleUpdate(ActionBaseModel):
-    schedule: Optional[SCHEDULE_TYPES] = Field(
+    schedule: Optional[NormalizedSchedule] = Field(
         default=None, description="The schedule for the deployment."
     )
     active: Optional[bool] = Field(
@@ -189,6 +213,10 @@ class DeploymentScheduleUpdate(ActionBaseModel):
     slug: Optional[str] = Field(
         default=None,
         description="A unique identifier for the schedule.",
+    )
+    replaces: Optional[str] = Field(
+        default=None,
+        description="The slug of an existing schedule that this schedule replaces. Used for renaming slugs.",
     )
 
     @field_validator("max_scheduled_runs")
@@ -537,6 +565,27 @@ class DeploymentFlowRunCreate(ActionBaseModel):
                 values["parameters"], convert_value, return_data=True
             )
         return values
+
+    @field_serializer("parameters", when_used="json")
+    def serialize_parameters(self, value: dict[str, Any]) -> dict[str, Any]:
+        """Serialize datetime types as ISO strings instead of timestamps.
+
+        PrefectBaseModel has ser_json_timedelta='float' to serialize timedeltas as floats,
+        but this also causes datetime/date/time to serialize as timestamps. This serializer
+        overrides that behavior for datetime types while preserving float serialization for
+        timedeltas.
+        """
+
+        def convert_temporal(v: Any) -> Any:
+            if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+                return v.isoformat()
+            elif isinstance(v, dict):
+                return {k: convert_temporal(val) for k, val in v.items()}
+            elif isinstance(v, list):
+                return [convert_temporal(item) for item in v]
+            return v
+
+        return {k: convert_temporal(v) for k, v in value.items()}
 
 
 class SavedSearchCreate(ActionBaseModel):

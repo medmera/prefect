@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import uuid
 from uuid import uuid4
 
@@ -43,6 +44,33 @@ class TestCreateTaskRun:
         )
         assert task_run
         assert task_run.flow_run_id == flow_run.id
+
+    async def test_create_task_run_with_content_no_content_type(self, flow_run, client):
+        """Old clients (<3.6.19) sent JSON via httpx's content= parameter,
+        which omits the Content-Type header. The server should still accept it."""
+        task_run_data = {
+            "flow_run_id": str(flow_run.id),
+            "task_key": "my-task-key",
+            "name": "my-old-client-task-run",
+            "dynamic_key": "0",
+        }
+        response = await client.post(
+            "/task_runs/",
+            content=json.dumps(task_run_data),
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["name"] == "my-old-client-task-run"
+
+    async def test_create_task_run_empty_body_no_content_type(self, client):
+        """A POST with no body and no Content-Type should not be forced to
+        application/json — it should fail with a normal validation error,
+        not a JSON parse error."""
+        response = await client.post(
+            "/task_runs/",
+            content=b"",
+            headers={"content-length": "0"},
+        )
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
     async def test_create_task_run_gracefully_upserts(self, flow_run, client):
         # create a task run
@@ -649,11 +677,52 @@ class TestPaginateTaskRuns:
         response = await client.post("/task_runs/paginate", json=dict(page=-1))
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
+    async def test_paginate_task_runs_includes_duration_fields(
+        self, flow_run: FlowRun, session: AsyncSession, client: AsyncClient
+    ):
+        """Test that paginate returns duration fields like total_run_time."""
+        now = now_fn("UTC")
+        await models.task_runs.create_task_run(
+            session=session,
+            task_run=schemas.core.TaskRun(
+                name="Task Run with Duration",
+                flow_run_id=flow_run.id,
+                task_key="my-key",
+                dynamic_key="0",
+                expected_start_time=now - datetime.timedelta(seconds=5),
+                start_time=now,
+                end_time=now + datetime.timedelta(seconds=10),
+                total_run_time=datetime.timedelta(seconds=10),
+            ),
+        )
+        await session.commit()
+
+        response = await client.post("/task_runs/paginate")
+        assert response.status_code == status.HTTP_200_OK
+
+        data = response.json()
+        assert len(data["results"]) == 1
+        result = data["results"][0]
+
+        # Verify duration fields are present
+        assert "total_run_time" in result
+        assert "estimated_run_time" in result
+        assert "estimated_start_time_delta" in result
+        assert "start_time" in result
+        assert "end_time" in result
+
+        # Verify the values - estimated fields are computed from the base fields
+        assert result["total_run_time"] == 10.0
+        # estimated_run_time should equal total_run_time when not in RUNNING state
+        assert result["estimated_run_time"] == 10.0
+        # estimated_start_time_delta should be 5 seconds (start_time - expected_start_time)
+        assert result["estimated_start_time_delta"] == 5.0
+
 
 class TestDeleteTaskRuns:
-    async def test_delete_task_runs(self, task_run, client, session):
+    async def test_delete_task_runs(self, task_run, hosted_api_client, session):
         # delete the task run
-        response = await client.delete(f"/task_runs/{task_run.id}")
+        response = await hosted_api_client.delete(f"/task_runs/{task_run.id}")
         assert response.status_code == status.HTTP_204_NO_CONTENT
 
         # make sure it's deleted
@@ -663,20 +732,24 @@ class TestDeleteTaskRuns:
             session=session, task_run_id=task_run_id
         )
         assert run is None
-        response = await client.get(f"/task_runs/{task_run_id}")
+        response = await hosted_api_client.get(f"/task_runs/{task_run_id}")
         assert response.status_code == status.HTTP_404_NOT_FOUND
 
-    async def test_delete_task_run_returns_404_if_does_not_exist(self, client):
-        response = await client.delete(f"/task_runs/{uuid4()}")
+    async def test_delete_task_run_returns_404_if_does_not_exist(
+        self, hosted_api_client
+    ):
+        response = await hosted_api_client.delete(f"/task_runs/{uuid4()}")
         assert response.status_code == status.HTTP_404_NOT_FOUND
 
-    async def test_delete_task_run_deletes_logs(self, task_run, logs, client, session):
+    async def test_delete_task_run_deletes_logs(
+        self, task_run, logs, hosted_api_client, session
+    ):
         # make sure we have task run logs
         task_run_logs = [log for log in logs if log.task_run_id is not None]
         assert len(task_run_logs) > 0
 
         # delete the task run
-        response = await client.delete(f"/task_runs/{task_run.id}")
+        response = await hosted_api_client.delete(f"/task_runs/{task_run.id}")
         assert response.status_code == status.HTTP_204_NO_CONTENT, response.text
 
         async def read_logs():

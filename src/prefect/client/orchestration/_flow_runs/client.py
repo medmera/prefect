@@ -281,8 +281,9 @@ class FlowRunClient(BaseClient):
             work_pool_filter: filter criteria for work pools
             work_queue_filter: filter criteria for work pool queues
             sort: sort criteria for the flow runs
-            limit: limit for the flow run query
-            offset: offset for the flow run query
+            limit: maximum number of flow runs to return. When `None`, the server
+                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+            offset: an offset for the flow run query.
 
         Returns:
             a list of Flow Run model representations
@@ -456,6 +457,7 @@ class FlowRunClient(BaseClient):
             value: The input value.
             sender: The sender of the input.
         """
+        from prefect.client.schemas.objects import FlowRunInput
 
         # Initialize the input to ensure that the key is valid.
         FlowRunInput(flow_run_id=flow_run_id, key=key, value=value)
@@ -779,8 +781,9 @@ class FlowRunAsyncClient(BaseAsyncClient):
             work_pool_filter: filter criteria for work pools
             work_queue_filter: filter criteria for work pool queues
             sort: sort criteria for the flow runs
-            limit: limit for the flow run query
-            offset: offset for the flow run query
+            limit: maximum number of flow runs to return. When `None`, the server
+                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+            offset: an offset for the flow run query.
 
         Returns:
             a list of Flow Run model representations

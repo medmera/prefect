@@ -9,7 +9,7 @@ import type { Flow } from "@/api/flows";
 import type { components } from "@/api/prefect";
 import { getQueryService } from "@/api/service";
 
-export type FlowRun = components["schemas"]["FlowRun"];
+export type FlowRun = components["schemas"]["FlowRunResponse"];
 export type FlowRunWithFlow = FlowRun & {
 	flow: Flow;
 };
@@ -26,7 +26,34 @@ export type FlowRunsPaginateFilter =
 export type FlowRunsCountFilter =
 	components["schemas"]["Body_count_flow_runs_flow_runs_count_post"];
 
+export type FlowRunHistoryFilter =
+	components["schemas"]["Body_read_flow_run_history_ui_flow_runs_history_post"];
+
+export type SimpleFlowRun = components["schemas"]["SimpleFlowRun"];
+
 export type CreateNewFlowRun = components["schemas"]["DeploymentFlowRunCreate"];
+
+/**
+ * Converts a FlowRunsFilter to a FlowRunsCountFilter by extracting only the
+ * filter properties that are valid for the count endpoint.
+ *
+ * The count endpoint does not accept sort, limit, or offset parameters.
+ *
+ * @param filter - The FlowRunsFilter to convert
+ * @returns A FlowRunsCountFilter with only the valid filter properties
+ */
+export function toFlowRunsCountFilter(
+	filter: FlowRunsFilter,
+): FlowRunsCountFilter {
+	return {
+		flows: filter.flows,
+		flow_runs: filter.flow_runs,
+		task_runs: filter.task_runs,
+		deployments: filter.deployments,
+		work_pools: filter.work_pools,
+		work_pool_queues: filter.work_pool_queues,
+	};
+}
 
 /**
  * The request body for setting a flow run state
@@ -81,8 +108,13 @@ export const queryKeyFactory = {
 	lateness: () => [...queryKeyFactory.all(), "lateness"] as const,
 	latenessWithFilter: (filter: FlowRunsFilter) =>
 		[...queryKeyFactory.lateness(), filter] as const,
+	history: () => [...queryKeyFactory.all(), "history"] as const,
+	historyWithFilter: (filter: FlowRunHistoryFilter) =>
+		[...queryKeyFactory.history(), filter] as const,
 	details: () => [...queryKeyFactory.all(), "details"] as const,
 	detail: (id: string) => [...queryKeyFactory.details(), id] as const,
+	input: (id: string, key: string) =>
+		[...queryKeyFactory.detail(id), "input", key] as const,
 };
 
 /**
@@ -112,7 +144,7 @@ export const buildFilterFlowRunsQuery = (
 	return queryOptions({
 		queryKey: queryKeyFactory.filter(filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST("/flow_runs/filter", {
+			const res = await (await getQueryService()).POST("/flow_runs/filter", {
 				body: filter,
 			});
 			return res.data ?? ([] satisfies FlowRun[]);
@@ -143,7 +175,7 @@ export const buildPaginateFlowRunsQuery = (
 	return queryOptions({
 		queryKey: queryKeyFactory.paginate(filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST("/flow_runs/paginate", {
+			const res = await (await getQueryService()).POST("/flow_runs/paginate", {
 				body: filter,
 			});
 			if (!res.data) {
@@ -172,7 +204,7 @@ export const buildGetFlowRunDetailsQuery = (id: string) => {
 	return queryOptions({
 		queryKey: queryKeyFactory.detail(id),
 		queryFn: async () => {
-			const res = await getQueryService().GET("/flow_runs/{id}", {
+			const res = await (await getQueryService()).GET("/flow_runs/{id}", {
 				params: { path: { id } },
 			});
 
@@ -181,6 +213,33 @@ export const buildGetFlowRunDetailsQuery = (id: string) => {
 					`Received empty response from server for flow run ${id}`,
 				);
 			}
+			return res.data;
+		},
+	});
+};
+
+/**
+ * Builds a query configuration for fetching flow run input by key
+ *
+ * @param id - The flow run id
+ * @param key - The input key (e.g., "schema", "description")
+ * @returns Query configuration object for use with TanStack Query
+ *
+ * @example
+ * ```ts
+ * const { data: schema } = useQuery(buildGetFlowRunInputQuery(flowRunId, "schema"));
+ * ```
+ */
+export const buildGetFlowRunInputQuery = (id: string, key: string) => {
+	return queryOptions({
+		queryKey: queryKeyFactory.input(id, key),
+		queryFn: async () => {
+			const res = await (await getQueryService()).GET(
+				"/flow_runs/{id}/input/{key}",
+				{
+					params: { path: { id, key } },
+				},
+			);
 			return res.data;
 		},
 	});
@@ -209,7 +268,7 @@ export const buildCountFlowRunsQuery = (
 	queryOptions({
 		queryKey: queryKeyFactory.count(filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST("/flow_runs/count", {
+			const res = await (await getQueryService()).POST("/flow_runs/count", {
 				body: filter,
 			});
 			return res.data ?? 0;
@@ -244,13 +303,52 @@ export const buildAverageLatenessFlowRunsQuery = (
 	queryOptions({
 		queryKey: queryKeyFactory.latenessWithFilter(filter),
 		queryFn: async (): Promise<number | null> => {
-			const res = await getQueryService().POST("/flow_runs/lateness", {
+			const res = await (await getQueryService()).POST("/flow_runs/lateness", {
 				body: filter,
 			});
 			return res.data ?? null;
 		},
 		refetchInterval,
 		placeholderData: keepPreviousData,
+	});
+
+/**
+ * Builds a query configuration for fetching flow run history for scatter plot visualization
+ *
+ * @param filter - Filter parameters for the flow run history query.
+ * @param refetchInterval - Interval for refetching the history (default 30 seconds)
+ * @returns Query configuration object for use with TanStack Query
+ *
+ * @example
+ * ```ts
+ * const { data: history } = useSuspenseQuery(buildFlowRunHistoryQuery({
+ *   sort: "EXPECTED_START_TIME_DESC",
+ *   limit: 1000
+ * }));
+ * ```
+ */
+export const buildFlowRunHistoryQuery = (
+	filter: FlowRunHistoryFilter = {
+		sort: "EXPECTED_START_TIME_DESC",
+		limit: 1000,
+		offset: 0,
+	},
+	refetchInterval = 30_000,
+) =>
+	queryOptions({
+		queryKey: queryKeyFactory.historyWithFilter(filter),
+		queryFn: async () => {
+			const res = await (await getQueryService()).POST(
+				"/ui/flow_runs/history",
+				{
+					body: filter,
+				},
+			);
+			return res.data ?? ([] satisfies SimpleFlowRun[]);
+		},
+		placeholderData: keepPreviousData,
+		staleTime: 1000,
+		refetchInterval,
 	});
 
 // ----- ✍🏼 Mutations 🗄️
@@ -280,8 +378,8 @@ export const buildAverageLatenessFlowRunsQuery = (
 export const useDeleteFlowRun = () => {
 	const queryClient = useQueryClient();
 	const { mutate: deleteFlowRun, ...rest } = useMutation({
-		mutationFn: (id: string) =>
-			getQueryService().DELETE("/flow_runs/{id}", {
+		mutationFn: async (id: string) =>
+			(await getQueryService()).DELETE("/flow_runs/{id}", {
 				params: { path: { id } },
 			}),
 		onSuccess: () => {
@@ -325,7 +423,7 @@ export const useDeploymentCreateFlowRun = () => {
 	const queryClient = useQueryClient();
 	const { mutate: createDeploymentFlowRun, ...rest } = useMutation({
 		mutationFn: async ({ id, ...body }: MutateCreateFlowRun) => {
-			const res = await getQueryService().POST(
+			const res = await (await getQueryService()).POST(
 				"/deployments/{id}/create_flow_run",
 				{
 					body,
@@ -371,10 +469,13 @@ export const useSetFlowRunState = () => {
 	const queryClient = useQueryClient();
 	const { mutate: setFlowRunState, ...rest } = useMutation({
 		mutationFn: async ({ id, ...params }: SetFlowRunStateParams) => {
-			const res = await getQueryService().POST("/flow_runs/{id}/set_state", {
-				params: { path: { id } },
-				body: params,
-			});
+			const res = await (await getQueryService()).POST(
+				"/flow_runs/{id}/set_state",
+				{
+					params: { path: { id } },
+					body: params,
+				},
+			);
 
 			if (!res.data) {
 				throw new Error("'data' expected");
@@ -405,7 +506,7 @@ export const useSetFlowRunState = () => {
 
 			return { previousFlowRun };
 		},
-		onError: (err, { id }, context) => {
+		onError: (_err, { id }, context) => {
 			// Roll back optimistic update on error
 			if (context?.previousFlowRun) {
 				queryClient.setQueryData(
@@ -413,10 +514,6 @@ export const useSetFlowRunState = () => {
 					context.previousFlowRun,
 				);
 			}
-
-			throw err instanceof Error
-				? err
-				: new Error("Failed to update flow run state");
 		},
 		onSettled: (_data, _error, { id }) => {
 			void Promise.all([
@@ -430,3 +527,73 @@ export const useSetFlowRunState = () => {
 		...rest,
 	};
 };
+
+/**
+ * Parameters for resuming a flow run
+ */
+type ResumeFlowRunParams = {
+	id: string;
+	runInput?: Record<string, unknown>;
+};
+
+/**
+ * Hook for resuming a paused flow run
+ *
+ * @returns Mutation object for resuming a flow run with loading/error states and trigger function
+ *
+ * @example
+ * ```ts
+ * const { resumeFlowRun, isPending } = useResumeFlowRun();
+ *
+ * resumeFlowRun({ id: "flow-run-id" }, {
+ *   onSuccess: () => toast.success("Flow run resumed"),
+ *   onError: (error) => toast.error(error.message)
+ * });
+ * ```
+ */
+export const useResumeFlowRun = () => {
+	const queryClient = useQueryClient();
+	const {
+		mutate: resumeFlowRun,
+		mutateAsync: resumeFlowRunAsync,
+		...rest
+	} = useMutation({
+		mutationFn: async ({ id, runInput }: ResumeFlowRunParams) => {
+			const res = await (await getQueryService()).POST(
+				"/flow_runs/{id}/resume",
+				{
+					params: { path: { id } },
+					body: runInput ? { run_input: runInput } : undefined,
+				},
+			);
+
+			if (!res.data) {
+				throw new Error("'data' expected");
+			}
+
+			// Check orchestration result status
+			if (res.data.status !== "ACCEPT") {
+				const reason =
+					res.data.details && "reason" in res.data.details
+						? res.data.details.reason
+						: "Resume request was not accepted";
+				throw new Error(reason ?? "Resume request was not accepted");
+			}
+
+			return res.data;
+		},
+		onSettled: (_data, _error, { id }) => {
+			void Promise.all([
+				queryClient.invalidateQueries({ queryKey: queryKeyFactory.lists() }),
+				queryClient.invalidateQueries({ queryKey: queryKeyFactory.detail(id) }),
+			]);
+		},
+	});
+	return {
+		resumeFlowRun,
+		resumeFlowRunAsync,
+		...rest,
+	};
+};
+
+export * from "./state-utilities";

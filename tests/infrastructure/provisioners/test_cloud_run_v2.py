@@ -2,7 +2,7 @@ import json
 import re
 import shlex
 from typing import Optional, Union
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from anyio import run_process
@@ -15,7 +15,6 @@ from prefect.settings import (
     PREFECT_DEFAULT_DOCKER_BUILD_NAMESPACE,
     load_current_profile,
 )
-from prefect.testing.utilities import AsyncMock
 from prefect.types import SecretDict
 
 default_cloud_run_v2_push_base_job_template = {
@@ -145,10 +144,10 @@ default_cloud_run_v2_push_base_job_template = {
             },
             "timeout": {
                 "title": "Job Timeout",
-                "description": "The length of time that Prefect will wait for a Cloud Run Job to complete before raising an exception (maximum of 86400 seconds, 1 day).",
+                "description": "The length of time that Prefect will wait for a Cloud Run Job to complete before raising an exception (maximum of 604800 seconds, 7 days).",
                 "default": 600,
                 "exclusiveMinimum": 0,
-                "maximum": 86400,
+                "maximum": 604800,
                 "type": "integer",
             },
             "vpc_connector_name": {
@@ -348,7 +347,7 @@ async def test_provision_interactive_with_default_names(
     mock_confirm = MagicMock(return_value=True)
 
     monkeypatch.setattr(
-        "prefect.infrastructure.provisioners.cloud_run.prompt_select_from_table",
+        "prefect.cli._prompts.prompt_select_from_table",
         mock_prompt_select_from_table,
     )
     monkeypatch.setattr(
@@ -427,11 +426,9 @@ async def test_provision_interactive_with_custom_names(
     )
     mock_confirm = MagicMock(return_value=True)
 
+    monkeypatch.setattr("prefect.cli._prompts.prompt", mock_prompt)
     monkeypatch.setattr(
-        "prefect.infrastructure.provisioners.cloud_run.prompt", mock_prompt
-    )
-    monkeypatch.setattr(
-        "prefect.infrastructure.provisioners.cloud_run.prompt_select_from_table",
+        "prefect.cli._prompts.prompt_select_from_table",
         mock_prompt_select_from_table,
     )
     monkeypatch.setattr(
@@ -502,7 +499,7 @@ async def test_provision_interactive_reject_provisioning(
     mock_confirm = MagicMock(return_value=False)
 
     monkeypatch.setattr(
-        "prefect.infrastructure.provisioners.cloud_run.prompt_select_from_table",
+        "prefect.cli._prompts.prompt_select_from_table",
         mock_prompt_select_from_table,
     )
     monkeypatch.setattr(

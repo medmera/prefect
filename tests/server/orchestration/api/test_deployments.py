@@ -7,6 +7,7 @@ import sqlalchemy as sa
 from httpx._client import AsyncClient
 from starlette import status
 
+from prefect._internal.testing import retry_asserts
 from prefect.client.schemas.responses import DeploymentResponse
 from prefect.server import models, schemas
 from prefect.server.database.orm_models import Flow
@@ -606,6 +607,7 @@ class TestCreateDeployment:
         assert deployment_response.job_variables == {"cpu": 24}
         assert deployment_response.work_pool_name == work_pool.name
         assert deployment_response.work_queue_name == work_queue_1.name
+        assert deployment_response.work_queue_id == work_queue_1.id
 
         deployment = await models.deployments.read_deployment(
             session=session, deployment_id=deployment_response.id
@@ -649,6 +651,7 @@ class TestCreateDeployment:
         assert deployment_response.job_variables == {"cpu": 24}
         assert deployment_response.work_pool_name == work_pool.name
         assert deployment_response.work_queue_name == default_queue.name
+        assert deployment_response.work_queue_id == work_pool.default_queue_id
 
         deployment = await models.deployments.read_deployment(
             session=session, deployment_id=deployment_response.id
@@ -690,6 +693,9 @@ class TestCreateDeployment:
             session=session, work_pool_name=work_pool.name, work_queue_name="new-queue"
         )
         assert work_queue is not None
+
+        # Regression test for #19415: work_queue_id should be in API response
+        assert response.json()["work_queue_id"] == str(work_queue.id)
 
         deployment = await models.deployments.read_deployment(
             session=session, deployment_id=deployment_id
@@ -1180,6 +1186,36 @@ class TestCreateDeployment:
         assert response.status_code == 200
         assert response.json().get("schedules") == []
 
+    async def test_create_deployment_with_oversized_parameters_returns_422(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        large_params = {"data": "x" * 1_000_000}
+        response = await client.post(
+            "/deployments/",
+            json={
+                "name": "Oversized Deployment",
+                "flow_id": str(flow.id),
+                "parameters": large_params,
+            },
+        )
+        assert response.status_code == 422
+
+    async def test_create_deployment_with_small_parameters_succeeds(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        small_params = {"data": "x" * 100}
+        data = DeploymentCreate(
+            name="Small Params Deployment",
+            flow_id=flow.id,
+            parameters=small_params,
+        ).model_dump(mode="json")
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+
 
 class TestReadDeployment:
     async def test_read_deployment(
@@ -1574,6 +1610,47 @@ class TestPaginateDeployments:
         response = await client.post("/deployments/paginate")
         assert response.status_code == status.HTTP_200_OK
         assert response.json()["results"] == []
+
+    async def test_paginate_deployments_empty_like_filter_returns_all(
+        self, deployments, client
+    ):
+        """Empty like_ string should be treated as no filter, returning all deployments."""
+        deployment_filter = dict(
+            deployments=schemas.filters.DeploymentFilter(
+                flow_or_deployment_name=schemas.filters.DeploymentOrFlowNameFilter(
+                    like_=""
+                )
+            ).model_dump(mode="json")
+        )
+        response = await client.post("/deployments/paginate", json=deployment_filter)
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["count"] == 2
+
+    async def test_paginate_deployments_empty_tags_all_filter_returns_all(
+        self, deployments, client
+    ):
+        """Empty all_ list should be treated as no filter, returning all deployments."""
+        deployment_filter = dict(
+            deployments=schemas.filters.DeploymentFilter(
+                tags=schemas.filters.DeploymentFilterTags(all_=[])
+            ).model_dump(mode="json")
+        )
+        response = await client.post("/deployments/paginate", json=deployment_filter)
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["count"] == 2
+
+    async def test_paginate_deployments_empty_name_like_filter_returns_all(
+        self, deployments, client
+    ):
+        """Empty like_ string on name filter should be treated as no filter."""
+        deployment_filter = dict(
+            deployments=schemas.filters.DeploymentFilter(
+                name=schemas.filters.DeploymentFilterName(like_="")
+            ).model_dump(mode="json")
+        )
+        response = await client.post("/deployments/paginate", json=deployment_filter)
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["count"] == 2
 
 
 class TestUpdateDeployment:
@@ -2557,6 +2634,346 @@ class TestUpdateDeployment:
             in response.json()["exception_detail"][0]["msg"]
         )
 
+    async def test_update_deployment_schedule_with_replaces_renames_slug(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """When a schedule has 'replaces', it should update the existing schedule with that slug."""
+        schedule1 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=1)
+        )
+
+        # Create deployment with initial schedule
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-replaces",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schedule1,
+                    active=True,
+                    slug="old-schedule-slug",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+        original_schedule_id = response.json()["schedules"][0]["id"]
+
+        # Update with replaces
+        schedule2 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=2)
+        )
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    schedule=schedule2,
+                    slug="new-schedule-slug",
+                    replaces="old-schedule-slug",
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 204
+
+        # Verify the schedule was renamed, not recreated
+        response = await client.get(f"/deployments/{deployment_id}")
+        assert response.status_code == 200
+        schedules = response.json()["schedules"]
+        assert len(schedules) == 1
+        assert schedules[0]["slug"] == "new-schedule-slug"
+        assert schedules[0]["id"] == original_schedule_id  # Same schedule, just renamed
+        assert schedules[0]["schedule"]["interval"] == 172800.0  # 2 days in seconds
+
+    async def test_update_deployment_schedule_replaces_nonexistent_slug_warns_and_creates(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """When 'replaces' points to a non-existent slug, warn and create new schedule."""
+        schedule1 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=1)
+        )
+
+        # Create deployment with initial schedule
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-replaces-nonexistent",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schedule1,
+                    active=True,
+                    slug="existing-slug",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+
+        # Update with replaces pointing to non-existent slug
+        schedule2 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=2)
+        )
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="existing-slug",  # Keep existing
+                ),
+                schemas.actions.DeploymentScheduleUpdate(
+                    schedule=schedule2,
+                    slug="new-slug",
+                    replaces="nonexistent-slug",  # This doesn't exist
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 204
+
+        # Verify both schedules exist (original preserved, new created)
+        response = await client.get(f"/deployments/{deployment_id}")
+        assert response.status_code == 200
+        schedules = response.json()["schedules"]
+        assert len(schedules) == 2
+        slugs = {s["slug"] for s in schedules}
+        assert slugs == {"existing-slug", "new-slug"}
+
+    async def test_update_deployment_schedule_multiple_replaces_same_target_errors(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """When multiple schedules have 'replaces' pointing to the same slug, return 422."""
+        schedule1 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=1)
+        )
+
+        # Create deployment with initial schedule
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-replaces-conflict",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schedule1,
+                    active=True,
+                    slug="target-slug",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+
+        # Update with two schedules both replacing the same slug
+        schedule2 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=2)
+        )
+        schedule3 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=3)
+        )
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    schedule=schedule2,
+                    slug="new-slug-1",
+                    replaces="target-slug",
+                ),
+                schemas.actions.DeploymentScheduleUpdate(
+                    schedule=schedule3,
+                    slug="new-slug-2",
+                    replaces="target-slug",  # Same target - should error
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 422
+        assert (
+            "Multiple schedules have 'replaces' targeting the same slug"
+            in response.text
+        )
+
+    async def test_update_deployment_schedule_replaces_collision_with_existing_slug(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """When 'replaces' renames to a slug that already exists, return 422."""
+        schedule1 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=1)
+        )
+        schedule2 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=2)
+        )
+
+        # Create deployment with two schedules
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-replaces-collision",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schedule1,
+                    active=True,
+                    slug="old-slug",
+                ),
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schedule2,
+                    active=True,
+                    slug="existing-slug",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+
+        # Try to rename old-slug to existing-slug (collision)
+        schedule3 = schemas.schedules.IntervalSchedule(
+            interval=datetime.timedelta(days=3)
+        )
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    schedule=schedule3,
+                    slug="existing-slug",  # This already exists!
+                    replaces="old-slug",
+                ),
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="existing-slug",  # Keep this one unchanged
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 422
+        assert (
+            "Cannot rename schedule from 'old-slug' to 'existing-slug'" in response.text
+        )
+        assert "already exists" in response.text
+
+    async def test_update_deployment_schedule_replaces_chain_rename(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """Chain rename (a->b, b->c) should update both schedules without collisions."""
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-chain-rename",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schemas.schedules.IntervalSchedule(
+                        interval=datetime.timedelta(days=1)
+                    ),
+                    active=True,
+                    slug="a",
+                ),
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schemas.schedules.IntervalSchedule(
+                        interval=datetime.timedelta(days=2)
+                    ),
+                    active=True,
+                    slug="b",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+        schedules_by_slug = {s["slug"]: s["id"] for s in response.json()["schedules"]}
+        id_a = schedules_by_slug["a"]
+        id_b = schedules_by_slug["b"]
+
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="b",
+                    replaces="a",
+                ),
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="c",
+                    replaces="b",
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 204
+
+        response = await client.get(f"/deployments/{deployment_id}")
+        assert response.status_code == 200
+        schedules = response.json()["schedules"]
+        assert len(schedules) == 2
+        updated_by_slug = {s["slug"]: s["id"] for s in schedules}
+        assert updated_by_slug["b"] == id_a
+        assert updated_by_slug["c"] == id_b
+
+    async def test_update_deployment_schedule_replaces_slug_swap(
+        self,
+        client: AsyncClient,
+        flow: Flow,
+    ):
+        """Slug swap (x->y, y->x) should update both schedules without collisions."""
+        data = DeploymentCreate(  # type: ignore
+            name="test-deployment-slug-swap",
+            flow_id=flow.id,
+            schedules=[
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schemas.schedules.IntervalSchedule(
+                        interval=datetime.timedelta(days=1)
+                    ),
+                    active=True,
+                    slug="x",
+                ),
+                schemas.actions.DeploymentScheduleCreate(
+                    schedule=schemas.schedules.IntervalSchedule(
+                        interval=datetime.timedelta(days=2)
+                    ),
+                    active=True,
+                    slug="y",
+                ),
+            ],
+        ).model_dump(mode="json")
+
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == 201
+        deployment_id = response.json()["id"]
+        schedules_by_slug = {s["slug"]: s["id"] for s in response.json()["schedules"]}
+        id_x = schedules_by_slug["x"]
+        id_y = schedules_by_slug["y"]
+
+        update_data = schemas.actions.DeploymentUpdate(
+            schedules=[
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="y",
+                    replaces="x",
+                ),
+                schemas.actions.DeploymentScheduleUpdate(
+                    slug="x",
+                    replaces="y",
+                ),
+            ],
+        ).model_dump(mode="json", exclude_unset=True)
+
+        response = await client.patch(f"/deployments/{deployment_id}", json=update_data)
+        assert response.status_code == 204
+
+        response = await client.get(f"/deployments/{deployment_id}")
+        assert response.status_code == 200
+        schedules = response.json()["schedules"]
+        assert len(schedules) == 2
+        updated_by_slug = {s["slug"]: s["id"] for s in schedules}
+        assert updated_by_slug["y"] == id_x
+        assert updated_by_slug["x"] == id_y
+
 
 class TestGetScheduledFlowRuns:
     @pytest.fixture
@@ -2659,12 +3076,12 @@ class TestGetScheduledFlowRuns:
 
     async def test_get_scheduled_runs_for_a_deployment(
         self,
-        client,
+        ephemeral_client_with_lifespan,
         deployments,
         flow_runs,
     ):
         deployment_1, _deployment_2 = deployments
-        response = await client.post(
+        response = await ephemeral_client_with_lifespan.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id)]),
         )
@@ -2673,16 +3090,24 @@ class TestGetScheduledFlowRuns:
             str(flow_run.id) for flow_run in flow_runs[:2]
         }
 
-        assert_status_events(deployment_1.name, ["prefect.deployment.ready"])
+        async for attempt in retry_asserts(max_attempts=10, delay=0.5):
+            with attempt:
+                assert_status_events(
+                    deployment_1.name,
+                    [
+                        "prefect.deployment.created",
+                        "prefect.deployment.ready",
+                    ],
+                )
 
     async def test_get_scheduled_runs_for_multiple_deployments(
         self,
-        client,
+        ephemeral_client_with_lifespan,
         deployments,
         flow_runs,
     ):
         deployment_1, deployment_2 = deployments
-        response = await client.post(
+        response = await ephemeral_client_with_lifespan.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id), str(deployment_2.id)]),
         )
@@ -2691,17 +3116,31 @@ class TestGetScheduledFlowRuns:
             str(flow_run.id) for flow_run in flow_runs
         }
 
-        assert_status_events(deployment_1.name, ["prefect.deployment.ready"])
-        assert_status_events(deployment_2.name, ["prefect.deployment.ready"])
+        async for attempt in retry_asserts(max_attempts=10, delay=0.5):
+            with attempt:
+                assert_status_events(
+                    deployment_1.name,
+                    [
+                        "prefect.deployment.created",
+                        "prefect.deployment.ready",
+                    ],
+                )
+                assert_status_events(
+                    deployment_2.name,
+                    [
+                        "prefect.deployment.created",
+                        "prefect.deployment.ready",
+                    ],
+                )
 
     async def test_get_scheduled_runs_respects_limit(
         self,
-        client,
+        hosted_api_client,
         flow_runs,
         deployments,
     ):
         deployment_1, _deployment_2 = deployments
-        response = await client.post(
+        response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id)], limit=1),
         )
@@ -2709,7 +3148,7 @@ class TestGetScheduledFlowRuns:
         assert {res["id"] for res in response.json()} == {str(flow_runs[0].id)}
 
         # limit should still be constrained by Orion settings though
-        response = await client.post(
+        response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(limit=9001),
         )
@@ -2717,13 +3156,13 @@ class TestGetScheduledFlowRuns:
 
     async def test_get_scheduled_runs_respects_scheduled_before(
         self,
-        client,
+        hosted_api_client,
         flow_runs,
         deployments,
     ):
         deployment_1, _deployment_2 = deployments
         # picks up one of the runs for the first deployment, but not the other
-        response = await client.post(
+        response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(
                 deployment_ids=[str(deployment_1.id)],
@@ -2735,13 +3174,13 @@ class TestGetScheduledFlowRuns:
 
     async def test_get_scheduled_runs_sort_order(
         self,
-        client,
+        hosted_api_client,
         flow_runs,
         deployments,
     ):
         """Should sort by next scheduled start time ascending"""
         deployment_1, deployment_2 = deployments
-        response = await client.post(
+        response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id), str(deployment_2.id)]),
         )
@@ -2752,83 +3191,95 @@ class TestGetScheduledFlowRuns:
 
     async def test_get_scheduled_flow_runs_updates_last_polled_time_and_status(
         self,
-        client,
+        hosted_api_client,
         flow_runs,
         deployments,
     ):
         deployment_1, deployment_2 = deployments
 
-        response1 = await client.get(f"/deployments/{deployment_1.id}")
+        response1 = await hosted_api_client.get(f"/deployments/{deployment_1.id}")
         assert response1.status_code == 200
         assert response1.json()["last_polled"] is None
         assert response1.json()["status"] == "NOT_READY"
 
-        response2 = await client.get(f"/deployments/{deployment_2.id}")
+        response2 = await hosted_api_client.get(f"/deployments/{deployment_2.id}")
         assert response2.status_code == 200
         assert response2.json()["last_polled"] is None
         assert response2.json()["status"] == "NOT_READY"
 
-        updated_response = await client.post(
+        updated_response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id)]),
         )
         assert updated_response.status_code == 200
 
-        updated_response_deployment_1 = await client.get(
-            f"/deployments/{deployment_1.id}"
-        )
-        assert updated_response_deployment_1.status_code == 200
+        async for attempt in retry_asserts(max_attempts=10, delay=0.5):
+            with attempt:
+                updated_response_deployment_1 = await hosted_api_client.get(
+                    f"/deployments/{deployment_1.id}"
+                )
+                assert updated_response_deployment_1.status_code == 200
 
-        assert (
-            updated_response_deployment_1.json()["last_polled"]
-            > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
-        )
-        assert updated_response_deployment_1.json()["status"] == "READY"
+                assert updated_response_deployment_1.json()["last_polled"] is not None
+                assert (
+                    updated_response_deployment_1.json()["last_polled"]
+                    > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
+                )
+                assert updated_response_deployment_1.json()["status"] == "READY"
 
-        same_response_deployment_2 = await client.get(f"/deployments/{deployment_2.id}")
-        assert same_response_deployment_2.status_code == 200
-        assert same_response_deployment_2.json()["last_polled"] is None
-        assert same_response_deployment_2.json()["status"] == "NOT_READY"
+                same_response_deployment_2 = await hosted_api_client.get(
+                    f"/deployments/{deployment_2.id}"
+                )
+                assert same_response_deployment_2.status_code == 200
+                assert same_response_deployment_2.json()["last_polled"] is None
+                assert same_response_deployment_2.json()["status"] == "NOT_READY"
 
     async def test_get_scheduled_flow_runs_updates_last_polled_time_and_status_multiple_deployments(
         self,
-        client,
+        hosted_api_client,
         flow_runs,
         deployments,
     ):
         deployment_1, deployment_2 = deployments
 
-        response_1 = await client.get(f"/deployments/{deployment_1.id}")
+        response_1 = await hosted_api_client.get(f"/deployments/{deployment_1.id}")
         assert response_1.status_code == 200
         assert response_1.json()["last_polled"] is None
         assert response_1.json()["status"] == "NOT_READY"
 
-        response_2 = await client.get(f"/deployments/{deployment_2.id}")
+        response_2 = await hosted_api_client.get(f"/deployments/{deployment_2.id}")
         assert response_2.status_code == 200
         assert response_2.json()["last_polled"] is None
         assert response_2.json()["status"] == "NOT_READY"
 
-        updated_response = await client.post(
+        updated_response = await hosted_api_client.post(
             "/deployments/get_scheduled_flow_runs",
             json=dict(deployment_ids=[str(deployment_1.id), str(deployment_2.id)]),
         )
         assert updated_response.status_code == 200
 
-        updated_response_1 = await client.get(f"/deployments/{deployment_1.id}")
-        assert updated_response_1.status_code == 200
-        assert (
-            updated_response_1.json()["last_polled"]
-            > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
-        )
-        assert updated_response_1.json()["status"] == "READY"
+        async for attempt in retry_asserts(max_attempts=10, delay=0.5):
+            with attempt:
+                updated_response_1 = await hosted_api_client.get(
+                    f"/deployments/{deployment_1.id}"
+                )
+                assert updated_response_1.status_code == 200
+                assert updated_response_1.json()["last_polled"] is not None
+                assert (
+                    updated_response_1.json()["last_polled"]
+                    > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
+                )
+                assert updated_response_1.json()["status"] == "READY"
 
-        updated_response_2 = await client.get(f"/deployments/{deployment_2.id}")
-        assert updated_response_2.status_code == 200
-        assert (
-            updated_response_2.json()["last_polled"]
-            > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
-        )
-        assert updated_response_2.json()["status"] == "READY"
+                updated_response_2 = await hosted_api_client.get(
+                    f"/deployments/{deployment_2.id}"
+                )
+                assert updated_response_2.status_code == 200
+                assert (
+                    updated_response_2.json()["last_polled"]
+                    > (now_fn("UTC") - datetime.timedelta(minutes=1)).isoformat()
+                )
+                assert updated_response_2.json()["status"] == "READY"
 
 
 class TestDeleteDeployment:
@@ -3662,3 +4113,212 @@ class TestGetDeploymentWorkQueueCheck:
             assert (
                 q2["filter"]["deployment_ids"] == q3["filter"]["deployment_ids"] is None
             )
+
+
+class TestDeploymentCRUDEvents:
+    @pytest.fixture(autouse=True)
+    def patch_events_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "prefect.server.models.deployments.PrefectServerEventsClient",
+            AssertingEventsClient,
+        )
+
+    async def test_create_deployment_emits_created_event(
+        self, client, flow, flow_function
+    ):
+        data = DeploymentCreate(
+            name="events-test-deployment",
+            flow_id=flow.id,
+        ).model_dump(mode="json")
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == status.HTTP_201_CREATED
+        deployment_id = response.json()["id"]
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.created",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{deployment_id}",
+                "prefect.resource.name": "events-test-deployment",
+            },
+            related=[
+                {
+                    "prefect.resource.id": f"prefect.flow.{flow.id}",
+                    "prefect.resource.name": flow.name,
+                    "prefect.resource.role": "flow",
+                }
+            ],
+        )
+
+    async def test_upsert_existing_deployment_emits_updated_event(
+        self, client, deployment, flow
+    ):
+        data = DeploymentCreate(
+            name=deployment.name,
+            flow_id=flow.id,
+            description="updated via upsert",
+        ).model_dump(mode="json")
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == status.HTTP_200_OK
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.updated",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{deployment.id}",
+                "prefect.resource.name": deployment.name,
+            },
+        )
+
+    async def test_update_deployment_emits_updated_event(
+        self, client, deployment, flow
+    ):
+        response = await client.patch(
+            f"/deployments/{deployment.id}",
+            json={"description": "patched description"},
+        )
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.updated",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{deployment.id}",
+                "prefect.resource.name": deployment.name,
+            },
+            related=[
+                {
+                    "prefect.resource.id": f"prefect.flow.{flow.id}",
+                    "prefect.resource.name": flow.name,
+                    "prefect.resource.role": "flow",
+                }
+            ],
+            payload={
+                "updated_fields": ["description"],
+                "updates": {
+                    "description": {
+                        "from": None,
+                        "to": "patched description",
+                    }
+                },
+            },
+        )
+
+    async def test_update_deployment_with_no_changes_does_not_emit_event(
+        self, client, deployment
+    ):
+        # Patch with same description (None -> None should be no change)
+        response = await client.patch(
+            f"/deployments/{deployment.id}",
+            json={"tags": deployment.tags},
+        )
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+
+        AssertingEventsClient.assert_no_emitted_event_with(
+            event="prefect.deployment.updated",
+        )
+
+    async def test_delete_deployment_emits_deleted_event(
+        self, client, deployment, flow
+    ):
+        deployment_id = deployment.id
+        deployment_name = deployment.name
+
+        response = await client.delete(f"/deployments/{deployment_id}")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.deleted",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{deployment_id}",
+                "prefect.resource.name": deployment_name,
+            },
+            related=[
+                {
+                    "prefect.resource.id": f"prefect.flow.{flow.id}",
+                    "prefect.resource.name": flow.name,
+                    "prefect.resource.role": "flow",
+                }
+            ],
+        )
+
+    async def test_delete_nonexistent_deployment_does_not_emit_event(self, client):
+        response = await client.delete(f"/deployments/{uuid4()}")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+        AssertingEventsClient.assert_no_emitted_event_with(
+            event="prefect.deployment.deleted",
+        )
+
+    async def test_bulk_delete_deployments_emits_deleted_events(
+        self, client, flow, session
+    ):
+        # Create two deployments
+        dep1_data = DeploymentCreate(name="bulk-del-1", flow_id=flow.id).model_dump(
+            mode="json"
+        )
+        dep2_data = DeploymentCreate(name="bulk-del-2", flow_id=flow.id).model_dump(
+            mode="json"
+        )
+        r1 = await client.post("/deployments/", json=dep1_data)
+        r2 = await client.post("/deployments/", json=dep2_data)
+        dep1_id = r1.json()["id"]
+        dep2_id = r2.json()["id"]
+
+        # Reset events after creation
+        AssertingEventsClient.reset()
+
+        response = await client.post(
+            "/deployments/bulk_delete",
+            json={
+                "deployments": {
+                    "operator": "and_",
+                    "id": {"any_": [dep1_id, dep2_id]},
+                },
+            },
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.deleted",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{dep1_id}",
+                "prefect.resource.name": "bulk-del-1",
+            },
+        )
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.deleted",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{dep2_id}",
+                "prefect.resource.name": "bulk-del-2",
+            },
+        )
+
+    async def test_create_deployment_with_work_pool_includes_related_resources(
+        self, client, flow, work_pool, session
+    ):
+        data = DeploymentCreate(
+            name="wp-deployment",
+            flow_id=flow.id,
+            work_pool_name=work_pool.name,
+        ).model_dump(mode="json")
+        response = await client.post("/deployments/", json=data)
+        assert response.status_code == status.HTTP_201_CREATED
+        deployment_id = response.json()["id"]
+
+        AssertingEventsClient.assert_emitted_event_with(
+            event="prefect.deployment.created",
+            resource={
+                "prefect.resource.id": f"prefect.deployment.{deployment_id}",
+                "prefect.resource.name": "wp-deployment",
+            },
+            related=[
+                {
+                    "prefect.resource.id": f"prefect.flow.{flow.id}",
+                    "prefect.resource.name": flow.name,
+                    "prefect.resource.role": "flow",
+                },
+                {
+                    "prefect.resource.id": f"prefect.work-pool.{work_pool.id}",
+                    "prefect.resource.name": work_pool.name,
+                    "prefect.resource.role": "work-pool",
+                },
+            ],
+        )

@@ -1,4 +1,8 @@
-import { Link } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { LogOut } from "lucide-react";
+import { buildGetSettingsQuery } from "@/api/admin";
+import { useAuthSafe } from "@/auth";
 import { Button } from "@/components/ui/button";
 import {
 	Sidebar,
@@ -12,6 +16,25 @@ import {
 } from "@/components/ui/sidebar";
 
 export function AppSidebar() {
+	const auth = useAuthSafe();
+	const navigate = useNavigate();
+
+	const handleLogout = () => {
+		auth?.logout();
+		void navigate({ to: "/login" });
+	};
+
+	const authRequired = auth?.authRequired ?? false;
+
+	const { data: settings } = useQuery(buildGetSettingsQuery());
+	const showPromotionalContent = (() => {
+		const server = (settings as Record<string, unknown> | undefined)?.server as
+			| Record<string, unknown>
+			| undefined;
+		const ui = server?.ui as Record<string, unknown> | undefined;
+		return (ui?.show_promotional_content as boolean | undefined) ?? true;
+	})();
+
 	return (
 		<Sidebar>
 			<SidebarHeader>
@@ -141,25 +164,29 @@ export function AppSidebar() {
 			</SidebarContent>
 			<SidebarFooter>
 				<SidebarMenu>
-					<SidebarMenuItem>
-						<a
-							href="https://prefect.io/cloud-vs-oss?utm_source=oss&utm_medium=oss&utm_campaign=oss&utm_term=none&utm_content=none"
-							target="_blank"
-							rel="noreferrer"
-						>
-							<SidebarMenuButton asChild>
-								<div className="flex items-center justify-between">
-									<span>Ready to scale?</span>
-									<Button size="sm">Upgrade</Button>
-								</div>
-							</SidebarMenuButton>
-						</a>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild>
-							<span>Join the community</span>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
+					{showPromotionalContent && (
+						<>
+							<SidebarMenuItem>
+								<a
+									href="https://prefect.io/cloud-vs-oss?utm_source=oss&utm_medium=oss&utm_campaign=oss&utm_term=none&utm_content=none"
+									target="_blank"
+									rel="noreferrer"
+								>
+									<SidebarMenuButton asChild>
+										<div className="flex items-center justify-between">
+											<span>Ready to scale?</span>
+											<Button size="sm">Upgrade</Button>
+										</div>
+									</SidebarMenuButton>
+								</a>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
+								<SidebarMenuButton asChild>
+									<span>Join the community</span>
+								</SidebarMenuButton>
+							</SidebarMenuItem>
+						</>
+					)}
 					<SidebarMenuItem>
 						<Link to="/settings">
 							{({ isActive }) => (
@@ -169,6 +196,14 @@ export function AppSidebar() {
 							)}
 						</Link>
 					</SidebarMenuItem>
+					{authRequired && (
+						<SidebarMenuItem>
+							<SidebarMenuButton onClick={handleLogout}>
+								<LogOut className="h-4 w-4" />
+								<span>Logout</span>
+							</SidebarMenuButton>
+						</SidebarMenuItem>
+					)}
 				</SidebarMenu>
 			</SidebarFooter>
 		</Sidebar>

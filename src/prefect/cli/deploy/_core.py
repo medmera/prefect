@@ -4,11 +4,11 @@ import inspect
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from rich.markup import escape
 from rich.panel import Panel
 
-import prefect.cli.root as root
 from prefect.cli._prompts import (
     confirm,
     prompt,
@@ -17,7 +17,6 @@ from prefect.cli._prompts import (
     prompt_push_custom_docker_image,
     prompt_select_work_pool,
 )
-from prefect.cli.root import app
 from prefect.client.orchestration import get_client
 from prefect.client.schemas.filters import WorkerFilter
 from prefect.deployments.base import _save_deployment_to_prefect_file
@@ -25,7 +24,7 @@ from prefect.deployments.runner import RunnerDeployment
 from prefect.deployments.steps.core import run_steps
 from prefect.exceptions import ObjectNotFound
 from prefect.flows import load_flow_from_entrypoint
-from prefect.settings import PREFECT_UI_URL
+from prefect.settings import get_current_settings
 from prefect.utilities.callables import parameter_schema
 from prefect.utilities.collections import get_from_dict
 from prefect.utilities.templating import (
@@ -57,6 +56,8 @@ from ._triggers import (
 )
 
 if TYPE_CHECKING:
+    from rich.console import Console
+
     from prefect.client.orchestration import PrefectClient
 
 
@@ -66,6 +67,9 @@ async def _run_single_deploy(
     options: dict[str, Any] | None = None,
     client: Optional["PrefectClient"] = None,
     prefect_file: Path = Path("prefect.yaml"),
+    *,
+    console: "Console",
+    is_interactive: Callable[[], bool],
 ):
     client = client or get_client()
     deploy_config = deepcopy(deploy_config) if deploy_config else {}
@@ -77,7 +81,7 @@ async def _run_single_deploy(
     (
         deploy_config,
         variable_overrides,
-    ) = _apply_cli_options_to_deploy_config(deploy_config, options)
+    ) = _apply_cli_options_to_deploy_config(deploy_config, options, console=console)
 
     build_steps = deploy_config.get("build", actions.get("build")) or []
     push_steps = deploy_config.get("push", actions.get("push")) or []
@@ -90,13 +94,13 @@ async def _run_single_deploy(
     deploy_config = apply_values(deploy_config, os.environ, remove_notset=False)
 
     if not deploy_config.get("entrypoint"):
-        if not root.is_interactive():
+        if not is_interactive():
             raise ValueError(
                 "An entrypoint must be provided:\n\n"
                 " \t[yellow]prefect deploy path/to/file.py:flow_function\n\n"
                 "You can also provide an entrypoint in a prefect.yaml file."
             )
-        deploy_config["entrypoint"] = await prompt_entrypoint(app.console)
+        deploy_config["entrypoint"] = await prompt_entrypoint(console)
 
     flow = load_flow_from_entrypoint(deploy_config["entrypoint"])
 
@@ -104,7 +108,7 @@ async def _run_single_deploy(
 
     deployment_name = deploy_config.get("name")
     if not deployment_name:
-        if not root.is_interactive():
+        if not is_interactive():
             raise ValueError("A deployment name must be provided.")
         deploy_config["name"] = prompt("Deployment name", default="default")
 
@@ -119,20 +123,20 @@ async def _run_single_deploy(
 
             # dont allow submitting to prefect-agent typed work pools
             if work_pool.type == "prefect-agent":
-                if not root.is_interactive():
+                if not is_interactive():
                     raise ValueError(
                         "Cannot create a project-style deployment with work pool of"
                         " type 'prefect-agent'. If you wish to use an agent with"
                         " your deployment, please use the `prefect deployment"
                         " build` command."
                     )
-                app.console.print(
+                console.print(
                     "You've chosen a work pool with type 'prefect-agent' which"
                     " cannot be used for project-style deployments. Let's pick"
                     " another work pool to deploy to."
                 )
                 deploy_config["work_pool"]["name"] = await prompt_select_work_pool(
-                    app.console
+                    console
                 )
         except ObjectNotFound:
             raise ValueError(
@@ -142,7 +146,7 @@ async def _run_single_deploy(
                 " work pool in the Prefect UI."
             )
     else:
-        if not root.is_interactive():
+        if not is_interactive():
             raise ValueError(
                 "A work pool is required to deploy this flow. Please specify a work"
                 " pool name via the '--pool' flag or in your prefect.yaml file."
@@ -150,7 +154,7 @@ async def _run_single_deploy(
         if not isinstance(deploy_config.get("work_pool"), dict):
             deploy_config["work_pool"] = {}
         deploy_config["work_pool"]["name"] = await prompt_select_work_pool(
-            console=app.console
+            console=console
         )
 
     docker_build_steps = [
@@ -189,13 +193,13 @@ async def _run_single_deploy(
     )
 
     if (
-        root.is_interactive()
+        is_interactive()
         and not docker_build_step_exists
         and not build_step_set_to_null
         and image_is_configurable
     ):
         build_docker_image_step = await prompt_build_custom_docker_image(
-            app.console, deploy_config
+            console, deploy_config
         )
         if build_docker_image_step is not None:
             if not get_from_dict(deploy_config, "work_pool.job_variables.image"):
@@ -205,7 +209,7 @@ async def _run_single_deploy(
                 push_docker_image_step,
                 updated_build_docker_image_step,
             ) = await prompt_push_custom_docker_image(
-                app.console, deploy_config, build_docker_image_step
+                console, deploy_config, build_docker_image_step
             )
 
             if actions.get("build"):
@@ -229,7 +233,7 @@ async def _run_single_deploy(
 
     ## CONFIGURE PUSH and/or PULL STEPS FOR REMOTE FLOW STORAGE
     if (
-        root.is_interactive()
+        is_interactive()
         and not (deploy_config.get("pull") or actions.get("pull"))
         and not docker_push_step_exists
         and confirm(
@@ -239,19 +243,12 @@ async def _run_single_deploy(
                 " remote storage location when running this flow?"
             ),
             default=True,
-            console=app.console,
+            console=console,
         )
     ):
         actions = await _generate_actions_for_remote_flow_storage(
-            console=app.console, deploy_config=deploy_config, actions=actions
+            console=console, deploy_config=deploy_config, actions=actions
         )
-
-    if trigger_specs := _gather_deployment_trigger_definitions(
-        options.get("triggers"), deploy_config.get("triggers")
-    ):
-        triggers = _initialize_deployment_triggers(deployment_name, trigger_specs)
-    else:
-        triggers = []
 
     # Prefer the originally captured pull_steps (taken before resolution) to
     # preserve unresolved block placeholders in the deployment spec. Only fall
@@ -261,31 +258,32 @@ async def _run_single_deploy(
         or deploy_config.get("pull")
         or actions.get("pull")
         or await _generate_default_pull_action(
-            app.console,
+            console,
             deploy_config=deploy_config,
             actions=actions,
+            is_interactive=is_interactive,
         )
     )
 
     ## RUN BUILD AND PUSH STEPS
     step_outputs: dict[str, Any] = {}
     if build_steps:
-        app.console.print("Running deployment build steps...")
+        console.print("Running deployment build steps...")
         step_outputs.update(
-            await run_steps(build_steps, step_outputs, print_function=app.console.print)
+            await run_steps(build_steps, step_outputs, print_function=console.print)
         )
 
     if push_steps := push_steps or actions.get("push"):
-        app.console.print("Running deployment push steps...")
+        console.print("Running deployment push steps...")
         step_outputs.update(
-            await run_steps(push_steps, step_outputs, print_function=app.console.print)
+            await run_steps(push_steps, step_outputs, print_function=console.print)
         )
 
     step_outputs.update(variable_overrides)
 
     if update_work_pool_image:
         if "build-image" not in step_outputs:
-            app.console.print(
+            console.print(
                 "Warning: no build-image step found in the deployment build steps."
                 " The work pool image will not be updated."
             )
@@ -294,7 +292,9 @@ async def _run_single_deploy(
     if not deploy_config.get("description"):
         deploy_config["description"] = flow.description
 
-    deploy_config["schedules"] = _construct_schedules(deploy_config, step_outputs)
+    deploy_config["schedules"] = _construct_schedules(
+        deploy_config, step_outputs, console=console, is_interactive=is_interactive
+    )
 
     # save deploy_config before templating
     deploy_config_before_templating = deepcopy(deploy_config)
@@ -303,16 +303,56 @@ async def _run_single_deploy(
 
     _schedules = deploy_config.pop("schedules")
 
-    deploy_config = apply_values(deploy_config, step_outputs, warn_on_notset=True)
+    # Save triggers before templating to preserve event template parameters
+    _triggers = deploy_config.pop("triggers", None)
+
+    # Preserve {{ ctx.* }} placeholders during deploy-time templating.
+    # These are runtime templates resolved by the worker's
+    # prepare_for_flow_run() and must not be stripped here.
+    deploy_config = apply_values(
+        deploy_config,
+        step_outputs,
+        warn_on_notset=True,
+        skip_prefixes=["ctx."],
+    )
     deploy_config["parameter_openapi_schema"] = _parameter_schema
     deploy_config["schedules"] = _schedules
 
+    # This initialises triggers after templating to ensure that jinja variables are resolved
+    # Use the pre-templated trigger specs to preserve event template parameters like {{ event.name }}
+    # while still applying templating to trigger-level fields like enabled
+    if trigger_specs := _gather_deployment_trigger_definitions(
+        options.get("triggers"), _triggers
+    ):
+        # Apply templating only to non-parameter trigger fields to preserve event templates
+        templated_trigger_specs = []
+        for spec in trigger_specs:
+            # Save parameters before templating
+            parameters = spec.pop("parameters", None)
+            # Apply templating to trigger fields (e.g., enabled)
+            templated_spec = apply_values(spec, step_outputs, warn_on_notset=False)
+            # Restore parameters without templating
+            if parameters is not None:
+                templated_spec["parameters"] = parameters
+            templated_trigger_specs.append(templated_spec)
+        triggers = _initialize_deployment_triggers(
+            deployment_name, templated_trigger_specs
+        )
+    else:
+        triggers = []
+
     if isinstance(deploy_config.get("concurrency_limit"), dict):
-        deploy_config["concurrency_options"] = {
+        concurrency_options = {
             "collision_strategy": get_from_dict(
                 deploy_config, "concurrency_limit.collision_strategy"
             )
         }
+        grace_period_seconds = get_from_dict(
+            deploy_config, "concurrency_limit.grace_period_seconds"
+        )
+        if grace_period_seconds is not None:
+            concurrency_options["grace_period_seconds"] = grace_period_seconds
+        deploy_config["concurrency_options"] = concurrency_options
         deploy_config["concurrency_limit"] = get_from_dict(
             deploy_config, "concurrency_limit.limit"
         )
@@ -365,7 +405,7 @@ async def _run_single_deploy(
         slas = _initialize_deployment_slas(deployment_id, sla_specs)
         await _create_slas(client, deployment_id, slas)
 
-    app.console.print(
+    console.print(
         Panel(
             f"Deployment '{deploy_config['flow_name']}/{deploy_config['name']}'"
             f" successfully created with id '{deployment_id}'."
@@ -373,20 +413,20 @@ async def _run_single_deploy(
         style="green",
     )
 
-    if PREFECT_UI_URL:
+    if ui_url := get_current_settings().ui_url:
         message = (
             "\nView Deployment in UI:"
-            f" {PREFECT_UI_URL.value()}/deployments/deployment/{deployment_id}\n"
+            f" {ui_url}/deployments/deployment/{deployment_id}\n"
         )
-        app.console.print(message, soft_wrap=True)
+        console.print(message, soft_wrap=True)
 
-    if root.is_interactive() and not prefect_file.exists():
+    if is_interactive() and not prefect_file.exists():
         if confirm(
             (
                 "Would you like to save configuration for this deployment for faster"
                 " deployments in the future?"
             ),
-            console=app.console,
+            console=console,
         ):
             deploy_config_before_templating.update({"schedules": _schedules})
             _save_deployment_to_prefect_file(
@@ -398,7 +438,7 @@ async def _run_single_deploy(
                 sla=sla_specs or None,
                 prefect_file=prefect_file,
             )
-            app.console.print(
+            console.print(
                 (
                     f"\n[green]Deployment configuration saved to {prefect_file}![/]"
                     " You can now deploy using this deployment configuration"
@@ -419,19 +459,17 @@ async def _run_single_deploy(
         and not work_pool.is_managed_pool
         and not active_workers
     ):
-        app.console.print(
+        console.print(
             "\nTo execute flow runs from these deployments, start a worker in a"
             " separate terminal that pulls work from the"
             f" {work_pool_name!r} work pool:"
         )
-        app.console.print(
+        console.print(
             f"\n\t$ prefect worker start --pool {work_pool_name!r}",
             style="blue",
         )
-    app.console.print(
-        "\nTo schedule a run for this deployment, use the following command:"
-    )
-    app.console.print(
+    console.print("\nTo schedule a run for this deployment, use the following command:")
+    console.print(
         (
             "\n\t$ prefect deployment run"
             f" '{deploy_config['flow_name']}/{deploy_config['name']}'\n"
@@ -446,34 +484,49 @@ async def _run_multi_deploy(
     names: Optional[list[str]] = None,
     deploy_all: bool = False,
     prefect_file: Path = Path("prefect.yaml"),
+    *,
+    console: "Console",
+    is_interactive: Callable[[], bool],
 ):
     deploy_configs = deepcopy(deploy_configs) if deploy_configs else []
     actions = deepcopy(actions) if actions else {}
     names = names or []
 
     if deploy_all:
-        app.console.print(
+        console.print(
             "Deploying all flows with an existing deployment configuration..."
         )
     else:
-        app.console.print("Deploying flows with selected deployment configurations...")
+        console.print("Deploying flows with selected deployment configurations...")
     for deploy_config in deploy_configs:
         if deploy_config.get("name") is None:
-            if not root.is_interactive():
-                app.console.print(
+            if not is_interactive():
+                console.print(
                     "Discovered unnamed deployment. Skipping...", style="yellow"
                 )
                 continue
-            app.console.print("Discovered unnamed deployment.", style="yellow")
-            app.console.print_json(data=deploy_config)
+            console.print("Discovered unnamed deployment.", style="yellow")
+            console.print_json(data=deploy_config)
             if confirm(
                 "Would you like to give this deployment a name and deploy it?",
                 default=True,
-                console=app.console,
+                console=console,
             ):
                 deploy_config["name"] = prompt("Deployment name", default="default")
             else:
-                app.console.print("Skipping unnamed deployment.", style="yellow")
+                console.print("Skipping unnamed deployment.", style="yellow")
                 continue
-        app.console.print(Panel(f"Deploying {deploy_config['name']}", style="blue"))
-        await _run_single_deploy(deploy_config, actions, prefect_file=prefect_file)
+        # Resolve env var templates in name for display purposes only
+        resolved_name = apply_values(
+            {"name": deploy_config["name"]}, os.environ, remove_notset=False
+        )["name"]
+        # Escape Rich markup to prevent brackets from being interpreted as style tags
+        display_name = escape(str(resolved_name))
+        console.print(Panel(f"Deploying {display_name}", style="blue"))
+        await _run_single_deploy(
+            deploy_config,
+            actions,
+            prefect_file=prefect_file,
+            console=console,
+            is_interactive=is_interactive,
+        )

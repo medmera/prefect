@@ -28,7 +28,10 @@ from prefect.server.schemas.actions import LogCreate
 from prefect.server.schemas.core import TaskRunResult
 from prefect.server.schemas.responses import FlowRunResponse, OrchestrationResult
 from prefect.server.schemas.states import StateType
-from prefect.settings import PREFECT_SERVER_CONCURRENCY_LEASE_STORAGE
+from prefect.settings import (
+    PREFECT_SERVER_CONCURRENCY_LEASE_STORAGE,
+    PREFECT_SERVER_DOCKET_NAME,
+)
 from prefect.settings.context import temporary_settings
 from prefect.states import (
     Completed,
@@ -315,6 +318,60 @@ class TestCreateFlowRun:
             "command": "uv run --with prefect-aws python -m prefect_aws.bundles.execute_from_s3"
         }
 
+    async def test_create_flow_run_with_oversized_parameters_returns_422(
+        self,
+        flow: Flow,
+        client: AsyncClient,
+    ):
+        large_params = {"data": "x" * 1_000_000}
+        response = await client.post(
+            "/flow_runs/",
+            json={"flow_id": str(flow.id), "parameters": large_params},
+        )
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    async def test_create_flow_run_with_small_parameters_succeeds(
+        self,
+        flow: Flow,
+        client: AsyncClient,
+    ):
+        small_params = {"data": "x" * 100}
+        response = await client.post(
+            "/flow_runs/",
+            json={"flow_id": str(flow.id), "parameters": small_params},
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+    async def test_create_flow_run_parameter_size_limit_is_configurable(
+        self,
+        flow: Flow,
+        client: AsyncClient,
+    ):
+        from prefect.settings import PREFECT_SERVER_API_MAX_PARAMETER_SIZE
+
+        # Set limit to 50 bytes; even a small payload should fail
+        with temporary_settings({PREFECT_SERVER_API_MAX_PARAMETER_SIZE: 50}):
+            response = await client.post(
+                "/flow_runs/",
+                json={"flow_id": str(flow.id), "parameters": {"key": "a" * 100}},
+            )
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    async def test_create_flow_run_parameter_size_limit_disabled_when_zero(
+        self,
+        flow: Flow,
+        client: AsyncClient,
+    ):
+        from prefect.settings import PREFECT_SERVER_API_MAX_PARAMETER_SIZE
+
+        large_params = {"data": "x" * 1_000_000}
+        with temporary_settings({PREFECT_SERVER_API_MAX_PARAMETER_SIZE: 0}):
+            response = await client.post(
+                "/flow_runs/",
+                json={"flow_id": str(flow.id), "parameters": large_params},
+            )
+            assert response.status_code == status.HTTP_201_CREATED
+
 
 class TestUpdateFlowRun:
     async def test_update_flow_run_succeeds(self, flow, session, client):
@@ -494,6 +551,22 @@ class TestUpdateFlowRun:
             json={},
         )
         assert response.status_code == status.HTTP_404_NOT_FOUND, response.text
+
+    async def test_update_flow_run_with_oversized_parameters_returns_422(
+        self, flow, session, client
+    ):
+        flow_run = await models.flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(flow_id=flow.id, flow_version="1.0"),
+        )
+        await session.commit()
+
+        large_params = {"data": "x" * 1_000_000}
+        response = await client.patch(
+            f"flow_runs/{flow_run.id}",
+            json={"parameters": large_params},
+        )
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
 class TestReadFlowRun:
@@ -1275,9 +1348,9 @@ class TestReadFlowRunGraph:
 
 
 class TestDeleteFlowRuns:
-    async def test_delete_flow_runs(self, flow_run, client, session):
+    async def test_delete_flow_runs(self, flow_run, hosted_api_client, session):
         # delete the flow run
-        response = await client.delete(f"/flow_runs/{flow_run.id}")
+        response = await hosted_api_client.delete(f"/flow_runs/{flow_run.id}")
         assert response.status_code == 204, response.text
 
         # make sure it's deleted (first grab its ID)
@@ -1288,11 +1361,13 @@ class TestDeleteFlowRuns:
             session=session, flow_run_id=flow_run_id
         )
         assert run is None
-        response = await client.get(f"/flow_runs/{flow_run_id}")
+        response = await hosted_api_client.get(f"/flow_runs/{flow_run_id}")
         assert response.status_code == status.HTTP_404_NOT_FOUND, response.text
 
-    async def test_delete_flow_run_returns_404_if_does_not_exist(self, client):
-        response = await client.delete(f"/flow_runs/{uuid4()}")
+    async def test_delete_flow_run_returns_404_if_does_not_exist(
+        self, hosted_api_client
+    ):
+        response = await hosted_api_client.delete(f"/flow_runs/{uuid4()}")
         assert response.status_code == status.HTTP_404_NOT_FOUND, response.text
 
     @pytest.mark.parametrize(
@@ -1310,7 +1385,7 @@ class TestDeleteFlowRuns:
     )
     async def test_delete_flow_run_releases_concurrency_slots(
         self,
-        client,
+        hosted_api_client,
         session,
         flow,
         deployment_with_concurrency_limit,
@@ -1347,19 +1422,21 @@ class TestDeleteFlowRuns:
         assert concurrency_limit.active_slots == 1
 
         # delete the flow run
-        response = await client.delete(f"/flow_runs/{flow_run.id}")
+        response = await hosted_api_client.delete(f"/flow_runs/{flow_run.id}")
         assert response.status_code == 204, response.text
 
         await session.refresh(concurrency_limit)
         assert concurrency_limit.active_slots == expected_slots
 
-    async def test_delete_flow_run_deletes_logs(self, flow_run, logs, client, session):
+    async def test_delete_flow_run_deletes_logs(
+        self, flow_run, logs, hosted_api_client, session
+    ):
         # make sure we have flow run logs
         flow_run_logs = [log for log in logs if log.flow_run_id is not None]
         assert len(flow_run_logs) > 0
 
         # delete the flow run
-        response = await client.delete(f"/flow_runs/{flow_run.id}")
+        response = await hosted_api_client.delete(f"/flow_runs/{flow_run.id}")
         assert response.status_code == status.HTTP_204_NO_CONTENT, response.text
 
         async def read_logs():
@@ -1917,7 +1994,7 @@ class TestSetFlowRunState:
     async def test_pending_to_pending(self, pending_flow_run, client):
         response = await client.post(
             f"flow_runs/{pending_flow_run.id}/set_state",
-            json=dict(state=dict(type="PENDING", name="Test State")),
+            json=dict(state=dict(type="PENDING", name="Pending")),
         )
         assert response.status_code == 200, response.text
 
@@ -1928,6 +2005,18 @@ class TestSetFlowRunState:
             == "This run is in a PENDING state and cannot transition to a PENDING"
             " state."
         )
+
+    async def test_pending_to_pending_with_different_name(
+        self, pending_flow_run, client
+    ):
+        response = await client.post(
+            f"flow_runs/{pending_flow_run.id}/set_state",
+            json=dict(state=dict(type="PENDING", name="Submitting")),
+        )
+        assert response.status_code == 201, response.text
+
+        api_response = OrchestrationResult.model_validate(response.json())
+        assert api_response.status == responses.SetStateStatus.ACCEPT
 
     @pytest.fixture
     async def transition_id(self) -> UUID:
@@ -2039,7 +2128,11 @@ class TestSetFlowRunState:
         def app(
             self, use_filesystem_lease_storage: None
         ) -> Generator[FastAPI, Any, None]:
-            yield create_app(ephemeral=True)
+            # Use a unique Docket name for each test to avoid Redis key collisions
+            # when using memory:// backend (fakeredis) which shares a single FakeServer
+            unique_name = f"test-docket-{uuid4().hex[:8]}"
+            with temporary_settings({PREFECT_SERVER_DOCKET_NAME: unique_name}):
+                yield create_app(ephemeral=True)
 
         @pytest.fixture
         async def client(self, app: FastAPI) -> AsyncGenerator[AsyncClient, Any]:

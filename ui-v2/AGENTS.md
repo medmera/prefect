@@ -8,7 +8,9 @@ This is the new React-based Prefect UI, migrating from the legacy Vue applicatio
 prefect/ui-v2/
 ├── src/
 │   ├── api/           # API queries, mutations, and mocks
+│   ├── auth/          # Authentication state, AuthProvider, useAuth hook
 │   ├── components/    # React components organized by domain
+│   ├── graphs/        # Pixi.js run graph rendering engine (ported from @prefecthq/graphs)
 │   ├── hooks/         # Custom hooks for common patterns
 │   ├── lib/           # Utility functions and shared code
 │   ├── mocks/         # Mock data factories
@@ -30,6 +32,7 @@ prefect/ui-v2/
 - **Tanstack Table** - table state management
 - **react-hook-form** - form state management
 - **Recharts** - charts and data visualization
+- **Pixi.js** - WebGL canvas rendering for run graphs (`src/graphs/`)
 - **Vitest** - testing framework
 - **Storybook** - component development and documentation
 - **MSW** - API mocking
@@ -123,6 +126,40 @@ Before committing any changes, always run:
 - Succinct commit messages
 - PR descriptions mention "Related to #15512"
 - Never commit directly to `main`
+
+## Styling for Light and Dark Mode
+
+The UI supports both light and dark themes. To ensure components render correctly in both modes:
+
+### Use Semantic Color Tokens
+
+Always use Tailwind's semantic color classes that automatically adapt to the current theme instead of hardcoded color values:
+
+| Instead of | Use |
+|------------|-----|
+| `bg-gray-100`, `bg-gray-200` | `bg-muted` |
+| `bg-white` | `bg-background` or `bg-card` |
+| `text-gray-500`, `text-gray-600` | `text-muted-foreground` |
+| `text-gray-900`, `text-black` | `text-foreground` |
+| `border-gray-200`, `border-gray-300` | `border-border` or `border-muted` |
+
+### For Dividers and Subtle Elements
+
+Use opacity modifiers with semantic colors for subtle visual elements like dividers:
+- `bg-muted-foreground/30` for subtle divider lines
+- `border-border` for standard borders
+
+### Avoid Hardcoded Colors
+
+Never use hardcoded gray scale colors (e.g., `bg-gray-100`, `text-gray-500`) as these will not adapt to dark mode and can make text unreadable or create jarring visual contrast.
+
+### Testing Dark Mode
+
+Always verify components in both light and dark mode:
+1. Use the theme toggle in Settings to switch between modes
+2. Check that all text remains readable
+3. Verify backgrounds blend appropriately with the overall theme
+4. Ensure sufficient contrast for interactive elements
 
 ## Architecture Notes
 

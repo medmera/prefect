@@ -43,6 +43,7 @@ handlers:
     level: 0
     class: prefect.logging.handlers.PrefectConsoleHandler
     formatter: standard
+    stream: ext://sys.stderr
     styles:
       log.web_url: bright_blue
       log.local_url: bright_blue
@@ -67,8 +68,9 @@ handlers:
 
   debug:
     level: 0
-    class: logging.StreamHandler
+    class: prefect.logging.handlers._SafeStreamHandler
     formatter: debug
+    stream: ext://sys.stderr
 
   worker_api:
     level: 0

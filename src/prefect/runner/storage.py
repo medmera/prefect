@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import (
@@ -20,6 +22,7 @@ from anyio import run_process
 from pydantic import SecretStr
 
 from prefect._internal.concurrency.api import create_call, from_async
+from prefect._internal.urls import strip_auth_from_url
 from prefect.blocks.core import Block, BlockNotSavedError
 from prefect.blocks.system import Secret
 from prefect.filesystems import ReadableDeploymentStorage, WritableDeploymentStorage
@@ -79,6 +82,39 @@ class RunnerStorage(Protocol):
 class GitCredentials(TypedDict, total=False):
     username: str
     access_token: str | Secret[str]
+
+
+@runtime_checkable
+class _GitCredentialsFormatter(Protocol):
+    """
+    Protocol for credential blocks that can format themselves for git URLs.
+
+    Implementing this protocol allows credential blocks to own their auth
+    formatting logic instead of having it centralized in core Prefect.
+
+    This enables proper separation of concerns where each git provider
+    (GitLab, GitHub, BitBucket) can handle their own authentication format
+    requirements without core needing provider-specific knowledge.
+    """
+
+    def format_git_credentials(self, url: str) -> str:
+        """
+        Format and return the full git URL with credentials embedded.
+
+        Args:
+            url: The repository URL (e.g., "https://gitlab.com/org/repo.git").
+
+        Returns:
+            Complete URL with credentials embedded in the appropriate format for the provider.
+
+        Examples:
+            - GitLab PAT: "https://oauth2:my-token@gitlab.com/org/repo.git"
+            - GitLab Deploy Token: "https://username:token@gitlab.com/org/repo.git"
+            - GitHub: "https://my-token@github.com/org/repo.git"
+            - BitBucket Cloud: "https://x-token-auth:my-token@bitbucket.org/org/repo.git"
+            - BitBucket Server: "https://username:token@bitbucketserver.com/scm/project/repo.git"
+        """
+        ...
 
 
 class GitRepository:
@@ -142,6 +178,26 @@ class GitRepository:
                 "Cannot provide both a branch and a commit SHA. Please provide only one."
             )
 
+        if commit_sha and not re.match(r"^[0-9a-fA-F]{4,64}$", commit_sha):
+            raise ValueError(
+                f"Invalid commit SHA: {commit_sha!r}."
+                " Expected a hexadecimal Git commit SHA (4–64 characters)."
+                " If you are trying to specify a branch or tag name,"
+                " use the 'branch' parameter instead."
+            )
+
+        if directories:
+            for d in directories:
+                if d.startswith("--"):
+                    warnings.warn(
+                        f"Directory {d!r} starts with '--' and will be"
+                        " interpreted as a path by git sparse-checkout."
+                        " If this is not intentional, remove it from the"
+                        " directories list.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
         self._url = url
         self._branch = branch
         self._commit_sha = commit_sha
@@ -168,10 +224,16 @@ class GitRepository:
         return self._pull_interval
 
     @property
-    def _formatted_credentials(self) -> Optional[str]:
+    def _repository_url_with_credentials(self) -> str:
+        """Get the repository URL with credentials embedded."""
         if not self._credentials:
-            return None
+            return self._url
 
+        # If block implements the protocol, let it format the complete URL
+        if isinstance(self._credentials, _GitCredentialsFormatter):
+            return self._credentials.format_git_credentials(self._url)
+
+        # Otherwise, use legacy formatting for plain dict credentials
         credentials = (
             self._credentials.model_dump()
             if isinstance(self._credentials, Block)
@@ -184,23 +246,20 @@ class GitRepository:
             elif isinstance(v, SecretStr):
                 credentials[k] = v.get_secret_value()
 
-        return _format_token_from_credentials(urlparse(self._url).netloc, credentials)
-
-    def _add_credentials_to_url(self, url: str) -> str:
-        """Add credentials to given url if possible."""
-        components = urlparse(url)
-        credentials = self._formatted_credentials
-
-        if components.scheme != "https" or not credentials:
-            return url
-
-        return urlunparse(
-            components._replace(netloc=f"{credentials}@{components.netloc}")
+        # Get credential string for plain dict credentials
+        block = self._credentials if isinstance(self._credentials, Block) else None
+        credential_string = _format_token_from_credentials(
+            urlparse(self._url).netloc, credentials, block
         )
 
-    @property
-    def _repository_url_with_credentials(self) -> str:
-        return self._add_credentials_to_url(self._url)
+        # Insert credentials into URL
+        components = urlparse(self._url)
+        if components.scheme != "https":
+            return self._url
+
+        return urlunparse(
+            components._replace(netloc=f"{credential_string}@{components.netloc}")
+        )
 
     @property
     def _git_config(self) -> list[str]:
@@ -210,11 +269,42 @@ class GitRepository:
         # Submodules can be private. The url in .gitmodules
         # will not include the credentials, we need to
         # propagate them down here if they exist.
-        if self._include_submodules and self._formatted_credentials:
-            base_url = urlparse(self._url)._replace(path="")
-            without_auth = urlunparse(base_url)
-            with_auth = self._add_credentials_to_url(without_auth)
-            config[f"url.{with_auth}.insteadOf"] = without_auth
+        if self._include_submodules and self._credentials:
+            # Get base URL (without path) with credentials
+            base_url_parsed = urlparse(self._url)._replace(path="")
+            base_url_without_auth = urlunparse(base_url_parsed)
+
+            # Create a temporary URL with just the base to get credentials formatting
+            if isinstance(self._credentials, _GitCredentialsFormatter):
+                base_url_with_auth = self._credentials.format_git_credentials(
+                    base_url_without_auth
+                )
+            else:
+                # Use legacy credential insertion
+                credentials_dict = (
+                    self._credentials.model_dump()
+                    if isinstance(self._credentials, Block)
+                    else deepcopy(self._credentials)
+                )
+                for k, v in credentials_dict.items():
+                    if isinstance(v, Secret):
+                        credentials_dict[k] = v.get()
+                    elif isinstance(v, SecretStr):
+                        credentials_dict[k] = v.get_secret_value()
+
+                block = (
+                    self._credentials if isinstance(self._credentials, Block) else None
+                )
+                credential_string = _format_token_from_credentials(
+                    base_url_parsed.netloc, credentials_dict, block
+                )
+                base_url_with_auth = urlunparse(
+                    base_url_parsed._replace(
+                        netloc=f"{credential_string}@{base_url_parsed.netloc}"
+                    )
+                )
+
+            config[f"url.{base_url_with_auth}.insteadOf"] = base_url_without_auth
 
         return ["-c", " ".join(f"{k}={v}" for k, v in config.items())] if config else []
 
@@ -277,18 +367,19 @@ class GitRepository:
                 cwd=str(self.destination),
             )
             existing_repo_url = None
-            existing_repo_url = _strip_auth_from_url(result.stdout.decode().strip())
+            existing_repo_url = strip_auth_from_url(result.stdout.decode().strip())
+            configured_repo_url = strip_auth_from_url(self._url)
 
-            if existing_repo_url != self._url:
+            if existing_repo_url != configured_repo_url:
                 raise ValueError(
                     f"The existing repository at {str(self.destination)} "
-                    f"does not match the configured repository {self._url}"
+                    f"does not match the configured repository {configured_repo_url}"
                 )
 
             # Sparsely checkout the repository if directories are specified and the repo is not in sparse-checkout mode already
             if self._directories and not await self.is_sparsely_checked_out():
                 await run_process(
-                    ["git", "sparse-checkout", "set", *self._directories],
+                    ["git", "sparse-checkout", "set", "--", *self._directories],
                     cwd=self.destination,
                 )
 
@@ -390,10 +481,15 @@ class GitRepository:
                 if self._credentials or parsed_url.password or parsed_url.username
                 else exc
             )
-            raise RuntimeError(
-                f"Failed to clone repository {_strip_auth_from_url(self._url)!r} with exit code"
+            safe_url = strip_auth_from_url(self._url)
+            error_message = (
+                f"Failed to clone repository {safe_url!r} with exit code"
                 f" {exc.returncode}."
-            ) from exc_chain
+            )
+            hint = _get_git_clone_error_hint(exc)
+            if hint:
+                error_message += f" {hint}"
+            raise RuntimeError(error_message) from exc_chain
 
         if self._commit_sha:
             # Fetch the commit
@@ -412,7 +508,7 @@ class GitRepository:
         if self._directories:
             self._logger.debug("Will add %s", self._directories)
             await run_process(
-                ["git", "sparse-checkout", "set", *self._directories],
+                ["git", "sparse-checkout", "set", "--", *self._directories],
                 cwd=self.destination,
             )
 
@@ -438,6 +534,22 @@ class GitRepository:
                 "branch": self._branch,
             }
         }
+
+        # Include clone_directory_name if it differs from auto-generated default
+        repo_name = urlparse(self._url).path.split("/")[-1].replace(".git", "")
+        safe_branch = self._branch.replace("/", "-") if self._branch else None
+        default_name = f"{repo_name}-{safe_branch}" if safe_branch else repo_name
+        if self._name != default_name:
+            pull_step["prefect.deployments.steps.git_clone"]["clone_directory_name"] = (
+                self._name
+            )
+
+        # Include directories if specified
+        if self._directories:
+            pull_step["prefect.deployments.steps.git_clone"]["directories"] = (
+                self._directories
+            )
+
         if self._include_submodules:
             pull_step["prefect.deployments.steps.git_clone"]["include_submodules"] = (
                 self._include_submodules
@@ -614,10 +726,14 @@ class RemoteStorage:
                 )
             )
         except Exception as exc:
-            raise RuntimeError(
+            error_message = (
                 f"Failed to pull contents from remote storage {self._url!r} to"
                 f" {self.destination!r}"
-            ) from exc
+            )
+            hint = _get_remote_storage_error_hint(exc)
+            if hint:
+                error_message += f". {hint}"
+            raise RuntimeError(error_message) from exc
 
     def to_pull_step(self) -> dict[str, Any]:
         """
@@ -813,16 +929,116 @@ def create_storage_from_source(
         return LocalStorage(path=source, pull_interval=pull_interval)
 
 
+# Pattern-based error hints for git clone failures
+_GIT_CLONE_ERROR_HINTS: list[tuple[str, str]] = [
+    (
+        "Authentication failed",
+        "Hint: Check that your credentials or access token are correct and not expired.",
+    ),
+    (
+        "repository not found",
+        "Hint: Verify the repository URL and that you have access to it.",
+    ),
+    (
+        "Could not resolve host",
+        "Hint: Check your network connectivity and DNS settings.",
+    ),
+    (
+        "Connection refused",
+        "Hint: Check your network connectivity and DNS settings.",
+    ),
+    (
+        "Permission denied",
+        "Hint: Check your SSH key or token permissions.",
+    ),
+    (
+        "destination path",
+        "Hint: A stale working directory may exist. Consider removing it and retrying.",
+    ),
+    (
+        "not found",
+        "Hint: Verify the repository URL and that you have access to it.",
+    ),
+]
+
+
+def _get_git_clone_error_hint(exc: subprocess.CalledProcessError) -> str | None:
+    """Extract a resolution hint from a git clone CalledProcessError's stderr."""
+    stderr = ""
+    if exc.stderr:
+        stderr = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else str(exc.stderr)
+        )
+    for pattern, hint in _GIT_CLONE_ERROR_HINTS:
+        if pattern.lower() in stderr.lower():
+            return hint
+    return None
+
+
+# Pattern-based error hints for remote storage failures
+_REMOTE_STORAGE_ERROR_HINTS: list[tuple[str, str]] = [
+    (
+        "NoSuchBucket",
+        "Hint: Verify the bucket name and region.",
+    ),
+    (
+        "AccessDenied",
+        "Hint: Check your storage permissions and credentials.",
+    ),
+    (
+        "403",
+        "Hint: Check your storage permissions and credentials.",
+    ),
+    (
+        "NoSuchKey",
+        "Hint: Verify the storage path exists.",
+    ),
+    (
+        "ConnectionError",
+        "Hint: Check network connectivity and the storage endpoint URL.",
+    ),
+    (
+        "EndpointConnectionError",
+        "Hint: Check network connectivity and the storage endpoint URL.",
+    ),
+    (
+        "ConnectionRefusedError",
+        "Hint: Check network connectivity and the storage endpoint URL.",
+    ),
+]
+
+
+def _get_remote_storage_error_hint(exc: Exception) -> str | None:
+    """Extract a resolution hint from a remote storage exception."""
+    error_str = str(exc).lower()
+    for pattern, hint in _REMOTE_STORAGE_ERROR_HINTS:
+        if pattern.lower() in error_str:
+            return hint
+    return None
+
+
 def _format_token_from_credentials(
-    netloc: str, credentials: dict[str, Any] | GitCredentials
+    netloc: str,
+    credentials: dict[str, Any] | GitCredentials,
+    block: Block | None = None,
 ) -> str:
     """
     Formats the credentials block for the git provider.
 
-    BitBucket supports the following syntax:
-        git clone "https://x-token-auth:{token}@bitbucket.org/yourRepoOwnerHere/RepoNameHere"
-        git clone https://username:<token>@bitbucketserver.com/scm/projectname/teamsinspace.git
+    If the block implements _GitCredentialsFormatter protocol, delegates to it.
+    Otherwise, uses generic formatting for plain dict credentials.
+
+    Args:
+        netloc: The network location (hostname) of the git repository
+        credentials: Dictionary containing credential information
+        block: Optional Block object that may implement the formatter protocol
     """
+    if block is not None and isinstance(block, _GitCredentialsFormatter):
+        # Reconstruct full URL for context (scheme doesn't matter for formatting)
+        url = f"https://{netloc}"
+        return block.format_git_credentials(url)
     username = credentials.get("username") if credentials else None
     password = credentials.get("password") if credentials else None
     token = credentials.get("token") if credentials else None
@@ -842,57 +1058,34 @@ def _format_token_from_credentials(
     if username:
         return f"{username}:{user_provided_token}"
 
+    # Netloc-based provider detection for dict credentials (e.g., from YAML block references).
+    # When credentials come from deployment YAML like:
+    #   credentials: "{{ prefect.blocks.gitlab-credentials.my-block }}"
+    # they resolve to dicts, not Block instances, so the protocol check above doesn't apply.
+    # This provides sensible defaults for common git providers.
     if "bitbucketserver" in netloc:
-        # If they pass a BitBucketCredentials block and we don't have both a username and at
-        # least one of a password or token and they don't provide a header themselves,
-        # we can raise the appropriate error to avoid the wrong format for BitBucket Server.
-        if not username and ":" not in user_provided_token:
+        if ":" not in user_provided_token:
             raise ValueError(
                 "Please provide a `username` and a `password` or `token` in your"
                 " BitBucketCredentials block to clone a repo from BitBucket Server."
             )
-        # if username or if no username but it's provided in the token
-        return (
-            f"{username}:{user_provided_token}"
-            if username and username not in user_provided_token
-            else user_provided_token
-        )
+        return user_provided_token
 
     elif "bitbucket" in netloc:
-        return (
-            user_provided_token
-            if user_provided_token.startswith("x-token-auth:")
+        if (
+            user_provided_token.startswith("x-token-auth:")
             or ":" in user_provided_token
-            else f"x-token-auth:{user_provided_token}"
-        )
+        ):
+            return user_provided_token
+        return f"x-token-auth:{user_provided_token}"
 
     elif "gitlab" in netloc:
-        return (
-            f"oauth2:{user_provided_token}"
-            if not user_provided_token.startswith("oauth2:")
-            else user_provided_token
-        )
+        if user_provided_token.startswith("oauth2:"):
+            return user_provided_token
+        # Deploy tokens contain ":" (username:token format) and should not get oauth2: prefix
+        if ":" in user_provided_token:
+            return user_provided_token
+        return f"oauth2:{user_provided_token}"
 
-    # all other cases (GitHub, etc.)
+    # GitHub and other providers: plain token
     return user_provided_token
-
-
-def _strip_auth_from_url(url: str) -> str:
-    parsed = urlparse(url)
-
-    # Construct a new netloc without the auth info
-    netloc = parsed.hostname
-    if parsed.port and netloc:
-        netloc += f":{parsed.port}"
-
-    # Build the sanitized URL
-    return urlunparse(
-        (
-            parsed.scheme,
-            netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment,
-        )
-    )

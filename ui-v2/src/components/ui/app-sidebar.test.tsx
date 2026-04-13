@@ -1,0 +1,181 @@
+import { QueryClient } from "@tanstack/react-query";
+import {
+	createMemoryHistory,
+	createRootRoute,
+	createRouter,
+	RouterProvider,
+} from "@tanstack/react-router";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { buildApiUrl, createWrapper, server } from "@tests/utils";
+import { HttpResponse, http } from "msw";
+import { describe, expect, it, vi } from "vitest";
+import { AuthContext, type AuthState } from "@/auth";
+import { SidebarProvider } from "@/components/ui/sidebar";
+import { createFakeServerSettings } from "@/mocks";
+import { AppSidebar } from "./app-sidebar";
+
+const createTestRouter = (authState: AuthState | null) => {
+	const rootRoute = createRootRoute({
+		component: () => (
+			<AuthContext.Provider value={authState}>
+				<SidebarProvider>
+					<AppSidebar />
+				</SidebarProvider>
+			</AuthContext.Provider>
+		),
+	});
+
+	return createRouter({
+		routeTree: rootRoute,
+		history: createMemoryHistory({
+			initialEntries: ["/"],
+		}),
+		context: { queryClient: new QueryClient() },
+	});
+};
+
+describe("AppSidebar", () => {
+	describe("promotional content", () => {
+		it("renders promotional items when show_promotional_content is true", async () => {
+			const mockSettings = createFakeServerSettings();
+			server.use(
+				http.get(buildApiUrl("/admin/settings"), () => {
+					return HttpResponse.json(mockSettings);
+				}),
+			);
+
+			const router = createTestRouter(null);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Ready to scale?")).toBeTruthy();
+			});
+
+			expect(screen.getByText("Join the community")).toBeTruthy();
+		});
+
+		it("hides promotional items when show_promotional_content is false", async () => {
+			const mockSettings = createFakeServerSettings({
+				server: {
+					...((createFakeServerSettings() as Record<string, unknown>)
+						.server as Record<string, unknown>),
+					ui: {
+						enabled: true,
+						api_url: "http://127.0.0.1:4200/api",
+						serve_base: "/",
+						static_directory: null,
+						show_promotional_content: false,
+					},
+				},
+			});
+			server.use(
+				http.get(buildApiUrl("/admin/settings"), () => {
+					return HttpResponse.json(mockSettings);
+				}),
+			);
+
+			const router = createTestRouter(null);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Dashboard")).toBeTruthy();
+				expect(screen.queryByText("Ready to scale?")).toBeNull();
+			});
+
+			expect(screen.queryByText("Join the community")).toBeNull();
+		});
+	});
+
+	describe("logout button", () => {
+		it("does not render logout button when auth context is null", async () => {
+			const router = createTestRouter(null);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Dashboard")).toBeTruthy();
+			});
+
+			expect(screen.queryByText("Logout")).toBeNull();
+		});
+
+		it("does not render logout button when authRequired is false", async () => {
+			const mockAuthState: AuthState = {
+				isAuthenticated: true,
+				isLoading: false,
+				authRequired: false,
+				login: vi.fn(),
+				logout: vi.fn(),
+			};
+
+			const router = createTestRouter(mockAuthState);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Dashboard")).toBeTruthy();
+			});
+
+			expect(screen.queryByText("Logout")).toBeNull();
+		});
+
+		it("renders logout button when authRequired is true", async () => {
+			const mockAuthState: AuthState = {
+				isAuthenticated: true,
+				isLoading: false,
+				authRequired: true,
+				login: vi.fn(),
+				logout: vi.fn(),
+			};
+
+			const router = createTestRouter(mockAuthState);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Logout")).toBeTruthy();
+			});
+		});
+
+		it("calls logout and navigates to /login when logout button is clicked", async () => {
+			const user = userEvent.setup();
+			const mockLogout = vi.fn();
+			const mockAuthState: AuthState = {
+				isAuthenticated: true,
+				isLoading: false,
+				authRequired: true,
+				login: vi.fn(),
+				logout: mockLogout,
+			};
+
+			const router = createTestRouter(mockAuthState);
+
+			render(<RouterProvider router={router} />, {
+				wrapper: createWrapper(),
+			});
+
+			await waitFor(() => {
+				expect(screen.getByText("Logout")).toBeTruthy();
+			});
+
+			const logoutButton = screen.getByText("Logout");
+			await user.click(logoutButton);
+
+			expect(mockLogout).toHaveBeenCalledTimes(1);
+			expect(router.state.location.pathname).toBe("/login");
+		});
+	});
+});

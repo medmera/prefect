@@ -15,7 +15,7 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
 			<input
 				type={type}
 				className={cn(
-					"flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+					"flex h-9 w-full rounded-md border border-input bg-card dark:bg-background px-3 py-1 text-sm shadow-xs transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
 					className,
 				)}
 				ref={ref}
@@ -55,10 +55,13 @@ const SearchInput = React.forwardRef<HTMLInputElement, SearchInputProps>(
 		const debouncedValue = useDebounce(state.value, debounceMs);
 
 		useEffect(() => {
-			if (debouncedValue && state.event) {
+			// Only fire onChange when debounced value matches the current state value
+			// and we have an event to pass. This ensures the debounce is complete
+			// and handles empty string values correctly (not using truthiness check).
+			if (debouncedValue === state.value && state.event) {
 				onChange?.(state.event);
 			}
-		}, [debouncedValue, onChange, state.event]);
+		}, [debouncedValue, onChange, state.event, state.value]);
 
 		useEffect(() => {
 			setState({ value });
@@ -78,4 +81,4 @@ const SearchInput = React.forwardRef<HTMLInputElement, SearchInputProps>(
 );
 SearchInput.displayName = "SearchInput";
 
-export { Input, type InputProps, IconInput, SearchInput };
+export { IconInput, Input, type InputProps, SearchInput };
