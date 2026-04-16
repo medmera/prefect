@@ -1,15 +1,20 @@
 import { keepPreviousData, queryOptions } from "@tanstack/react-query";
+import type { FlowRun } from "@/api/flow-runs";
 import type { components } from "../prefect";
 import { getQueryService } from "../service";
 
 export type Artifact = components["schemas"]["Artifact"];
+export type ArtifactCollection = components["schemas"]["ArtifactCollection"];
 export type ArtifactWithFlowRunAndTaskRun = Artifact & {
-	flow_run?: components["schemas"]["FlowRun"];
+	flow_run?: FlowRun;
 	task_run?: components["schemas"]["TaskRun"];
 };
 
 export type ArtifactsFilter =
 	components["schemas"]["Body_read_artifacts_artifacts_filter_post"];
+
+export type ArtifactCollectionsFilter =
+	components["schemas"]["Body_read_latest_artifacts_artifacts_latest_filter_post"];
 
 /**
  * Query key factory for artifacts-related queries
@@ -29,6 +34,7 @@ export type ArtifactsFilter =
  * count			=>   ['artifacts', 'counts', { ...filter }]
  * details          =>   ['artifacts', 'details']
  * detail           =>   ['artifacts', 'details', id]
+ * task-run-result  =>   ['artifacts', 'task-run-result', taskRunId]
  * ```
  */
 export const queryKeyFactory = {
@@ -42,6 +48,15 @@ export const queryKeyFactory = {
 		[...queryKeyFactory.counts(), filter] as const,
 	details: () => [...queryKeyFactory.all(), "details"] as const,
 	detail: (id: string) => [...queryKeyFactory.details(), id] as const,
+	"task-run-result": (taskRunId: string) =>
+		[...queryKeyFactory.all(), "task-run-result", taskRunId] as const,
+	"latest-lists": () => [...queryKeyFactory.all(), "latest", "list"] as const,
+	"latest-list-filter": (filter: ArtifactCollectionsFilter) =>
+		[...queryKeyFactory["latest-lists"](), filter] as const,
+	"latest-counts": () =>
+		[...queryKeyFactory.all(), "latest", "counts"] as const,
+	"latest-count": (filter: ArtifactCollectionsFilter) =>
+		[...queryKeyFactory["latest-counts"](), filter] as const,
 };
 
 // ----------------------------
@@ -73,7 +88,7 @@ export const buildListArtifactsQuery = (
 	queryOptions({
 		queryKey: queryKeyFactory["list-filter"](filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST("/artifacts/filter", {
+			const res = await (await getQueryService()).POST("/artifacts/filter", {
 				body: filter,
 			});
 			return res.data ?? [];
@@ -104,7 +119,7 @@ export const buildCountArtifactsQuery = (
 	queryOptions({
 		queryKey: queryKeyFactory.count(filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST("/artifacts/count", {
+			const res = await (await getQueryService()).POST("/artifacts/count", {
 				body: filter,
 			});
 			return res.data ?? 0;
@@ -127,12 +142,85 @@ export const buildGetArtifactQuery = (id: string) =>
 	queryOptions({
 		queryKey: queryKeyFactory.detail(id),
 		queryFn: async () => {
-			const res = await getQueryService().GET("/artifacts/{id}", {
+			const res = await (await getQueryService()).GET("/artifacts/{id}", {
 				params: { path: { id } },
 			});
 			if (!res.data) {
 				throw new Error("'data' expected");
 			}
 			return res.data;
+		},
+	});
+
+/**
+ * Builds a query configuration for fetching the result artifact for a task run
+ *
+ * @param taskRunId - ID of the task run to fetch the result artifact for
+ * @returns Query configuration object for use with TanStack Query that returns the first result artifact or null
+ *
+ * @example
+ * ```ts
+ * const query = buildGetTaskRunResultQuery("task-run-123");
+ * const { data } = useSuspenseQuery(query);
+ * // data is Artifact | null
+ * ```
+ */
+export const buildListLatestArtifactsQuery = (
+	filter: ArtifactCollectionsFilter = {
+		offset: 0,
+		sort: "ID_DESC",
+	},
+) =>
+	queryOptions({
+		queryKey: queryKeyFactory["latest-list-filter"](filter),
+		queryFn: async () => {
+			const res = await (await getQueryService()).POST(
+				"/artifacts/latest/filter",
+				{
+					body: filter,
+				},
+			);
+			return res.data ?? [];
+		},
+		placeholderData: keepPreviousData,
+	});
+
+export const buildCountLatestArtifactsQuery = (
+	filter: ArtifactCollectionsFilter = {
+		offset: 0,
+		sort: "ID_DESC",
+	},
+) =>
+	queryOptions({
+		queryKey: queryKeyFactory["latest-count"](filter),
+		queryFn: async () => {
+			const res = await (await getQueryService()).POST(
+				"/artifacts/latest/count",
+				{
+					body: filter,
+				},
+			);
+			return res.data ?? 0;
+		},
+		placeholderData: 0,
+	});
+
+export const buildGetTaskRunResultQuery = (taskRunId: string) =>
+	queryOptions({
+		queryKey: queryKeyFactory["task-run-result"](taskRunId),
+		queryFn: async () => {
+			const res = await (await getQueryService()).POST("/artifacts/filter", {
+				body: {
+					artifacts: {
+						operator: "and_",
+						task_run_id: { any_: [taskRunId] },
+						type: { any_: ["result"] },
+					},
+					sort: "CREATED_DESC",
+					offset: 0,
+					limit: 1,
+				},
+			});
+			return res.data?.[0] ?? null;
 		},
 	});

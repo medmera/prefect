@@ -35,6 +35,7 @@ from prefect.server.events.models.automations import (
     read_automation,
 )
 from prefect.server.events.models.composite_trigger_child_firing import (
+    acquire_composite_trigger_lock,
     clear_child_firings,
     clear_old_child_firings,
     get_child_firings,
@@ -74,6 +75,9 @@ logger: "logging.Logger" = get_logger(__name__)
 
 AutomationID: TypeAlias = UUID
 TriggerID: TypeAlias = UUID
+AutomationStateSnapshot: TypeAlias = Tuple[
+    Optional[prefect.types._datetime.DateTime], int
+]
 
 
 AUTOMATION_BUCKET_BATCH_SIZE = 500
@@ -346,6 +350,11 @@ async def evaluate_composite_trigger(session: AsyncSession, firing: Firing) -> N
         )
         return
 
+    # Acquire an advisory lock to serialize concurrent evaluations for this
+    # compound trigger. This prevents a race condition where multiple child
+    # triggers fire concurrently and neither transaction sees both firings.
+    await acquire_composite_trigger_lock(session, trigger)
+
     # If we're only looking within a certain time horizon, remove any older firings that
     # should no longer be considered as satisfying this trigger
     if trigger.within is not None:
@@ -382,8 +391,27 @@ async def evaluate_composite_trigger(session: AsyncSession, firing: Firing) -> N
             },
         )
 
-        # clear by firing id
-        await clear_child_firings(session, trigger, firing_ids=list(firing_ids))
+        # Clear by firing id, and only proceed if we won the race to claim them.
+        # This prevents double-firing when multiple workers evaluate concurrently.
+        deleted_ids = await clear_child_firings(
+            session, trigger, firing_ids=list(firing_ids)
+        )
+
+        if deleted_ids != firing_ids:
+            logger.debug(
+                "Composite trigger %s skipped fire; expected to delete %s firings, "
+                "actually deleted %s (another worker likely claimed them)",
+                trigger.id,
+                len(firing_ids),
+                len(deleted_ids),
+                extra={
+                    "automation": automation.id,
+                    "trigger": trigger.id,
+                    "expected_firing_ids": sorted(str(f) for f in firing_ids),
+                    "deleted_firing_ids": sorted(str(f) for f in deleted_ids),
+                },
+            )
+            return
 
         await fire(
             session,
@@ -411,21 +439,37 @@ async def act(firing: Firing) -> None:
     }
     await messaging.publish(state_change_events.values())
 
-    # By default, all `automation.actions` are fired
-    source_actions: List[Tuple[Optional[ReceivedEvent], ServerActionTypes]] = [
-        (firing.triggering_event, action) for action in automation.actions
+    # Determine the primary state change event ID for linking action events back to
+    # the automation.triggered or automation.resolved event. Prefer Triggered over
+    # Resolved when both are present.
+    primary_state_change_event = state_change_events.get(
+        TriggerState.Triggered
+    ) or state_change_events.get(TriggerState.Resolved)
+    primary_state_change_event_id = (
+        primary_state_change_event.id if primary_state_change_event else None
+    )
+
+    # By default, all `automation.actions` are fired. Each tuple contains:
+    # (triggering_event, action, automation_triggered_event_id)
+    source_actions: List[
+        Tuple[Optional[ReceivedEvent], ServerActionTypes, UUID | None]
+    ] = [
+        (firing.triggering_event, action, primary_state_change_event_id)
+        for action in automation.actions
     ]
 
     # Conditionally add in actions that fire on specific trigger states
     if TriggerState.Triggered in firing.trigger_states:
+        triggered_event = state_change_events[TriggerState.Triggered]
         source_actions += [
-            (state_change_events[TriggerState.Triggered], action)
+            (triggered_event, action, triggered_event.id)
             for action in automation.actions_on_trigger
         ]
 
     if TriggerState.Resolved in firing.trigger_states:
+        resolved_event = state_change_events[TriggerState.Resolved]
         source_actions += [
-            (state_change_events[TriggerState.Resolved], action)
+            (resolved_event, action, resolved_event.id)
             for action in automation.actions_on_resolve
         ]
 
@@ -438,8 +482,13 @@ async def act(firing: Firing) -> None:
             triggering_event=action_triggering_event,
             action=action,
             action_index=index,
+            automation_triggered_event_id=automation_triggered_event_id,
         )
-        for index, (action_triggering_event, action) in enumerate(source_actions)
+        for index, (
+            action_triggering_event,
+            action,
+            automation_triggered_event_id,
+        ) in enumerate(source_actions)
     ]
 
     async with messaging.create_actions_publisher() as publisher:
@@ -633,6 +682,8 @@ async def periodic_evaluation(now: prefect.types._datetime.DateTime) -> None:
 
     logger.debug("Running periodic evaluation as of %s (offset %ss)", as_of, offset)
 
+    await reconcile_automations()
+
     # Any followers that have been sitting around longer than our lookback are never
     # going to see their leader event (maybe it was lost or took too long to arrive).
     # These events can just be evaluated now in the order they occurred.
@@ -667,6 +718,7 @@ async def evaluate_periodically(periodic_granularity: timedelta) -> None:
 automations_by_id: Dict[UUID, Automation] = {}
 triggers: Dict[TriggerID, EventTrigger] = {}
 next_proactive_runs: Dict[TriggerID, prefect.types._datetime.DateTime] = {}
+automation_state_snapshot: Optional[AutomationStateSnapshot] = None
 
 # This lock governs any changes to the set of loaded automations; any routine that will
 # add/remove automations must be holding this lock when it does so.  It's best to use
@@ -684,6 +736,12 @@ def _automations_lock() -> asyncio.Lock:
 def find_interested_triggers(event: ReceivedEvent) -> Collection[EventTrigger]:
     candidates = triggers.values()
     return [trigger for trigger in candidates if trigger.covers(event)]
+
+
+def clear_loaded_automations() -> None:
+    automations_by_id.clear()
+    triggers.clear()
+    next_proactive_runs.clear()
 
 
 def load_automation(automation: Optional[Automation]) -> None:
@@ -716,14 +774,17 @@ async def automation_changed(
     automation_id: UUID,
     event: Literal["automation__created", "automation__updated", "automation__deleted"],
 ) -> None:
+    global automation_state_snapshot
+
     async with _automations_lock():
         if event in ("automation__deleted", "automation__updated"):
             forget_automation(automation_id)
 
-        if event in ("automation__created", "automation__updated"):
-            async with automations_session() as session:
+        async with automations_session() as session:
+            if event in ("automation__created", "automation__updated"):
                 automation = await read_automation(session, automation_id)
                 load_automation(automation)
+            automation_state_snapshot = await read_automation_state_snapshot(session)
 
 
 @db_injector
@@ -740,6 +801,53 @@ async def load_automations(db: PrefectDBInterface, session: AsyncSession):
     logger.debug(
         "Loaded %s automations with %s triggers", len(automations_by_id), len(triggers)
     )
+
+
+@db_injector
+async def read_automation_state_snapshot(
+    db: PrefectDBInterface, session: AsyncSession
+) -> AutomationStateSnapshot:
+    query = sa.select(
+        sa.func.max(db.Automation.updated),
+        sa.func.count(db.Automation.id),
+    ).select_from(db.Automation)
+
+    latest_updated, count = (await session.execute(query)).one()
+
+    return (
+        prefect.types._datetime.create_datetime_instance(latest_updated)
+        if latest_updated
+        else None,
+        count or 0,
+    )
+
+
+async def reconcile_automations(force: bool = False) -> bool:
+    global automation_state_snapshot
+
+    async with _automations_lock():
+        async with automations_session() as session:
+            current_snapshot = await read_automation_state_snapshot(session)
+            if not force and current_snapshot == automation_state_snapshot:
+                return False
+
+            previous_automations = automations_by_id.copy()
+            previous_triggers = triggers.copy()
+            previous_next_proactive_runs = next_proactive_runs.copy()
+
+            clear_loaded_automations()
+
+            try:
+                await load_automations(session)
+            except Exception:
+                clear_loaded_automations()
+                automations_by_id.update(previous_automations)
+                triggers.update(previous_triggers)
+                next_proactive_runs.update(previous_next_proactive_runs)
+                raise
+
+            automation_state_snapshot = current_snapshot
+            return True
 
 
 @db_injector
@@ -1022,10 +1130,11 @@ async def sweep_closed_buckets(
 
 async def reset() -> None:
     """Resets the in-memory state of the service"""
+    global automation_state_snapshot
+
     await reset_events_clock()
-    automations_by_id.clear()
-    triggers.clear()
-    next_proactive_runs.clear()
+    clear_loaded_automations()
+    automation_state_snapshot = None
 
 
 async def listen_for_automation_changes() -> None:
@@ -1049,6 +1158,8 @@ async def listen_for_automation_changes() -> None:
             logger.info(
                 f"Listening for automation changes on {AUTOMATION_CHANGES_CHANNEL}"
             )
+
+            await reconcile_automations()
 
             async for payload in pg_listen(
                 conn,
@@ -1106,8 +1217,7 @@ async def consumer(
     # Start the automation change listener task
     sync_task = asyncio.create_task(listen_for_automation_changes())
 
-    async with automations_session() as session:
-        await load_automations(session)
+    await reconcile_automations(force=True)
 
     proactive_task = asyncio.create_task(evaluate_periodically(periodic_granularity))
 

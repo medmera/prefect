@@ -37,6 +37,7 @@ from prefect.client.schemas import FlowRun, TaskRun
 from prefect.client.schemas.objects import RunType
 from prefect.events.worker import EventsWorker
 from prefect.exceptions import MissingContextError
+from prefect.logging.configuration import ensure_logging_setup
 from prefect.results import (
     ResultStore,
     get_default_persist_setting,
@@ -60,6 +61,53 @@ if TYPE_CHECKING:
     from prefect.tasks import Task
 
 
+class _ContextWrappedCallable:
+    """Picklable callable that hydrates Prefect context before calling the
+    wrapped function.  The serialized context is stored as cloudpickle
+    bytes so that standard pickle (used by `multiprocessing`) can handle it."""
+
+    def __init__(
+        self, fn: Callable[..., Any], serialized_context: dict[str, Any]
+    ) -> None:
+        import cloudpickle
+
+        self.fn = fn
+        self._ctx_bytes = cloudpickle.dumps(serialized_context)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        import cloudpickle
+
+        ctx = cloudpickle.loads(self._ctx_bytes)
+        with hydrated_context(ctx):
+            return self.fn(*args, **kwargs)
+
+
+def with_context(fn: Callable[..., Any]) -> _ContextWrappedCallable:
+    """Wrap a function so it runs with the current Prefect context when
+    called in a subprocess.
+
+    Use this to enable `get_run_logger()` and other context-dependent
+    APIs in functions executed via `multiprocessing.Pool`,
+    `ProcessPoolExecutor`, or `multiprocessing.Process`.
+
+    Example:
+        ```python
+        from prefect.context import with_context
+
+        def worker(item):
+            logger = get_run_logger()
+            logger.info(f"Processing {item}")
+
+        @task
+        def my_task():
+            with multiprocessing.Pool() as pool:
+                pool.map(with_context(worker), items)
+        ```
+    """
+    ctx = serialize_context()
+    return _ContextWrappedCallable(fn, ctx)
+
+
 def serialize_context(
     asset_ctx_kwargs: Union[dict[str, Any], None] = None,
 ) -> dict[str, Any]:
@@ -75,6 +123,10 @@ def serialize_context(
     tags_context = TagsContext.get()
     settings_context = SettingsContext.get()
 
+    # Serialize deployment ContextVars for cross-process context propagation
+    deployment_id = _deployment_id.get()
+    deployment_params = _deployment_parameters.get()
+
     return {
         "flow_run_context": flow_run_context.serialize() if flow_run_context else {},
         "task_run_context": task_run_context.serialize() if task_run_context else {},
@@ -85,6 +137,8 @@ def serialize_context(
         ).serialize()
         if asset_ctx_kwargs
         else {},
+        "deployment_id": str(deployment_id) if deployment_id else None,
+        "deployment_parameters": deployment_params,
     }
 
 
@@ -110,6 +164,8 @@ def hydrated_context(
 
     with ExitStack() as stack:
         if serialized_context:
+            ensure_logging_setup()
+
             # Set up settings context
             if settings_context := serialized_context.get("settings_context"):
                 stack.enter_context(SettingsContext(**settings_context))
@@ -138,6 +194,15 @@ def hydrated_context(
             # Set up asset context
             if asset_context := serialized_context.get("asset_context"):
                 stack.enter_context(AssetContext(**asset_context))
+            # Restore deployment ContextVars for cross-process context propagation
+            if deployment_id_str := serialized_context.get("deployment_id"):
+                from uuid import UUID
+
+                deployment_id_token = _deployment_id.set(UUID(deployment_id_str))
+                stack.callback(_deployment_id.reset, deployment_id_token)
+            if deployment_params := serialized_context.get("deployment_parameters"):
+                deployment_params_token = _deployment_parameters.set(deployment_params)
+                stack.callback(_deployment_parameters.reset, deployment_params_token)
         yield
 
 
@@ -246,7 +311,12 @@ class SyncClientContext(ContextModel):
         self._context_stack += 1
         if self._context_stack == 1:
             self.client.__enter__()
-            self.client.raise_for_api_version_mismatch()
+            settings_ctx = SettingsContext.get()
+            if (
+                settings_ctx is None
+                or settings_ctx.settings.client.server_version_check_enabled
+            ):
+                self.client.raise_for_api_version_mismatch_once()
             return super().__enter__()
         else:
             return self
@@ -304,7 +374,12 @@ class AsyncClientContext(ContextModel):
         self._context_stack += 1
         if self._context_stack == 1:
             await self.client.__aenter__()
-            await self.client.raise_for_api_version_mismatch()
+            settings_ctx = SettingsContext.get()
+            if (
+                settings_ctx is None
+                or settings_ctx.settings.client.server_version_check_enabled
+            ):
+                await self.client.raise_for_api_version_mismatch_once()
             return super().__enter__()
         else:
             return self
@@ -588,17 +663,21 @@ class AssetContext(ContextModel):
         if asset.properties:
             properties_dict = asset.properties.model_dump(exclude_unset=True)
 
-            if "name" in properties_dict:
-                resource["prefect.resource.name"] = properties_dict["name"]
+            name = properties_dict.get("name")
+            if name is not None:
+                resource["prefect.resource.name"] = name
 
-            if "description" in properties_dict:
-                resource["prefect.asset.description"] = properties_dict["description"]
+            description = properties_dict.get("description")
+            if description is not None:
+                resource["prefect.asset.description"] = description
 
-            if "url" in properties_dict:
-                resource["prefect.asset.url"] = properties_dict["url"]
+            url = properties_dict.get("url")
+            if url is not None:
+                resource["prefect.asset.url"] = url
 
-            if "owners" in properties_dict:
-                resource["prefect.asset.owners"] = json.dumps(properties_dict["owners"])
+            owners = properties_dict.get("owners")
+            if owners is not None:
+                resource["prefect.asset.owners"] = json.dumps(owners)
 
         return resource
 
@@ -743,6 +822,13 @@ class SettingsContext(ContextModel):
             return None
 
 
+# Root deployment context vars for O(1) access in nested flows
+_deployment_id: ContextVar[UUID | None] = ContextVar("deployment_id", default=None)
+_deployment_parameters: ContextVar[dict[str, Any] | None] = ContextVar(
+    "deployment_parameters", default=None
+)
+
+
 def get_run_context() -> Union[FlowRunContext, TaskRunContext]:
     """
     Get the current run context from within a task or flow function.
@@ -754,10 +840,23 @@ def get_run_context() -> Union[FlowRunContext, TaskRunContext]:
         RuntimeError: If called outside of a flow or task run.
     """
     task_run_ctx = TaskRunContext.get()
+    flow_run_ctx = FlowRunContext.get()
+
+    # When both contexts exist, determine which represents the currently executing code.
+    # If the flow_run_id from the flow context differs from the task's flow_run_id,
+    # we're in a subflow running inside a task, so prefer the flow context.
+    # Otherwise, we're in a regular task within the flow, so prefer the task context.
+    if task_run_ctx and flow_run_ctx:
+        if (
+            flow_run_ctx.flow_run
+            and flow_run_ctx.flow_run.id != task_run_ctx.task_run.flow_run_id
+        ):
+            return flow_run_ctx
+        return task_run_ctx
+
     if task_run_ctx:
         return task_run_ctx
 
-    flow_run_ctx = FlowRunContext.get()
     if flow_run_ctx:
         return flow_run_ctx
 
@@ -953,6 +1052,17 @@ def root_settings_context() -> SettingsContext:
 
 
 GLOBAL_SETTINGS_CONTEXT: SettingsContext = root_settings_context()
+
+
+def refresh_global_settings_context() -> None:
+    """
+    Refresh the global settings context to pick up environment variable changes.
+
+    This is called after plugins run to ensure any environment variables they set
+    are reflected in get_current_settings().
+    """
+    global GLOBAL_SETTINGS_CONTEXT
+    GLOBAL_SETTINGS_CONTEXT = root_settings_context()
 
 
 # 2024-07-02: This surfaces an actionable error message for removed objects

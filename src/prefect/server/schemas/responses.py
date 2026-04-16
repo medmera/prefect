@@ -3,6 +3,7 @@ Schemas for special responses from the Prefect REST API.
 """
 
 import datetime
+from datetime import timedelta
 from typing import Any, ClassVar, Dict, List, Optional, Type, Union
 from uuid import UUID
 
@@ -369,9 +370,6 @@ class TaskRunResponse(ORMBaseModel):
         description="The version of the task executed in this task run.",
         examples=["1.0"],
     )
-    parameters: dict[str, Any] = Field(
-        default_factory=dict, description="Parameters for the task run."
-    )
     task_inputs: dict[
         str,
         list[
@@ -383,11 +381,6 @@ class TaskRunResponse(ORMBaseModel):
             ]
         ],
     ] = Field(default_factory=dict, description="Inputs provided to the task run.")
-    context: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional context for the task run.",
-        examples=[{"my_var": "my_val"}],
-    )
     empirical_policy: schemas.core.TaskRunPolicy = Field(
         default_factory=schemas.core.TaskRunPolicy,
         description="The task run's empirical retry policy.",
@@ -396,6 +389,27 @@ class TaskRunResponse(ORMBaseModel):
         default_factory=list,
         description="A list of tags for the task run.",
         examples=[["tag-1", "tag-2"]],
+    )
+    start_time: Optional[DateTime] = Field(
+        default=None, description="The actual start time."
+    )
+    end_time: Optional[DateTime] = Field(
+        default=None, description="The actual end time."
+    )
+    total_run_time: datetime.timedelta = Field(
+        default=datetime.timedelta(0),
+        description=(
+            "Total run time. If the task run was executed multiple times, the time of"
+            " each run will be summed."
+        ),
+    )
+    estimated_run_time: datetime.timedelta = Field(
+        default=datetime.timedelta(0),
+        description="A real-time estimate of the total run time.",
+    )
+    estimated_start_time_delta: datetime.timedelta = Field(
+        default=datetime.timedelta(0),
+        description="The difference between actual and expected start time.",
     )
 
 
@@ -449,6 +463,10 @@ class DeploymentResponse(ORMBaseModel):
             "The work queue for the deployment. If no work queue is set, work will not"
             " be scheduled."
         ),
+    )
+    work_queue_id: Optional[UUID] = Field(
+        default=None,
+        description="The id of the work pool queue to which this deployment is assigned.",
     )
     last_polled: Optional[DateTime] = Field(
         default=None,
@@ -520,11 +538,22 @@ class DeploymentResponse(ORMBaseModel):
 
         if from_attributes:
             if obj.work_queue:
+                response.work_queue_id = obj.work_queue.id
                 response.work_queue_name = obj.work_queue.name
                 if obj.work_queue.work_pool:
                     response.work_pool_name = obj.work_queue.work_pool.name
 
         return response
+
+
+class WorkPoolResponse(schemas.core.WorkPool):
+    active_slots: Optional[int] = Field(
+        default=None,
+        description=(
+            "The number of concurrency slots occupied by pending or running "
+            "flow runs. None when concurrency_limit is not set."
+        ),
+    )
 
 
 class WorkQueueResponse(schemas.core.WorkQueue):
@@ -534,6 +563,13 @@ class WorkQueueResponse(schemas.core.WorkQueue):
     )
     status: Optional[schemas.statuses.WorkQueueStatus] = Field(
         default=None, description="The queue status."
+    )
+    active_slots: Optional[int] = Field(
+        default=None,
+        description=(
+            "The number of concurrency slots currently in use. "
+            "None when concurrency_limit is not set."
+        ),
     )
 
     @classmethod
@@ -668,3 +704,103 @@ SchemaValueError = Union[str, SchemaValuePropertyError, SchemaValueIndexError]
 class SchemaValuesValidationResponse(BaseModel):
     errors: List[SchemaValueError]
     valid: bool
+
+
+# Bulk operation response schemas
+
+
+class FlowRunBulkDeleteResponse(PrefectBaseModel):
+    """Response from bulk flow run deletion."""
+
+    deleted: List[UUID] = Field(default_factory=list)
+
+
+class DeploymentBulkDeleteResponse(PrefectBaseModel):
+    """Response from bulk deployment deletion."""
+
+    deleted: List[UUID] = Field(default_factory=list)
+
+
+class FlowBulkDeleteResponse(PrefectBaseModel):
+    """Response from bulk flow deletion."""
+
+    deleted: List[UUID] = Field(default_factory=list)
+
+
+class FlowRunOrchestrationResult(PrefectBaseModel):
+    """Per-run result for bulk state operations."""
+
+    flow_run_id: UUID
+    status: SetStateStatus
+    state: Optional[schemas.states.State] = None
+    details: StateResponseDetails
+
+
+class FlowRunBulkSetStateResponse(PrefectBaseModel):
+    """Response from bulk set state operation."""
+
+    results: List[FlowRunOrchestrationResult] = Field(default_factory=list)
+
+
+class FlowRunCreateResult(PrefectBaseModel):
+    """Per-run result for bulk create operations."""
+
+    flow_run_id: Optional[UUID] = None
+    status: Literal["CREATED", "FAILED"]
+    error: Optional[str] = None
+
+
+class FlowRunBulkCreateResponse(PrefectBaseModel):
+    """Response from bulk flow run creation."""
+
+    results: List[FlowRunCreateResult] = Field(default_factory=list)
+
+
+class FlowRunSlotSummary(PrefectBaseModel):
+    """Summary of a flow run occupying a concurrency slot."""
+
+    id: UUID
+    name: str
+    state_type: Optional[schemas.states.StateType] = None
+    state_name: Optional[str] = None
+    start_time: Optional[DateTime] = None
+    state_timestamp: Optional[DateTime] = None
+    time_in_current_state: Optional[timedelta] = None
+
+
+class WorkQueueConcurrencyStatusDetail(PrefectBaseModel):
+    """Per-queue concurrency status with flow run details."""
+
+    queue_id: UUID
+    queue_name: str
+    active_slots: int
+    concurrency_limit: Optional[int] = None
+    flow_runs: List[FlowRunSlotSummary] = Field(default_factory=list)
+    flow_run_count: Optional[int] = Field(
+        default=None,
+        description="Total flow run count for this queue (may differ from len(flow_runs) when flow_run_limit is applied).",
+    )
+
+
+class WorkPoolConcurrencyStatus(PrefectBaseModel):
+    """Paginated pool-level concurrency status with per-queue breakdown."""
+
+    active_slots: int
+    concurrency_limit: Optional[int] = None
+    queues: List[WorkQueueConcurrencyStatusDetail] = Field(default_factory=list)
+    count: int = Field(description="Total number of queues.")
+    limit: int = Field(description="Page size.")
+    pages: int = Field(description="Total number of pages.")
+    page: int = Field(description="Current page number (1-indexed).")
+
+
+class WorkQueueConcurrencyStatus(PrefectBaseModel):
+    """Paginated queue-level concurrency status with flow run details."""
+
+    active_slots: int
+    concurrency_limit: Optional[int] = None
+    flow_runs: List[FlowRunSlotSummary] = Field(default_factory=list)
+    count: int = Field(description="Total number of slot-holding flow runs.")
+    limit: int = Field(description="Page size.")
+    pages: int = Field(description="Total number of pages.")
+    page: int = Field(description="Current page number (1-indexed).")

@@ -15,7 +15,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional
 from unittest import mock
-from unittest.mock import ANY, MagicMock, call, create_autospec
+from unittest.mock import ANY, AsyncMock, MagicMock, call, create_autospec
 from zoneinfo import ZoneInfo
 
 import anyio
@@ -83,7 +83,6 @@ from prefect.states import (
 )
 from prefect.task_runners import ThreadPoolTaskRunner
 from prefect.testing.utilities import (
-    AsyncMock,
     exceptions_equal,
     get_most_recent_flow_run,
 )
@@ -334,6 +333,71 @@ class TestResultPersistence:
 
         assert my_flow.persist_result is True
         assert new_flow.persist_result is True
+
+    def test_result_storage_accepts_path_object(self, tmpdir):
+        from pathlib import Path
+
+        storage_path = Path(tmpdir) / "results"
+
+        @flow(result_storage=storage_path)
+        def my_flow():
+            return 42
+
+        assert my_flow.result_storage == storage_path
+        assert my_flow.persist_result is True
+
+    def test_result_storage_with_path_string(self, tmpdir):
+        from pathlib import Path
+
+        storage_path = Path(tmpdir) / "results"
+
+        @flow(result_storage=storage_path, persist_result=True)
+        def my_flow():
+            return {"data": "test"}
+
+        result = my_flow()
+        assert result == {"data": "test"}
+
+    def test_result_storage_path_with_with_options(self, tmpdir):
+        from pathlib import Path
+
+        path1 = Path(tmpdir) / "path1"
+        path2 = Path(tmpdir) / "path2"
+
+        @flow(result_storage=path1)
+        def base():
+            pass
+
+        new_flow = base.with_options(result_storage=path2)
+
+        assert base.result_storage == path1
+        assert new_flow.result_storage == path2
+        assert base.persist_result is True
+        assert new_flow.persist_result is True
+
+    def test_result_storage_path_relative(self):
+        from pathlib import Path
+
+        @flow(result_storage=Path("./relative/path"))
+        def my_flow():
+            return "test"
+
+        assert my_flow.result_storage == Path("./relative/path")
+        assert my_flow.persist_result is True
+
+    def test_result_storage_unsaved_block_still_rejected(self, tmpdir):
+        import pytest
+
+        block = LocalFileSystem(basepath=str(tmpdir))
+
+        with pytest.raises(
+            TypeError,
+            match="Result storage configuration must be persisted server-side",
+        ):
+
+            @flow(result_storage=block)
+            def my_flow():
+                pass
 
 
 class TestFlowWithOptions:
@@ -4689,6 +4753,38 @@ def test_flow():
         return {}
 
 
+class MockModuleStorage:
+    """
+    A mock storage class that writes a Python package structure for module path testing.
+    """
+
+    def __init__(self):
+        self._base_path = Path.cwd()
+
+    def set_base_path(self, path: Path):
+        self._base_path = path
+
+    @property
+    def destination(self):
+        return self._base_path
+
+    @property
+    def pull_interval(self):
+        return 60
+
+    async def pull_code(self):
+        if self._base_path:
+            pkg_dir = self._base_path / "mypackage"
+            pkg_dir.mkdir(exist_ok=True)
+            (pkg_dir / "__init__.py").write_text("")
+            (pkg_dir / "flows.py").write_text(
+                "from prefect import flow\n\n@flow\ndef test_flow():\n    return 1\n"
+            )
+
+    def to_pull_step(self):
+        return {}
+
+
 class TestFlowFromSource:
     def test_load_flow_from_source_on_flow_function(self):
         assert hasattr(flow, "from_source")
@@ -4911,12 +5007,57 @@ class TestFlowFromSource:
 
             pull_code_spy.assert_not_called()
 
+    class TestModulePath:
+        def test_from_source_with_module_path_entrypoint(self):
+            storage = MockModuleStorage()
+
+            loaded_flow = Flow.from_source(
+                entrypoint="mypackage.flows.test_flow", source=storage
+            )
+
+            assert isinstance(loaded_flow, Flow)
+            assert loaded_flow.name == "test-flow"
+            assert loaded_flow._entrypoint == "mypackage.flows.test_flow"
+
+        async def test_afrom_source_with_module_path_entrypoint(self):
+            storage = MockModuleStorage()
+
+            loaded_flow = await Flow.afrom_source(
+                entrypoint="mypackage.flows.test_flow", source=storage
+            )
+
+            assert isinstance(loaded_flow, Flow)
+            assert loaded_flow.name == "test-flow"
+            assert loaded_flow._entrypoint == "mypackage.flows.test_flow"
+
+        def test_from_source_with_module_path_does_not_pollute_sys_path(self):
+            import sys
+
+            storage = MockModuleStorage()
+            original_path = sys.path.copy()
+
+            Flow.from_source(entrypoint="mypackage.flows.test_flow", source=storage)
+
+            assert sys.path == original_path
+
+        async def test_afrom_source_with_module_path_does_not_pollute_sys_path(self):
+            import sys
+
+            storage = MockModuleStorage()
+            original_path = sys.path.copy()
+
+            await Flow.afrom_source(
+                entrypoint="mypackage.flows.test_flow", source=storage
+            )
+
+            assert sys.path == original_path
+
 
 class TestFlowDeploy:
     @pytest.fixture
     def mock_deploy(self, monkeypatch):
         mock = AsyncMock()
-        monkeypatch.setattr("prefect.deployments.runner.deploy", mock)
+        monkeypatch.setattr("prefect.deployments.runner.adeploy", mock)
         return mock
 
     @pytest.fixture
@@ -5229,6 +5370,82 @@ class TestFlowDeploy:
             type="prefect:simple",
             version=local_flow.version,
         )
+
+
+class TestFlowDeployAsyncDispatch:
+    """Tests for async_dispatch behavior of Flow.deploy."""
+
+    def test_aio_attribute_exists(self):
+        """Test that Flow.deploy has .aio attribute for backward compatibility."""
+
+        @flow
+        def my_flow():
+            pass
+
+        assert hasattr(my_flow.deploy, "aio")
+
+    async def test_adeploy_works_in_async_context(
+        self, work_pool_with_image_variable, monkeypatch
+    ):
+        """Test that Flow.adeploy works when awaited directly."""
+        mock_deploy = AsyncMock(return_value=["test-deployment-id"])
+        monkeypatch.setattr("prefect.deployments.runner.adeploy", mock_deploy)
+
+        @flow
+        def my_flow():
+            pass
+
+        await my_flow.adeploy(
+            name="test-deployment",
+            work_pool_name=work_pool_with_image_variable.name,
+            image="my-repo/my-image",
+            build=False,
+            print_next_steps=False,
+        )
+
+        mock_deploy.assert_awaited_once()
+
+    async def test_deploy_dispatches_to_adeploy_in_async_context(
+        self, work_pool_with_image_variable, monkeypatch
+    ):
+        """Test that Flow.deploy dispatches to adeploy in async context."""
+        mock_deploy = AsyncMock(return_value=["test-deployment-id"])
+        monkeypatch.setattr("prefect.deployments.runner.adeploy", mock_deploy)
+
+        @flow
+        def my_flow():
+            pass
+
+        await my_flow.deploy(
+            name="test-deployment",
+            work_pool_name=work_pool_with_image_variable.name,
+            image="my-repo/my-image",
+            build=False,
+            print_next_steps=False,
+        )
+
+        mock_deploy.assert_awaited_once()
+
+    def test_deploy_works_in_sync_context(
+        self, work_pool_with_image_variable, monkeypatch
+    ):
+        """Test that Flow.deploy works in sync context."""
+        mock_deploy = AsyncMock(return_value=["test-deployment-id"])
+        monkeypatch.setattr("prefect.deployments.runner.adeploy", mock_deploy)
+
+        @flow
+        def my_flow():
+            pass
+
+        my_flow.deploy(
+            name="test-deployment",
+            work_pool_name=work_pool_with_image_variable.name,
+            image="my-repo/my-image",
+            build=False,
+            print_next_steps=False,
+        )
+
+        mock_deploy.assert_awaited_once()
 
 
 class TestLoadFlowFromFlowRun:

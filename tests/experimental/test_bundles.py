@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,7 @@ from prefect.context import TagsContext
 from prefect.exceptions import Abort
 
 
+@pytest.mark.usefixtures("use_hosted_api_server")
 @pytest.mark.parametrize("engine_type", ["sync", "async"])
 class TestExecuteBundleInSubprocess:
     @pytest.fixture(autouse=True)
@@ -66,7 +68,8 @@ class TestExecuteBundleInSubprocess:
             flow=simple_flow,
         )
 
-        bundle = create_bundle_for_flow_run(simple_flow, flow_run)
+        result = create_bundle_for_flow_run(simple_flow, flow_run)
+        bundle = result["bundle"]
 
         assert bundle["dependencies"] == "the-whole-enchilada==0.5.3"
 
@@ -109,7 +112,8 @@ class TestExecuteBundleInSubprocess:
 
         flow_run = await prefect_client.create_flow_run(flow=foo)
 
-        bundle = create_bundle_for_flow_run(foo, flow_run)
+        result = create_bundle_for_flow_run(foo, flow_run)
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
 
         process.join()
@@ -144,7 +148,8 @@ class TestExecuteBundleInSubprocess:
             parameters={"x": 42, "y": "hello"},
         )
 
-        bundle = create_bundle_for_flow_run(flow_with_parameters, flow_run)
+        result = create_bundle_for_flow_run(flow_with_parameters, flow_run)
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
 
         process.join()
@@ -181,9 +186,10 @@ class TestExecuteBundleInSubprocess:
             flow=context_flow,
         )
 
-        bundle = create_bundle_for_flow_run(
+        result = create_bundle_for_flow_run(
             flow=context_flow, flow_run=flow_run, context=context
         )
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
         process.join()
         assert process.exitcode == 0
@@ -215,7 +221,8 @@ class TestExecuteBundleInSubprocess:
 
         flow_run = await prefect_client.create_flow_run(flow=foo)
 
-        bundle = create_bundle_for_flow_run(foo, flow_run)
+        result = create_bundle_for_flow_run(foo, flow_run)
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
         process.join()
         assert process.exitcode == 0
@@ -247,7 +254,8 @@ class TestExecuteBundleInSubprocess:
 
         flow_run = await prefect_client.create_flow_run(flow=foo)
 
-        bundle = create_bundle_for_flow_run(foo, flow_run)
+        result = create_bundle_for_flow_run(foo, flow_run)
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
         process.join()
         assert process.exitcode == 1
@@ -278,7 +286,8 @@ class TestExecuteBundleInSubprocess:
 
         flow_run = await prefect_client.create_flow_run(flow=foo)
 
-        bundle = create_bundle_for_flow_run(foo, flow_run)
+        result = create_bundle_for_flow_run(foo, flow_run)
+        bundle = result["bundle"]
         process = execute_bundle_in_subprocess(bundle)
         process.join()
         assert process.exitcode == -9
@@ -314,7 +323,8 @@ class TestExecuteBundleInSubprocess:
                 return "test"
 
         flow_run = await prefect_client.create_flow_run(flow=simple_flow)
-        bundle = create_bundle_for_flow_run(simple_flow, flow_run)
+        result = create_bundle_for_flow_run(simple_flow, flow_run)
+        bundle = result["bundle"]
 
         # Verify that local file dependencies are filtered out
         assert (
@@ -490,7 +500,9 @@ from my_package.submodule import function
                         assert len(unregistered) == 1
                         assert unregistered[0] == mock_module
 
-    def test_pickle_local_modules_handles_import_errors(self, caplog):
+    def test_pickle_local_modules_handles_import_errors(
+        self, caplog: pytest.LogCaptureFixture
+    ):
         """Test that import errors are handled gracefully."""
 
         @flow
@@ -506,3 +518,98 @@ from my_package.submodule import function
 
             # Check that a debug message was logged about the failure
             assert "Failed to register module nonexistent_module" in caplog.text
+
+    def test_discover_deeply_nested_local_dependencies(self, tmp_path: Path):
+        """Test that local dependencies are discovered recursively through multiple levels.
+
+        This tests the scenario where:
+        - flow_module imports module_b
+        - module_b imports module_c
+        - module_c imports module_d
+
+        All modules should be discovered, including module_d which is 3 levels deep.
+        """
+        # Create temporary package structure with deep nesting
+        package_root = tmp_path / "test_packages"
+        package_root.mkdir()
+
+        # Create flow_module package
+        flow_pkg = package_root / "flow_module"
+        flow_pkg.mkdir()
+        (flow_pkg / "__init__.py").write_text("")
+
+        # Create module_b package
+        module_b_pkg = package_root / "module_b"
+        module_b_pkg.mkdir()
+        (module_b_pkg / "__init__.py").write_text("")
+
+        # Create module_c package
+        module_c_pkg = package_root / "module_c"
+        module_c_pkg.mkdir()
+        (module_c_pkg / "__init__.py").write_text("")
+
+        # Create module_d package (deepest level)
+        module_d_pkg = package_root / "module_d"
+        module_d_pkg.mkdir()
+        (module_d_pkg / "__init__.py").write_text("")
+
+        # Create module_d with a simple function
+        (module_d_pkg / "utils.py").write_text("""
+def function_d():
+    return "d"
+""")
+
+        # Create module_c that imports from module_d
+        (module_c_pkg / "utils.py").write_text("""
+from module_d.utils import function_d
+
+def function_c():
+    return function_d()
+""")
+
+        # Create module_b that imports from module_c
+        (module_b_pkg / "utils.py").write_text("""
+from module_c.utils import function_c
+
+def function_b():
+    return function_c()
+""")
+
+        # Create flow_module that imports from module_b
+        (flow_pkg / "my_flow.py").write_text("""
+from module_b.utils import function_b
+from prefect import flow
+
+@flow
+def test_flow():
+    return function_b()
+""")
+
+        # Add package_root to sys.path so modules can be imported
+        sys.path.insert(0, str(package_root))
+
+        try:
+            # Import the flow module and get the flow
+            import flow_module.my_flow
+
+            flow_obj = flow_module.my_flow.test_flow
+
+            # Discover dependencies
+            deps = _discover_local_dependencies(flow_obj)
+
+            # All four modules should be discovered
+            assert "flow_module.my_flow" in deps, (
+                "Flow module itself should be discovered"
+            )
+            assert "module_b.utils" in deps, "First-level import should be discovered"
+            assert "module_c.utils" in deps, "Second-level import should be discovered"
+            assert "module_d.utils" in deps, "Third-level import should be discovered"
+
+        finally:
+            # Clean up sys.path and sys.modules
+            sys.path.remove(str(package_root))
+            for module in list(sys.modules.keys()):
+                if module.startswith(
+                    ("flow_module", "module_b", "module_c", "module_d")
+                ):
+                    del sys.modules[module]

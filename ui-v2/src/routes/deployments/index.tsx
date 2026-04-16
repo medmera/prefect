@@ -1,4 +1,5 @@
 import { useQuery, useSuspenseQueries } from "@tanstack/react-query";
+import type { ErrorComponentProps } from "@tanstack/react-router";
 import { createFileRoute } from "@tanstack/react-router";
 import type {
 	ColumnFiltersState,
@@ -12,11 +13,22 @@ import {
 	buildPaginateDeploymentsQuery,
 	type DeploymentsPaginationFilter,
 } from "@/api/deployments";
+import { categorizeError } from "@/api/error-utils";
 import { buildListFlowsQuery } from "@/api/flows";
 import type { components } from "@/api/prefect";
 import { DeploymentsDataTable } from "@/components/deployments/data-table";
 import { DeploymentsEmptyState } from "@/components/deployments/empty-state";
 import { DeploymentsPageHeader } from "@/components/deployments/header";
+import { Button } from "@/components/ui/button";
+import {
+	EmptyState,
+	EmptyStateActions,
+	EmptyStateDescription,
+	EmptyStateIcon,
+	EmptyStateTitle,
+} from "@/components/ui/empty-state";
+import { PrefectLoading } from "@/components/ui/loading";
+import { RouteErrorState } from "@/components/ui/route-error-state";
 
 /**
  * Schema for validating URL search parameters for the variables page.
@@ -60,9 +72,124 @@ const buildPaginationBody = (
 	},
 });
 
+const DeploymentsFilteredEmptyState = ({
+	onClearFilters,
+}: {
+	onClearFilters: () => void;
+}) => (
+	<EmptyState>
+		<EmptyStateIcon id="Search" />
+		<EmptyStateTitle>No deployments match your filters</EmptyStateTitle>
+		<EmptyStateDescription>
+			Try adjusting your search or tag filters.
+		</EmptyStateDescription>
+		<EmptyStateActions>
+			<Button variant="outline" onClick={onClearFilters}>
+				Clear filters
+			</Button>
+		</EmptyStateActions>
+	</EmptyState>
+);
+
 export const Route = createFileRoute("/deployments/")({
 	validateSearch: zodValidator(searchParams),
-	component: RouteComponent,
+	component: function RouteComponent() {
+		const search = Route.useSearch();
+		const navigate = Route.useNavigate();
+		const [pagination, onPaginationChange] = usePagination();
+		const [sort, onSortChange] = useSort();
+		const [columnFilters, onColumnFiltersChange] =
+			useDeploymentsColumnFilters();
+
+		const [{ data: deploymentsCount }, { data: deploymentsPage }] =
+			useSuspenseQueries({
+				queries: [
+					buildCountDeploymentsQuery(),
+					buildPaginateDeploymentsQuery(buildPaginationBody(search)),
+				],
+			});
+
+		const deployments = deploymentsPage?.results ?? [];
+		const filteredCount = deploymentsPage?.count ?? 0;
+
+		const onClearFilters = useCallback(() => {
+			void navigate({
+				to: ".",
+				search: (prev) => ({
+					...prev,
+					page: 1,
+					flowOrDeploymentName: undefined,
+					tags: undefined,
+				}),
+				replace: true,
+			});
+		}, [navigate]);
+
+		const { data: flows } = useQuery(
+			buildListFlowsQuery({
+				flows: {
+					operator: "and_",
+					id: {
+						any_: [
+							...new Set(deployments.map((deployment) => deployment.flow_id)),
+						],
+					},
+				},
+				offset: 0,
+				sort: "NAME_ASC",
+			}),
+		);
+
+		const deploymentsWithFlows = deployments.map((deployment) => ({
+			...deployment,
+			flow: flows?.find((flow) => flow.id === deployment.flow_id),
+		}));
+
+		return (
+			<div className="flex flex-col gap-4">
+				<DeploymentsPageHeader />
+				{deploymentsCount === 0 ? (
+					<DeploymentsEmptyState />
+				) : filteredCount === 0 ? (
+					<DeploymentsFilteredEmptyState onClearFilters={onClearFilters} />
+				) : (
+					<DeploymentsDataTable
+						deployments={deploymentsWithFlows}
+						currentDeploymentsCount={deploymentsCount}
+						pageCount={deploymentsPage?.pages ?? 0}
+						pagination={pagination}
+						sort={sort}
+						columnFilters={columnFilters}
+						onPaginationChange={onPaginationChange}
+						onSortChange={onSortChange}
+						onColumnFiltersChange={onColumnFiltersChange}
+					/>
+				)}
+			</div>
+		);
+	},
+	errorComponent: function DeploymentsErrorComponent({
+		error,
+		reset,
+	}: ErrorComponentProps) {
+		const serverError = categorizeError(error, "Failed to load deployments");
+
+		// Only handle API errors (server-error, client-error) at route level
+		// Let network errors and unknown errors bubble up to root error component
+		if (
+			serverError.type !== "server-error" &&
+			serverError.type !== "client-error"
+		) {
+			throw error;
+		}
+
+		return (
+			<div className="flex flex-col gap-4">
+				<DeploymentsPageHeader />
+				<RouteErrorState error={serverError} onRetry={reset} />
+			</div>
+		);
+	},
 	loaderDeps: ({ search }) => buildPaginationBody(search),
 	loader: async ({ deps, context }) => {
 		// Get full count of deployments, don't block the UI
@@ -102,6 +229,7 @@ export const Route = createFileRoute("/deployments/")({
 		};
 	},
 	wrapInSuspense: true,
+	pendingComponent: PrefectLoading,
 });
 
 /**
@@ -208,61 +336,3 @@ const useDeploymentsColumnFilters = () => {
 
 	return [columnFilters, onColumnFiltersChange] as const;
 };
-
-function RouteComponent() {
-	const search = Route.useSearch();
-	const [pagination, onPaginationChange] = usePagination();
-	const [sort, onSortChange] = useSort();
-	const [columnFilters, onColumnFiltersChange] = useDeploymentsColumnFilters();
-
-	const [{ data: deploymentsCount }, { data: deploymentsPage }] =
-		useSuspenseQueries({
-			queries: [
-				buildCountDeploymentsQuery(),
-				buildPaginateDeploymentsQuery(buildPaginationBody(search)),
-			],
-		});
-
-	const deployments = deploymentsPage?.results ?? [];
-
-	const { data: flows } = useQuery(
-		buildListFlowsQuery({
-			flows: {
-				operator: "and_",
-				id: {
-					any_: [
-						...new Set(deployments.map((deployment) => deployment.flow_id)),
-					],
-				},
-			},
-			offset: 0,
-			sort: "NAME_ASC",
-		}),
-	);
-
-	const deploymentsWithFlows = deployments.map((deployment) => ({
-		...deployment,
-		flow: flows?.find((flow) => flow.id === deployment.flow_id),
-	}));
-
-	return (
-		<div className="flex flex-col gap-4">
-			<DeploymentsPageHeader />
-			{deploymentsCount === 0 ? (
-				<DeploymentsEmptyState />
-			) : (
-				<DeploymentsDataTable
-					deployments={deploymentsWithFlows}
-					currentDeploymentsCount={deploymentsCount}
-					pageCount={deploymentsPage?.pages ?? 0}
-					pagination={pagination}
-					sort={sort}
-					columnFilters={columnFilters}
-					onPaginationChange={onPaginationChange}
-					onSortChange={onSortChange}
-					onColumnFiltersChange={onColumnFiltersChange}
-				/>
-			)}
-		</div>
-	);
-}

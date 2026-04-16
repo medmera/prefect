@@ -3,7 +3,7 @@ import io
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,10 +30,27 @@ class MyModel(BaseModel):
     y: uuid.UUID
 
 
+T = TypeVar("T")
+
+
+class GenericResult(BaseModel, Generic[T]):
+    """Generic model for testing JSON serialization of parameterized types."""
+
+    data: T | None = None
+    message: str = ""
+
+
 @dataclass
 class MyDataclass:
     x: int
     y: str
+
+
+@dataclass
+class GenericDataclass(Generic[T]):
+    """Generic dataclass for testing non-Pydantic generic serialization."""
+
+    data: T
 
 
 @dataclass
@@ -386,6 +403,83 @@ class TestJSONSerializer:
     def test_does_not_allow_default_collision(self):
         with pytest.raises(ValidationError):
             JSONSerializer(dumps_kwargs={"default": "foo"})
+
+    def test_pydantic_generic_model_roundtrip(self):
+        """Test that Pydantic generic models with type parameters can be serialized.
+
+        Regression test for: https://github.com/PrefectHQ/prefect/issues/XXXX
+
+        When using parameterized generics like `APIResult[str]`, the class name
+        includes brackets which cannot be imported. The serializer should extract
+        the origin class for proper roundtrip serialization.
+        """
+        serializer = JSONSerializer()
+
+        # Test with concrete type parameter
+        result = GenericResult[str](data="hello", message="success")
+        serialized = serializer.dumps(result)
+
+        # Verify the serialized class name doesn't include type parameters
+        decoded = json.loads(serialized)
+        assert "[" not in decoded["__class__"], (
+            f"Class name should not contain brackets: {decoded['__class__']}"
+        )
+
+        # Verify roundtrip works
+        loaded = serializer.loads(serialized)
+        assert loaded.data == "hello"
+        assert loaded.message == "success"
+
+    def test_dataclass_generic_model_roundtrip(self):
+        """Test that non-Pydantic generic models still work correctly.
+
+        Ensures the fix for Pydantic generics doesn't break standard
+        Generic dataclasses, which don't have the bracketed name issue.
+        """
+        serializer = JSONSerializer()
+
+        # Non-Pydantic generics don't create distinct classes per parameterization
+        result = GenericDataclass[str](data="hello")
+        serialized = serializer.dumps(result)
+
+        # Verify roundtrip works
+        loaded = serializer.loads(serialized)
+        assert loaded.data == "hello"
+
+
+class TestJSONObjectDecoderSecurity:
+    def test_exc_type_rejects_non_exception_class(self):
+        with pytest.raises(ValueError, match="Invalid exception type"):
+            prefect_json_object_decoder(
+                {"__exc_type__": "builtins.int", "message": "42"}
+            )
+
+    def test_exc_type_allows_real_exception(self):
+        result = prefect_json_object_decoder(
+            {"__exc_type__": "builtins.ValueError", "message": "test error"}
+        )
+        assert isinstance(result, ValueError)
+        assert str(result) == "test error"
+
+    def test_exc_type_raises_on_unimportable_class(self):
+        with pytest.raises(ValueError, match="Invalid exception type"):
+            prefect_json_object_decoder(
+                {"__exc_type__": "nonexistent.FakeError", "message": "test"}
+            )
+
+    def test_exc_type_raises_on_dotless_name(self):
+        with pytest.raises(ValueError, match="Invalid exception type"):
+            prefect_json_object_decoder({"__exc_type__": "int", "message": "test"})
+
+    def test_class_path_handles_unimportable_class(self):
+        result = prefect_json_object_decoder(
+            {"__class__": "nonexistent.Module", "data": {}}
+        )
+        assert result == {"__class__": "nonexistent.Module", "data": {}}
+
+    def test_class_path_handles_dotless_name(self):
+        result = prefect_json_object_decoder({"__class__": "int", "data": {}})
+        assert result == {"__class__": "int", "data": {}}
 
 
 class TestCompressedSerializer:

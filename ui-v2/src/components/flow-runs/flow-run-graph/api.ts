@@ -1,3 +1,6 @@
+import { parseISO } from "date-fns";
+import type { components } from "@/api/prefect";
+import { getQueryService } from "@/api/service";
 import type {
 	EventRelatedResource,
 	RunGraphArtifact,
@@ -6,10 +9,8 @@ import type {
 	RunGraphEventResource,
 	RunGraphFetchEventsContext,
 	RunGraphNode,
-} from "@prefecthq/graphs";
-import { parseISO } from "date-fns";
-import type { components } from "@/api/prefect";
-import { getQueryService } from "@/api/service";
+	RunGraphStateEvent,
+} from "@/graphs";
 
 /**
  * Fetches the graph data for a flow run.
@@ -17,15 +18,18 @@ import { getQueryService } from "@/api/service";
  * @returns The graph data for the flow run.
  */
 export async function fetchFlowRunGraph(id: string): Promise<RunGraphData> {
-	const { data } = await getQueryService().GET("/flow_runs/{id}/graph-v2", {
-		params: { path: { id } },
-	});
+	const { data } = await (await getQueryService()).GET(
+		"/flow_runs/{id}/graph-v2",
+		{
+			params: { path: { id } },
+		},
+	);
 
 	if (!data) {
 		throw new Error("No data returned from API");
 	}
 
-	return mapApiResponseToRunGraphData(data);
+	return mapApiResponseToRunGraphData(data as GraphResponse);
 }
 
 /**
@@ -40,7 +44,7 @@ export async function fetchFlowRunEvents({
 	until,
 	nodeId,
 }: RunGraphFetchEventsContext): Promise<RunGraphEvent[]> {
-	const { data } = await getQueryService().POST("/events/filter", {
+	const { data } = await (await getQueryService()).POST("/events/filter", {
 		body: {
 			filter: {
 				any_resource: {
@@ -55,7 +59,7 @@ export async function fetchFlowRunEvents({
 				},
 				order: "ASC",
 			},
-			limit: 200,
+			limit: 50,
 		},
 	});
 
@@ -69,6 +73,7 @@ export async function fetchFlowRunEvents({
 type GraphResponse = components["schemas"]["Graph"];
 type GraphResponseNode = GraphResponse["nodes"][number];
 type GraphResponseArtifact = GraphResponse["artifacts"][number];
+type GraphResponseState = NonNullable<GraphResponse["states"]>[number];
 type EventsResponse = components["schemas"]["EventPage"];
 
 function mapApiResponseToRunGraphData(response: GraphResponse): RunGraphData {
@@ -81,6 +86,7 @@ function mapApiResponseToRunGraphData(response: GraphResponse): RunGraphData {
 		start_time: parseISO(response.start_time),
 		end_time: response.end_time ? parseISO(response.end_time) : null,
 		nodes: new Map(response.nodes.map((node) => mapNode(node))),
+		states: response.states?.map(mapState) ?? [],
 	};
 }
 
@@ -125,6 +131,15 @@ function mapNode([id, node]: GraphResponseNode): [string, RunGraphNode] {
 			artifacts: node.artifacts.map(mapArtifact),
 		},
 	];
+}
+
+function mapState(state: GraphResponseState): RunGraphStateEvent {
+	return {
+		id: state.id,
+		timestamp: parseISO(state.timestamp),
+		type: state.type,
+		name: state.name,
+	};
 }
 
 function mapArtifact(artifact: GraphResponseArtifact): RunGraphArtifact {

@@ -20,6 +20,7 @@ import contextlib
 import os
 import tempfile
 import threading
+import warnings
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
@@ -47,6 +48,8 @@ from prefect.workers.base import (
 )
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from prefect.client.schemas.objects import FlowRun, WorkPool
     from prefect.client.schemas.responses import DeploymentResponse
     from prefect.flows import Flow
@@ -72,8 +75,16 @@ class ProcessJobConfiguration(BaseJobConfiguration):
         flow: "APIFlow | None" = None,
         work_pool: "WorkPool | None" = None,
         worker_name: str | None = None,
+        worker_id: "UUID | None" = None,
     ) -> None:
-        super().prepare_for_flow_run(flow_run, deployment, flow, work_pool, worker_name)
+        super().prepare_for_flow_run(
+            flow_run,
+            deployment,
+            flow,
+            work_pool,
+            worker_name,
+            worker_id=worker_id,
+        )
 
         self.env: dict[str, str | None] = {**os.environ, **self.env}
         self.command: str | None = (
@@ -236,7 +247,8 @@ class ProcessWorker(
             if not configuration.working_dir
             else contextlib.nullcontext(configuration.working_dir)
         )
-        with working_dir_ctx as working_dir:
+        with working_dir_ctx as working_dir, warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
             process = await self._runner.execute_flow_run(
                 flow_run_id=flow_run.id,
                 command=configuration.command,
@@ -263,18 +275,27 @@ class ProcessWorker(
         parameters: dict[str, Any] | None = None,
         job_variables: dict[str, Any] | None = None,
         task_status: anyio.abc.TaskStatus["FlowRun"] | None = None,
+        flow_run: "FlowRun | None" = None,
     ):
         from prefect._experimental.bundles import (
             create_bundle_for_flow_run,
         )
 
-        flow_run = await self.client.create_flow_run(
-            flow,
-            parameters=parameters,
-            state=Pending(),
-            job_variables=job_variables,
-            work_pool_name=self.work_pool.name,
-        )
+        if flow_run is None:
+            flow_run = await self.client.create_flow_run(
+                flow,
+                parameters=parameters,
+                state=Pending(),
+                job_variables=job_variables,
+                work_pool_name=self.work_pool.name,
+            )
+        else:
+            # Reuse existing flow run - set state to Pending for retry
+            await self.client.set_flow_run_state(
+                flow_run.id,
+                Pending(),
+                force=True,
+            )
         if task_status is not None:
             # Emit the flow run object to .submit to allow it to return a future as soon as possible
             task_status.started(flow_run)
@@ -292,17 +313,20 @@ class ProcessWorker(
             flow=api_flow,
             work_pool=self.work_pool,
             worker_name=self.name,
+            worker_id=self.backend_id,
         )
 
-        bundle = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
 
         logger.debug("Executing flow run bundle in subprocess...")
         try:
-            await self._runner.execute_bundle(
-                bundle=bundle,
-                cwd=configuration.working_dir,
-                env=configuration.env,
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                await self._runner.execute_bundle(
+                    bundle=result["bundle"],
+                    cwd=configuration.working_dir,
+                    env=configuration.env,
+                )
         except Exception:
             logger.exception("Error executing flow run bundle in subprocess")
             await self._propose_crashed_state(flow_run, "Flow run execution failed")
