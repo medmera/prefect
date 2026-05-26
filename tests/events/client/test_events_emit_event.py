@@ -1,5 +1,6 @@
 from datetime import timedelta
 from unittest import mock
+from unittest.mock import MagicMock
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -7,9 +8,11 @@ import pytest
 
 from prefect.events import emit_event
 from prefect.events.clients import AssertingEventsClient
-from prefect.events.worker import EventsWorker
+from prefect.events.worker import EventsWorker, ProcessPoolForwardingEventsClient
+from prefect.exceptions import EventTooLarge
 from prefect.settings import (
     PREFECT_API_URL,
+    PREFECT_EVENTS_MAXIMUM_SIZE_BYTES,
     temporary_settings,
 )
 from prefect.types import DateTime
@@ -77,6 +80,23 @@ def test_returns_event(asserting_events_worker: EventsWorker):
 
 
 @pytest.mark.usefixtures("reset_worker_events")
+def test_raises_for_events_exceeding_maximum_size(
+    asserting_events_worker: EventsWorker,
+):
+    with temporary_settings(updates={PREFECT_EVENTS_MAXIMUM_SIZE_BYTES: 100}):
+        with pytest.raises(EventTooLarge, match="Event is too large to emit"):
+            emit_event(
+                event="vogon.poetry.read",
+                resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
+                payload={"text": "X" * 200},
+            )
+
+    asserting_events_worker.drain()
+    client = asserting_events_worker._client
+    assert client.events == []
+
+
+@pytest.mark.usefixtures("reset_worker_events")
 def test_sets_follows_tight_timing(asserting_events_worker: EventsWorker):
     destroyed_event = emit_event(
         event="planet.destroyed",
@@ -128,3 +148,21 @@ def test_noop_with_non_cloud_client(mock_should_emit_events: mock.Mock):
             )
             is None
         )
+
+
+def test_emits_with_process_pool_forwarding_client(monkeypatch: pytest.MonkeyPatch):
+    worker = MagicMock()
+    worker.client_type = ProcessPoolForwardingEventsClient
+
+    monkeypatch.setattr(
+        "prefect.events.utilities.EventsWorker.instance", lambda: worker
+    )
+    monkeypatch.setattr("prefect.events.utilities.should_emit_events", lambda: True)
+
+    emitted_event = emit_event(
+        event="vogon.poetry.read",
+        resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
+    )
+
+    assert emitted_event is not None
+    worker.send.assert_called_once_with(emitted_event)

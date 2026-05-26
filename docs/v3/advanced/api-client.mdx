@@ -1,6 +1,7 @@
 ---
 title: How to use and configure the API client
 sidebarTitle: Use and configure the API client
+keywords: ["API client", "REST API", "PrefectClient", "HTTP", "programmatic access"]
 ---
 
 ## Overview
@@ -42,6 +43,38 @@ with get_client(sync_client=True) as client:
 ```
 
 </CodeGroup>
+
+## Pagination and default query limits
+
+Client methods that accept `limit` and `offset` parameters - such as `read_flow_runs`, `read_deployments`,
+and `read_task_runs` — are subject to a server-side maximum.
+When `limit` is `None` (the default), the server applies `PREFECT_API_DEFAULT_LIMIT`, which defaults
+to `200`. To retrieve all matching records, paginate with `offset`:
+
+{/* pmd-metadata: notest */}
+```python
+from prefect import get_client
+
+
+async def read_all_deployments(page_size: int = 200):
+    all_deployments = []
+    offset = 0
+
+    async with get_client() as client:
+        while True:
+            page = await client.read_deployments(
+                limit=page_size, offset=offset
+            )
+            if not page:
+                break
+            all_deployments.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+
+    return all_deployments
+```
+
 
 ## Configure custom headers
 
@@ -383,6 +416,100 @@ async def bulk_cancel_flow_runs():
 
 if __name__ == "__main__":
     asyncio.run(bulk_cancel_flow_runs())
+```
+
+</Accordion>
+
+### Query events with pagination
+
+Query historical events from the Prefect API with support for filtering and pagination. This is useful for analyzing past activity, debugging issues, or building custom monitoring tools.
+
+The following example queries events from the last hour and demonstrates how to paginate through results:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from prefect import get_client
+from prefect.events.filters import EventFilter, EventOccurredFilter
+
+
+async def query_recent_events():
+    async with get_client() as client:
+        # query events from the last hour
+        now = datetime.now(timezone.utc)
+        event_filter = EventFilter(
+            occurred=EventOccurredFilter(
+                since=now - timedelta(hours=1),
+                until=now,
+            )
+        )
+
+        # get first page
+        page = await client.read_events(filter=event_filter, limit=10)
+        print(f"Total events: {page.total}")
+
+        # iterate through all pages
+        while page:
+            for event in page.events:
+                print(f"{event.occurred} - {event.event}")
+            page = await page.get_next_page(client)
+```
+
+<Accordion title="View the complete example">
+
+```python query_events.py
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from prefect import get_client
+from prefect.events.filters import EventFilter, EventOccurredFilter
+
+
+async def query_recent_events():
+    async with get_client() as client:
+        # query events from the last hour
+        now = datetime.now(timezone.utc)
+        event_filter = EventFilter(
+            occurred=EventOccurredFilter(
+                since=now - timedelta(hours=1),
+                until=now,
+            )
+        )
+
+        # get first page with small limit to demonstrate pagination
+        print("=== first page ===")
+        event_page = await client.read_events(filter=event_filter, limit=5)
+        print(f"total events: {event_page.total}")
+        print(f"events on this page: {len(event_page.events)}")
+        for event in event_page.events:
+            print(f"  {event.occurred} - {event.event}")
+        print()
+
+        # if there are more pages, fetch the next one
+        second_page = await event_page.get_next_page(client)
+        if second_page:
+            print("=== second page ===")
+            print(f"events on this page: {len(second_page.events)}")
+            for event in second_page.events:
+                print(f"  {event.occurred} - {event.event}")
+            print()
+
+        # demonstrate iterating through all pages
+        print("=== collecting all events ===")
+        all_events = []
+        page = await client.read_events(filter=event_filter, limit=5)
+
+        page_count = 0
+        while page:
+            all_events.extend(page.events)
+            page_count += 1
+            page = await page.get_next_page(client)
+
+        print(f"collected {len(all_events)} events across {page_count} pages")
+
+
+if __name__ == "__main__":
+    asyncio.run(query_recent_events())
 ```
 
 </Accordion>

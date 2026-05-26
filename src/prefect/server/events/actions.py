@@ -75,6 +75,7 @@ from prefect.server.utilities.http import should_redact_header
 from prefect.server.utilities.messaging import Message, MessageHandler
 from prefect.server.utilities.schemas import PrefectBaseModel
 from prefect.server.utilities.user_templates import (
+    TemplateRenderError,
     TemplateSecurityError,
     matching_types_in_templates,
     maybe_template,
@@ -158,14 +159,51 @@ class Action(PrefectBaseModel, abc.ABC):
 
         async with PrefectServerEventsClient() as events:
             triggered_event_id = uuid7()
+            # Link to the triggering event if available and recent to establish causal chain.
+            # Only set follows if timing is tight (within 5 minutes) to avoid unnecessary
+            # waiting at CausalOrdering when events arrive >15 min after their follows event.
+            follows_id = None
+            if (
+                triggered_action.triggering_event
+                and triggered_action.triggering_event.occurred
+            ):
+                time_since_trigger = (
+                    triggered_action.triggered
+                    - triggered_action.triggering_event.occurred
+                )
+                TIGHT_TIMING = timedelta(minutes=5)
+                if abs(time_since_trigger) < TIGHT_TIMING:
+                    follows_id = triggered_action.triggering_event.id
+
+            # Build related resources including automation.triggered and triggering event
+            related_resources = list(self._resulting_related_resources)
+            if triggered_action.automation_triggered_event_id:
+                related_resources.append(
+                    RelatedResource(
+                        {
+                            "prefect.resource.id": f"prefect.event.{triggered_action.automation_triggered_event_id}",
+                            "prefect.resource.role": "automation-triggered-event",
+                        }
+                    )
+                )
+            if triggered_action.triggering_event:
+                related_resources.append(
+                    RelatedResource(
+                        {
+                            "prefect.resource.id": f"prefect.event.{triggered_action.triggering_event.id}",
+                            "prefect.resource.role": "triggering-event",
+                        }
+                    )
+                )
             await events.emit(
                 Event(
                     occurred=triggered_action.triggered,
                     event="prefect.automation.action.triggered",
                     resource=resource,
-                    related=self._resulting_related_resources,
+                    related=related_resources,
                     payload=action_details,
                     id=triggered_event_id,
+                    follows=follows_id,
                 )
             )
             await events.emit(
@@ -173,7 +211,7 @@ class Action(PrefectBaseModel, abc.ABC):
                     occurred=now("UTC"),
                     event="prefect.automation.action.failed",
                     resource=resource,
-                    related=self._resulting_related_resources,
+                    related=related_resources,
                     payload={
                         **action_details,
                         "reason": reason,
@@ -210,34 +248,59 @@ class Action(PrefectBaseModel, abc.ABC):
 
         async with PrefectServerEventsClient() as events:
             triggered_event_id = uuid7()
+            # Link to the triggering event if available and recent to establish causal chain.
+            # Only set follows if timing is tight (within 5 minutes) to avoid unnecessary
+            # waiting at CausalOrdering when events arrive >15 min after their follows event.
+            follows_id = None
+            if (
+                triggered_action.triggering_event
+                and triggered_action.triggering_event.occurred
+            ):
+                time_since_trigger = (
+                    triggered_action.triggered
+                    - triggered_action.triggering_event.occurred
+                )
+                TIGHT_TIMING = timedelta(minutes=5)
+                if abs(time_since_trigger) < TIGHT_TIMING:
+                    follows_id = triggered_action.triggering_event.id
+
+            # Build related resources including automation.triggered and triggering event
+            related_resources = list(self._resulting_related_resources)
+            if triggered_action.automation_triggered_event_id:
+                related_resources.append(
+                    RelatedResource(
+                        {
+                            "prefect.resource.id": f"prefect.event.{triggered_action.automation_triggered_event_id}",
+                            "prefect.resource.role": "automation-triggered-event",
+                        }
+                    )
+                )
+            if triggered_action.triggering_event:
+                related_resources.append(
+                    RelatedResource(
+                        {
+                            "prefect.resource.id": f"prefect.event.{triggered_action.triggering_event.id}",
+                            "prefect.resource.role": "triggering-event",
+                        }
+                    )
+                )
             await events.emit(
                 Event(
                     occurred=triggered_action.triggered,
                     event="prefect.automation.action.triggered",
-                    resource=Resource(
-                        {
-                            "prefect.resource.id": automation_resource_id,
-                            "prefect.resource.name": automation.name,
-                            "prefect.trigger-type": automation.trigger.type,
-                        }
-                    ),
-                    related=self._resulting_related_resources,
+                    resource=resource,
+                    related=related_resources,
                     payload=action_details,
                     id=triggered_event_id,
+                    follows=follows_id,
                 )
             )
             await events.emit(
                 Event(
                     occurred=now("UTC"),
                     event="prefect.automation.action.executed",
-                    resource=Resource(
-                        {
-                            "prefect.resource.id": automation_resource_id,
-                            "prefect.resource.name": automation.name,
-                            "prefect.trigger-type": automation.trigger.type,
-                        }
-                    ),
-                    related=self._resulting_related_resources,
+                    resource=resource,
+                    related=related_resources,
                     payload={
                         **action_details,
                         **self._result_details,
@@ -624,9 +687,14 @@ class JinjaTemplateAction(ExternalDataAction):
 
         context = await self._template_context(templates, triggered_action)
 
-        return await asyncio.gather(
-            *[render_user_template(template, context) for template in templates]
-        )
+        try:
+            return await asyncio.gather(
+                *[render_user_template(template, context) for template in templates]
+            )
+        except TemplateRenderError as e:
+            self._result_details["template_error"] = str(e)
+            self._result_details["template_source"] = e.template
+            raise ActionFailed(f"Template rendering failed: {e.error!r}") from e
 
 
 class DeploymentAction(Action):
@@ -911,6 +979,32 @@ class RunDeployment(JinjaTemplateAction, DeploymentCommandAction):
 
         return parameters
 
+    @staticmethod
+    def _wrap_v1_template(template: str) -> Dict[str, Any]:
+        """Wraps a v1-style Jinja template string in the appropriate __prefect_kind
+        structure.  Single-expression templates (e.g. '{{ value }}') are wrapped
+        in a json + jinja structure with '| tojson' so that the rendered value
+        preserves its original type through JSON round-tripping.  Templates that
+        contain literal text outside expressions (e.g. 'Hello {{ name }}') are
+        wrapped in a plain jinja kind since their output is inherently a string."""
+        stripped = template.strip()
+        if (
+            stripped.startswith("{{")
+            and stripped.endswith("}}")
+            and stripped.count("{{") == 1
+        ):
+            # Single expression — wrap in json+jinja with | tojson to preserve
+            # the original value type (int, float, bool, None, list, dict, str).
+            inner_expr = stripped[2:-2].strip()
+            return {
+                "__prefect_kind": "json",
+                "value": {
+                    "__prefect_kind": "jinja",
+                    "template": "{{ " + inner_expr + " | tojson }}",
+                },
+            }
+        return {"__prefect_kind": "jinja", "template": template}
+
     @classmethod
     def _upgrade_v1_templates(cls, parameters: Parameters):
         """
@@ -929,9 +1023,9 @@ class RunDeployment(JinjaTemplateAction, DeploymentCommandAction):
                     if isinstance(item, dict):
                         cls._upgrade_v1_templates(item)
                     elif isinstance(item, str) and maybe_template(item):
-                        value[i] = {"__prefect_kind": "jinja", "template": item}
+                        value[i] = cls._wrap_v1_template(item)
             elif isinstance(value, str) and maybe_template(value):  # pyright: ignore[reportUnnecessaryIsInstance]
-                parameters[key] = {"__prefect_kind": "jinja", "template": value}
+                parameters[key] = cls._wrap_v1_template(value)
 
     def _collect_placeholders(
         self, parameters: Parameters | Placeholder
@@ -1039,7 +1133,9 @@ class FlowRunStateChangeAction(FlowRunAction):
 
         async with await self.orchestration_client(triggered_action) as orchestration:
             response = await orchestration.set_flow_run_state(
-                flow_run_id, await self.new_state(triggered_action=triggered_action)
+                flow_run_id,
+                await self.new_state(triggered_action=triggered_action),
+                force=getattr(self, "force", False),
             )
 
             self._result_details["status_code"] = response.status_code
@@ -1056,7 +1152,7 @@ class ChangeFlowRunState(FlowRunStateChangeAction):
 
     type: Literal["change-flow-run-state"] = "change-flow-run-state"
 
-    name: Optional[str] = Field(
+    name: str | None = Field(
         None,
         description="The name of the state to change the flow run to",
     )
@@ -1064,9 +1160,13 @@ class ChangeFlowRunState(FlowRunStateChangeAction):
         ...,
         description="The type of the state to change the flow run to",
     )
-    message: Optional[str] = Field(
+    message: str | None = Field(
         None,
         description="An optional message to associate with the state change",
+    )
+    force: bool = Field(
+        False,
+        description="Force the state change even if the transition is not allowed",
     )
 
     async def new_state(self, triggered_action: "TriggeredAction") -> StateCreate:

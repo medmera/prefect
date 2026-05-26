@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import copy
 import datetime
+import logging
+import os
 import threading
 import uuid
 import warnings
@@ -32,8 +35,10 @@ from typing_extensions import Literal, Self, TypeVar
 
 import prefect
 import prefect.types._datetime
+from prefect._experimental._launchers import resolve_bundle_step_with_launcher
 from prefect._internal.compatibility.deprecated import PrefectDeprecationWarning
 from prefect._internal.schemas.validators import return_v_or_none
+from prefect._observers import FlowRunCancellingObserver
 from prefect.client.base import ServerType
 from prefect.client.orchestration import PrefectClient, get_client
 from prefect.client.schemas.actions import WorkPoolCreate, WorkPoolUpdate
@@ -47,9 +52,12 @@ from prefect.client.schemas.objects import (
 from prefect.client.utilities import inject_client
 from prefect.context import FlowRunContext, TagsContext
 from prefect.events import Event, RelatedResource, emit_event
+from prefect.events.filters import EventAnyResourceFilter, EventFilter, EventNameFilter
 from prefect.events.related import object_as_related_resource, tags_as_related_resources
 from prefect.exceptions import (
     Abort,
+    InfrastructureNotAvailable,
+    InfrastructureNotFound,
     ObjectNotFound,
 )
 from prefect.filesystems import LocalFileSystem
@@ -72,12 +80,17 @@ from prefect.states import (
     Cancelled,
     Crashed,
     Pending,
+    Submitting,
     exception_to_failed_state,
 )
 from prefect.tasks import Task
 from prefect.types import KeyValueLabels
+from prefect.utilities._infrastructure_exit_codes import get_infrastructure_exit_info
+from prefect.utilities.annotations import NotSet
+from prefect.utilities.collections import deep_merge, set_in_dict
 from prefect.utilities.dispatch import get_registry_for_type, register_base_type
 from prefect.utilities.engine import propose_state
+from prefect.utilities.processutils import command_to_string
 from prefect.utilities.services import (
     critical_service_loop,
     start_client_metrics_server,
@@ -125,7 +138,8 @@ class BaseJobConfiguration(BaseModel):
         default=None,
         description=(
             "Name given to infrastructure created by the worker using this "
-            "job configuration."
+            "job configuration. Supports templates using {{ ctx.flow.* }} and "
+            "{{ ctx.flow_run.* }} when prepared for a flow run."
         ),
     )
 
@@ -174,18 +188,46 @@ class BaseJobConfiguration(BaseModel):
         Important: this method expects that the base_job_template was already
         validated server-side.
         """
-        base_config: dict[str, Any] = base_job_template["job_configuration"]
+        base_config: dict[str, Any] = copy.deepcopy(
+            base_job_template["job_configuration"]
+        )
         variables_schema = base_job_template["variables"]
         variables = cls._get_base_config_defaults(
             variables_schema.get("properties", {})
         )
 
-        # copy variable defaults for `env` to base config before they're replaced by
+        # merge variable defaults for `env` into base config before they're replaced by
         # deployment overrides
         if variables.get("env"):
-            base_config["env"] = variables.get("env")
+            if isinstance(base_config.get("env"), dict):
+                # Merge: preserve env vars from job_configuration
+                base_config["env"] = base_config["env"] | variables.get("env")
+            else:
+                # Replace template with defaults
+                base_config["env"] = variables.get("env")
 
-        variables.update(values)
+        # Transform dot-delimited keys (e.g., "env.FOO") to nested structure
+        # Process dot-delimited keys first, then merge non-dot keys on top
+        # so that nested format takes precedence over dot-delimited format
+        transformed_values: dict[str, Any] = {}
+        for key, value in values.items():
+            if "." in key:
+                set_in_dict(transformed_values, key, value)
+
+        for key, value in values.items():
+            if "." not in key:
+                if (
+                    key in transformed_values
+                    and isinstance(transformed_values[key], dict)
+                    and isinstance(value, dict)
+                ):
+                    # Deep merge: nested format values take precedence
+                    transformed_values[key] = deep_merge(transformed_values[key], value)
+                else:
+                    # Non-dot key overwrites any dot-delimited value
+                    transformed_values[key] = value
+
+        variables.update(transformed_values)
 
         # deep merge `env`
         if isinstance(base_config.get("env"), dict) and (
@@ -234,6 +276,7 @@ class BaseJobConfiguration(BaseModel):
         flow: "APIFlow | None" = None,
         work_pool: "WorkPool | None" = None,
         worker_name: str | None = None,
+        worker_id: "UUID | None" = None,
     ) -> None:
         """
         Prepare the job configuration for a flow run.
@@ -248,6 +291,7 @@ class BaseJobConfiguration(BaseModel):
             flow: The flow that the flow run is associated with.
             work_pool: The work pool that the flow run is running in.
             worker_name: The name of the worker that is submitting the flow run.
+            worker_id: The backend ID of the worker that is submitting the flow run.
         """
 
         self._related_objects = {
@@ -259,6 +303,13 @@ class BaseJobConfiguration(BaseModel):
         env = {
             **self._base_environment(),
             **self._base_flow_run_environment(flow_run),
+            **self._base_attribution_environment(
+                flow_run=flow_run,
+                deployment=deployment,
+                flow=flow,
+                worker_id=worker_id,
+                worker_name=worker_name,
+            ),
             **(self.env if isinstance(self.env, dict) else {}),  # pyright: ignore[reportUnnecessaryIsInstance]
         }
         self.env = {key: value for key, value in env.items() if value is not None}
@@ -270,6 +321,21 @@ class BaseJobConfiguration(BaseModel):
             **self._base_deployment_labels(deployment),
             **self.labels,
         }
+        if self.name:
+            template_values = {
+                "ctx": {
+                    "flow": flow.model_dump(mode="json") if flow is not None else {},
+                    "flow_run": flow_run.model_dump(mode="json") if flow_run else {},
+                },
+            }
+            rendered_name = apply_values(
+                template=self.name,
+                values=template_values,
+                remove_notset=True,
+            )
+            if rendered_name is not NotSet:
+                self.name = rendered_name
+
         self.name = self.name or flow_run.name
         self.command = self.command or self._base_flow_run_command()
 
@@ -309,6 +375,40 @@ class BaseJobConfiguration(BaseModel):
             return {}
 
         return {"PREFECT__FLOW_RUN_ID": str(flow_run.id)}
+
+    @staticmethod
+    def _base_attribution_environment(
+        flow_run: "FlowRun | None" = None,
+        deployment: "DeploymentResponse | None" = None,
+        flow: "APIFlow | None" = None,
+        worker_id: "UUID | None" = None,
+        worker_name: str | None = None,
+    ) -> dict[str, str]:
+        """
+        Generate environment variables for attribution headers.
+
+        These variables allow the flow run process to include attribution headers
+        in API requests, enabling usage tracking and rate limit debugging.
+        """
+        env: dict[str, str] = {}
+        if worker_id is not None:
+            env["PREFECT__WORKER_ID"] = str(worker_id)
+        if worker_name is not None:
+            env["PREFECT__WORKER_NAME"] = worker_name
+        # Use getattr for safety with mock/minimal FlowRun objects
+        if flow_id := (
+            getattr(flow_run, "flow_id", None) if flow_run is not None else None
+        ):
+            env["PREFECT__FLOW_ID"] = str(flow_id)
+        if flow is not None and getattr(flow, "name", None):
+            env["PREFECT__FLOW_NAME"] = flow.name
+        if deployment_id := (
+            getattr(flow_run, "deployment_id", None) if flow_run is not None else None
+        ):
+            env["PREFECT__DEPLOYMENT_ID"] = str(deployment_id)
+        if deployment is not None and getattr(deployment, "name", None):
+            env["PREFECT__DEPLOYMENT_NAME"] = deployment.name
+        return env
 
     @staticmethod
     def _base_deployment_labels(
@@ -400,6 +500,8 @@ class BaseVariables(BaseModel):
         ref_template: str = "#/definitions/{model}",
         schema_generator: Type[GenerateJsonSchema] = GenerateJsonSchema,
         mode: Literal["validation", "serialization"] = "validation",
+        *,
+        union_format: Literal["any_of", "primitive_type_array"] = "any_of",
     ) -> dict[str, Any]:
         """TODO: stop overriding this method - use GenerateSchema in ConfigDict instead?"""
         schema = super().model_json_schema(
@@ -486,6 +588,9 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self.backend_id: Optional[UUID] = None
         self._logger = get_worker_logger(self)
 
+        if get_current_settings().worker.debug_mode:
+            self._logger.setLevel(logging.DEBUG)
+
         self.is_setup = False
         self._create_pool_if_not_found = create_pool_if_not_found
         self._base_job_template = base_job_template
@@ -507,9 +612,11 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._limit = limit
         self._limiter: Optional[anyio.CapacityLimiter] = None
         self._submitting_flow_run_ids: set[UUID] = set()
-        self._cancelling_flow_run_ids: set[UUID] = set()
         self._scheduled_task_scopes: set[anyio.CancelScope] = set()
         self._worker_metadata_sent = False
+
+        # Cancellation handling
+        self._cancelling_observer: Optional[FlowRunCancellingObserver] = None
 
     @property
     def client(self) -> PrefectClient:
@@ -738,6 +845,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         flow: "Flow[..., FR]",
         parameters: dict[str, Any] | None = None,
         job_variables: dict[str, Any] | None = None,
+        flow_run: "FlowRun | None" = None,
     ) -> "PrefectFlowRunFuture[FR]":
         """
         EXPERIMENTAL: The interface for this method is subject to change.
@@ -747,9 +855,11 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         Args:
             flow: The flow to submit
             parameters: The parameters to pass to the flow
+            job_variables: Job variables for infrastructure configuration
+            flow_run: Optional existing flow run to retry (reuses ID instead of creating new)
 
         Returns:
-            A flow run object
+            A flow run future
         """
         warnings.warn(
             "Ad-hoc flow submission via workers is experimental. The interface "
@@ -765,6 +875,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 flow=flow,
                 parameters=parameters,
                 job_variables=job_variables,
+                flow_run=flow_run,
             ),
         )
         return PrefectFlowRunFuture(flow_run_id=flow_run.id)
@@ -775,9 +886,17 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         parameters: dict[str, Any] | None = None,
         job_variables: dict[str, Any] | None = None,
         task_status: anyio.abc.TaskStatus["FlowRun"] | None = None,
+        flow_run: "FlowRun | None" = None,
     ):
         """
         Submits a flow for the worker to kick off execution for.
+
+        Args:
+            flow: The flow to submit
+            parameters: The parameters to pass to the flow
+            job_variables: Job variables for infrastructure configuration
+            task_status: Task status for signaling when the flow run is ready
+            flow_run: Optional existing flow run to retry (reuses ID instead of creating new)
         """
         from prefect._experimental.bundles import (
             aupload_bundle_to_storage,
@@ -799,10 +918,9 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
 
         current_result_store = get_result_store()
         # Check result storage and use the work pool default if needed
-        if (
+        if flow.result_storage is None and (
             current_result_store.result_storage is None
             or isinstance(current_result_store.result_storage, LocalFileSystem)
-            and flow.result_storage is None
         ):
             if (
                 self.work_pool.storage_configuration.default_result_storage_block_id
@@ -822,40 +940,63 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 )
 
         bundle_key = str(uuid.uuid4())
-        upload_command = convert_step_to_command(
+        flow_launcher = getattr(flow, "launcher", None)
+        upload_step = resolve_bundle_step_with_launcher(
             self.work_pool.storage_configuration.bundle_upload_step,
+            flow_launcher,
+            "upload",
+        )
+        execute_step = resolve_bundle_step_with_launcher(
+            self.work_pool.storage_configuration.bundle_execution_step,
+            flow_launcher,
+            "execution",
+        )
+        upload_command = convert_step_to_command(
+            upload_step,
             bundle_key,
             quiet=True,
         )
-        execute_command = convert_step_to_command(
-            self.work_pool.storage_configuration.bundle_execution_step, bundle_key
-        )
+        execute_command = convert_step_to_command(execute_step, bundle_key)
 
-        job_variables = (job_variables or {}) | {"command": " ".join(execute_command)}
+        job_variables = (job_variables or {}) | {
+            "command": command_to_string(execute_command)
+        }
         parameters = parameters or {}
 
-        # Create a parent task run if this is a child flow run to ensure it shows up as a child flow in the UI
-        parent_task_run = None
-        if flow_run_ctx := FlowRunContext.get():
-            parent_task = Task[Any, Any](
-                name=flow.name,
-                fn=flow.fn,
-                version=flow.version,
-            )
-            parent_task_run = await parent_task.create_run(
-                flow_run_context=flow_run_ctx,
-                parameters=parameters,
-            )
+        if flow_run is None:
+            # Create new flow run (standard behavior)
+            # Create a parent task run if this is a child flow run to ensure it shows up as a child flow in the UI
+            parent_task_run = None
+            if flow_run_ctx := FlowRunContext.get():
+                parent_task = Task[Any, Any](
+                    name=flow.name,
+                    fn=flow.fn,
+                    version=flow.version,
+                )
+                parent_task_run = await parent_task.create_run(
+                    flow_run_context=flow_run_ctx,
+                    parameters=parameters,
+                )
 
-        flow_run = await self.client.create_flow_run(
-            flow,
-            parameters=flow.serialize_parameters(parameters),
-            state=Pending(),
-            job_variables=job_variables,
-            work_pool_name=self.work_pool.name,
-            tags=TagsContext.get().current_tags,
-            parent_task_run_id=getattr(parent_task_run, "id", None),
-        )
+            flow_run = await self.client.create_flow_run(
+                flow,
+                parameters=flow.serialize_parameters(parameters),
+                state=Pending(),
+                job_variables=job_variables,
+                work_pool_name=self.work_pool.name,
+                tags=TagsContext.get().current_tags,
+                parent_task_run_id=getattr(parent_task_run, "id", None),
+            )
+        else:
+            # Reuse existing flow run - set state to Pending for retry
+            await self.client.set_flow_run_state(
+                flow_run_id=flow_run.id,
+                state=Pending(message="Retrying on remote infrastructure"),
+                force=True,
+            )
+            # Re-fetch to get updated state
+            flow_run = await self.client.read_flow_run(flow_run.id)
+
         if task_status is not None:
             # Emit the flow run object to .submit to allow it to return a future as soon as possible
             task_status.started(flow_run)
@@ -873,10 +1014,35 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             flow=api_flow,
             work_pool=self.work_pool,
             worker_name=self.name,
+            worker_id=self.backend_id,
         )
 
-        bundle = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
-        await aupload_bundle_to_storage(bundle, bundle_key, upload_command)
+        bundle_result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        bundle = bundle_result["bundle"]
+        zip_path = bundle_result["zip_path"]
+
+        try:
+            await aupload_bundle_to_storage(
+                bundle,
+                bundle_key,
+                upload_command,
+                zip_path=zip_path,
+                upload_step=upload_step,
+            )
+        finally:
+            # Clean up zip file after upload (success or failure)
+            if zip_path:
+                try:
+                    zip_path.unlink(missing_ok=True)
+                    # Also clean up the temp directory created by ZipBuilder
+                    if zip_path.parent.exists() and zip_path.parent.name.startswith(
+                        "prefect-zip-"
+                    ):
+                        import shutil
+
+                        shutil.rmtree(zip_path.parent, ignore_errors=True)
+                except Exception as cleanup_error:
+                    logger.debug("Failed to clean up zip file: %s", cleanup_error)
 
         logger.debug("Successfully uploaded execution bundle")
 
@@ -889,19 +1055,22 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 result = await self.run(flow_run, configuration)
 
                 if result.status_code != 0:
+                    info = get_infrastructure_exit_info(result.status_code)
                     await self._propose_crashed_state(
                         flow_run,
                         (
                             "Flow run infrastructure exited with non-zero status code"
-                            f" {result.status_code}."
+                            f" {result.status_code}. {info.explanation}"
                         ),
                     )
+                    if info.resolution:
+                        logger.info(info.resolution)
         except Exception as exc:
             # This flow run was being submitted and did not start successfully
             logger.exception(
-                f"Failed to submit flow run '{flow_run.id}' to infrastructure."
+                f"Failed to submit flow run '{flow_run.name}' to infrastructure."
             )
-            message = f"Flow run could not be submitted to infrastructure:\n{exc!r}"
+            message = f"Failed to submit flow run to infrastructure: {type(exc).__name__}: {exc}"
             await self._propose_crashed_state(flow_run, message, client=self.client)
 
     @classmethod
@@ -926,7 +1095,35 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         await self._exit_stack.enter_async_context(self._client)
         await self._exit_stack.enter_async_context(self._runs_task_group)
 
+        # Set worker name in os.environ so get_attribution_headers() includes
+        # it in all API requests made by this worker process.
+        os.environ["PREFECT__WORKER_NAME"] = self.name
+
         await self.sync_with_backend()
+
+        # Initialize cancellation handling if enabled
+        if get_current_settings().worker.enable_cancellation and self._work_pool:
+            try:
+                self._cancelling_observer = await self._exit_stack.enter_async_context(
+                    FlowRunCancellingObserver(
+                        on_cancelling=lambda flow_run_id: (
+                            self._runs_task_group.start_soon(
+                                self._cancel_run, flow_run_id
+                            )
+                        ),
+                        polling_interval=get_current_settings().worker.cancellation_poll_seconds,
+                        event_filter=EventFilter(
+                            event=EventNameFilter(name=["prefect.flow-run.Cancelling"]),
+                            any_resource=EventAnyResourceFilter(
+                                id=[f"prefect.work-pool.{self._work_pool.id}"]
+                            ),
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to setup cancellation handling: %s", exc, exc_info=True
+                )
 
         self.is_setup = True
 
@@ -934,6 +1131,14 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         """Cleans up resources after the worker is stopped."""
         self._logger.debug("Tearing down worker...")
         self.is_setup: bool = False
+        # Only remove env vars if they still belong to this worker instance,
+        # in case multiple workers share the same process.
+        if os.environ.get("PREFECT__WORKER_NAME") == self.name:
+            os.environ.pop("PREFECT__WORKER_NAME", None)
+        if self.backend_id and os.environ.get("PREFECT__WORKER_ID") == str(
+            self.backend_id
+        ):
+            os.environ.pop("PREFECT__WORKER_ID", None)
         for scope in self._scheduled_task_scopes:
             scope.cancel()
 
@@ -1109,6 +1314,9 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         remote_id = await self._send_worker_heartbeat()
         if remote_id:
             self.backend_id = remote_id
+            # Set worker ID in os.environ so get_attribution_headers() includes
+            # it in all API requests made by this worker process.
+            os.environ["PREFECT__WORKER_ID"] = str(remote_id)
             self._logger = get_worker_logger(self)
 
         self._logger.debug(
@@ -1197,6 +1405,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                         run_logger.warning(f"Failed to generate worker URL: {ve}")
 
                 self._submitting_flow_run_ids.add(flow_run.id)
+                if self._cancelling_observer is not None:
+                    self._cancelling_observer.add_in_flight_flow_run_id(flow_run.id)
                 if TYPE_CHECKING:
                     assert self._runs_task_group is not None
                 self._runs_task_group.start_soon(
@@ -1227,6 +1437,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                     " execution"
                 )
                 self._submitting_flow_run_ids.remove(flow_run.id)
+                if self._cancelling_observer is not None:
+                    self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
                 await self._mark_flow_run_as_cancelled(
                     flow_run,
                     state_updates=dict(
@@ -1257,7 +1469,9 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                         "not be cancellable."
                     )
 
-                run_logger.info(f"Completed submission of flow run '{flow_run.id}'")
+                run_logger.info(
+                    f"Flow run '{flow_run.name}' submitted to infrastructure"
+                )
 
             else:
                 # If the run is not ready to submit, release the concurrency slot
@@ -1265,6 +1479,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         else:
             self._release_limit_slot(flow_run.id)
         self._submitting_flow_run_ids.remove(flow_run.id)
+        if self._cancelling_observer is not None:
+            self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
 
     async def _submit_run_and_capture_errors(
         self,
@@ -1278,6 +1494,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             submitted_event = self._emit_flow_run_submitted_event(configuration)
             await self._give_worker_labels_to_flow_run(flow_run.id)
 
+            await self._propose_submitting_state(flow_run)
+
             result = await self.run(
                 flow_run=flow_run,
                 task_status=task_status,
@@ -1287,17 +1505,17 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             if task_status and not getattr(task_status, "_future").done():
                 # This flow run was being submitted and did not start successfully
                 run_logger.exception(
-                    f"Failed to submit flow run '{flow_run.id}' to infrastructure."
+                    f"Failed to submit flow run '{flow_run.name}' to infrastructure."
                 )
                 # Mark the task as started to prevent agent crash
                 task_status.started(exc)
-                message = f"Flow run could not be submitted to infrastructure:\n{exc!r}"
+                message = f"Failed to submit flow run to infrastructure: {type(exc).__name__}: {exc}"
                 await self._propose_crashed_state(flow_run, message)
             else:
                 run_logger.exception(
-                    f"An error occurred while monitoring flow run '{flow_run.id}'. "
-                    "The flow run will not be marked as failed, but an issue may have "
-                    "occurred."
+                    f"Lost connection to flow run '{flow_run.name}' infrastructure."
+                    " The flow run's final state will be determined by the execution"
+                    " environment."
                 )
             return exc
         finally:
@@ -1318,13 +1536,16 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             )
 
         if result.status_code != 0:
+            info = get_infrastructure_exit_info(result.status_code)
             await self._propose_crashed_state(
                 flow_run,
                 (
                     "Flow run infrastructure exited with non-zero status code"
-                    f" {result.status_code}."
+                    f" {result.status_code}. {info.explanation}"
                 ),
             )
+            if info.resolution:
+                run_logger.info(info.resolution)
 
         if submitted_event:
             self._emit_flow_run_executed_event(result, configuration, submitted_event)
@@ -1334,10 +1555,20 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
     def _release_limit_slot(self, flow_run_id: UUID) -> None:
         """
         Frees up a slot taken by the given flow run id.
+
+        This method gracefully handles cases where the slot has already been released
+        to prevent worker crashes from double-release scenarios.
         """
         if self._limiter:
-            self._limiter.release_on_behalf_of(flow_run_id)
-            self._logger.debug("Limit slot released for flow run '%s'", flow_run_id)
+            try:
+                self._limiter.release_on_behalf_of(flow_run_id)
+                self._logger.debug("Limit slot released for flow run '%s'", flow_run_id)
+            except RuntimeError:
+                # Slot was already released - this can happen in certain error paths
+                # where multiple cleanup attempts occur. Log it but don't crash.
+                self._logger.debug(
+                    "Limit slot for flow run '%s' was already released", flow_run_id
+                )
 
     def get_status(self) -> dict[str, Any]:
         """
@@ -1387,16 +1618,17 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 flow=flow,
                 work_pool=self.work_pool,
                 worker_name=self.name,
+                worker_id=self.backend_id,
             )
         except TypeError:
             warnings.warn(
-                "This worker is missing the `work_pool` and `worker_name` arguments "
+                "This worker is missing the `work_pool`, `worker_name`, or `worker_id` arguments "
                 "in its JobConfiguration.prepare_for_flow_run method. Please update "
-                "the worker's JobConfiguration  class to accept these arguments to "
+                "the worker's JobConfiguration class to accept these arguments to "
                 "avoid this warning.",
                 category=PrefectDeprecationWarning,
             )
-            # Handle older subclasses that don't accept work_pool and worker_name
+            # Handle older subclasses that don't accept work_pool, worker_name, and worker_id
             configuration.prepare_for_flow_run(
                 flow_run=flow_run, deployment=deployment, flow=flow
             )
@@ -1451,6 +1683,22 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 exc_info=True,
             )
 
+    async def _propose_submitting_state(self, flow_run: "FlowRun") -> None:
+        run_logger = self.get_flow_run_logger(flow_run)
+        try:
+            await propose_state(
+                self.client,
+                Submitting(),
+                flow_run_id=flow_run.id,
+            )
+        except Abort:
+            pass
+        except Exception:
+            run_logger.debug(
+                f"Failed to update flow run '{flow_run.id}' to Submitting state",
+                exc_info=True,
+            )
+
     async def _propose_crashed_state(
         self, flow_run: "FlowRun", message: str, client: PrefectClient | None = None
     ) -> None:
@@ -1464,6 +1712,11 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         except Abort:
             # Flow run already marked as failed
             pass
+        except ObjectNotFound:
+            # Flow run was deleted - log it but don't crash the worker
+            run_logger.debug(
+                f"Flow run '{flow_run.id}' was deleted before state could be updated"
+            )
         except Exception:
             run_logger.exception(f"Failed to update state of flow run '{flow_run.id}'")
         else:
@@ -1486,13 +1739,113 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             # does not need to explicitly set the type
             state = Cancelled(**state_updates)
 
-        await self.client.set_flow_run_state(flow_run.id, state, force=True)
+        try:
+            await self.client.set_flow_run_state(flow_run.id, state, force=True)
+        except ObjectNotFound:
+            # Flow run was deleted - log it but don't crash the worker
+            run_logger = self.get_flow_run_logger(flow_run)
+            run_logger.debug(
+                f"Flow run '{flow_run.id}' was deleted before it could be marked as cancelled"
+            )
 
-        # Do not remove the flow run from the cancelling set immediately because
-        # the API caches responses for the `read_flow_runs` and we do not want to
-        # duplicate cancellations.
-        await self._schedule_task(
-            60 * 10, self._cancelling_flow_run_ids.remove, flow_run.id
+    async def _cancel_run(self, flow_run_id: UUID) -> None:
+        """
+        Cancel a flow run by killing its infrastructure and marking it cancelled.
+
+        Only cancels flow runs that were pending (not yet started).
+        """
+        try:
+            flow_run = await self.client.read_flow_run(flow_run_id)
+        except ObjectNotFound:
+            self._logger.debug(
+                f"Flow run {flow_run_id} not found, skipping cancellation"
+            )
+            return
+
+        run_logger = self.get_flow_run_logger(flow_run)
+
+        # Only cancel if the flow run was pending (never started)
+        if flow_run.start_time is not None:
+            return
+
+        # No infrastructure to kill if no pid
+        if not flow_run.infrastructure_pid:
+            await self._mark_flow_run_as_cancelled(
+                flow_run,
+                state_updates={
+                    "message": "Flow run cancelled by worker (no infrastructure found)."
+                },
+            )
+            return
+
+        # Get configuration and kill infrastructure
+        try:
+            configuration = await self._get_configuration(flow_run)
+        except ObjectNotFound:
+            run_logger.warning(
+                "Cannot kill infrastructure: deployment not found. "
+                "Infrastructure may still be running."
+            )
+            await self._mark_flow_run_as_cancelled(
+                flow_run,
+                state_updates={
+                    "message": "Flow run cancelled (deployment not found, infrastructure may still be running)."
+                },
+            )
+            return
+
+        try:
+            await self.kill_infrastructure(
+                infrastructure_pid=flow_run.infrastructure_pid,
+                configuration=configuration,
+                grace_seconds=30,
+            )
+        except NotImplementedError:
+            run_logger.warning(
+                "Worker does not support killing infrastructure. "
+                "Infrastructure may still be running."
+            )
+            return
+        except InfrastructureNotFound:
+            run_logger.debug("Attempted to kill infrastructure that was not found")
+            pass
+        except InfrastructureNotAvailable as exc:
+            run_logger.warning(f"Cannot kill infrastructure: {exc}")
+            return
+        except Exception:
+            run_logger.exception("Error killing infrastructure")
+            return
+
+        await self._mark_flow_run_as_cancelled(
+            flow_run,
+            state_updates={"message": "Flow run cancelled by worker while pending."},
+        )
+        run_logger.info(f"Cancelled pending flow run '{flow_run.id}'")
+
+    async def kill_infrastructure(
+        self,
+        infrastructure_pid: str,
+        configuration: C,
+        grace_seconds: int = 30,
+    ) -> None:
+        """
+        Kill infrastructure for a flow run.
+
+        Override this method in subclasses to implement infrastructure-specific
+        termination logic.
+
+        Args:
+            infrastructure_pid: The infrastructure identifier from the flow run.
+            configuration: The job configuration for connecting to infrastructure.
+            grace_seconds: Time to allow for graceful shutdown before force killing.
+
+        Raises:
+            NotImplementedError: If the worker doesn't support killing infrastructure.
+            InfrastructureNotFound: If the infrastructure doesn't exist.
+            InfrastructureNotAvailable: If the infrastructure can't be killed by this worker.
+        """
+        raise NotImplementedError(
+            f"Worker type {self.type!r} does not support killing infrastructure"
         )
 
     async def _set_work_pool_template(

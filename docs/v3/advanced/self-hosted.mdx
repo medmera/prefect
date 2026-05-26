@@ -2,6 +2,7 @@
 title: How to scale self-hosted Prefect
 sidebarTitle: Scale self-hosted Prefect
 description: Learn how to run multiple Prefect server instances for high availability and load distribution
+keywords: ["self-hosted", "scaling", "high availability", "load balancing", "production"]
 ---
 
 Running multiple Prefect server instances enables high availability and distributes load across your infrastructure. This guide covers configuration and deployment patterns for scaling self-hosted Prefect.
@@ -99,6 +100,29 @@ export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://user:password@h
 PostgreSQL version 14.9 or higher is required for multi-server deployments. SQLite does not support the features needed for state synchronization across multiple servers.
 </Warning>
 
+### AWS RDS IAM Authentication
+
+To use AWS IAM authentication for your PostgreSQL database (experimental):
+
+1. **Install the AWS integration**:
+   ```bash
+   pip install prefect-aws
+   ```
+
+2. **Create an IAM policy** with `rds-db:connect` permission and attach it to your IAM user/role.
+
+3. **Enable experimental plugins and IAM authentication**:
+   ```bash
+   export PREFECT_EXPERIMENTS_PLUGINS_ENABLED=true
+   export PREFECT_INTEGRATIONS_AWS_RDS_IAM_ENABLED=true
+   # Optional: export PREFECT_INTEGRATIONS_AWS_RDS_IAM_REGION_NAME=us-east-1
+   ```
+
+4. **Configure your connection URL**:
+   ```bash
+   export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://iam_user@host:5432/prefect"
+   ```
+
 ### Redis setup
 
 Configure Redis as your server's message broker, cache, and lease storage:
@@ -126,6 +150,44 @@ For Redis instances that require an encrypted connection, you can enable SSL/TLS
 export PREFECT_REDIS_MESSAGING_SSL="true"
 ```
 
+Alternatively, configure the Redis connection with a single URL instead of individual fields. When `PREFECT_REDIS_MESSAGING_URL` is set, it takes precedence and the individual host, port, db, username, password, and SSL fields are ignored:
+
+```bash
+export PREFECT_REDIS_MESSAGING_URL="redis://username:password@redis-host:6379/0"
+```
+
+Use `rediss://` for TLS connections:
+
+```bash
+export PREFECT_REDIS_MESSAGING_URL="rediss://redis-host:6379/0"
+```
+
+#### Docket URL for background services
+
+Prefect uses [Docket](https://github.com/chrisguidry/docket) to coordinate background services like the scheduler, late run detection, and automation triggers. By default, Docket uses in-memory storage (`memory://`), which only works for single-server deployments.
+
+For high-availability deployments, configure Docket to use Redis:
+
+```bash
+export PREFECT_SERVER_DOCKET_URL="redis://redis-host:6379/0"
+```
+
+If your Redis instance requires authentication:
+
+```bash
+export PREFECT_SERVER_DOCKET_URL="redis://username:password@redis-host:6379/0"
+```
+
+For Redis instances that require SSL/TLS:
+
+```bash
+export PREFECT_SERVER_DOCKET_URL="rediss://redis-host:6379/0"
+```
+
+<Note>
+The Docket URL can use the same Redis instance as the messaging configuration above, but you may use a different database number (e.g., `/1` instead of `/0`) to keep the data separate.
+</Note>
+
 ### Service separation
 
 For optimal performance, run API servers and background services separately:
@@ -139,6 +201,10 @@ prefect server start --host 0.0.0.0 --port 4200 --no-services
 ```bash
 prefect server services start
 ```
+
+<Tip>
+For high-volume deployments, consider reducing the event retention period from the default 7 days to prevent rapid database growth. See [database maintenance](/v3/advanced/database-maintenance#configure-event-retention) for configuration details.
+</Tip>
 
 ### Database migrations
 
@@ -324,6 +390,7 @@ services:
       PREFECT_SERVER_CONCURRENCY_LEASE_STORAGE: prefect_redis.lease_storage
       PREFECT_REDIS_MESSAGING_HOST: redis
       PREFECT_REDIS_MESSAGING_PORT: "6379"
+      PREFECT_SERVER_DOCKET_URL: redis://redis:6379/1
     ports:
       - "4200-4202:4200"  # Maps to different ports for each replica
 
@@ -346,6 +413,7 @@ services:
       PREFECT_SERVER_CONCURRENCY_LEASE_STORAGE: prefect_redis.lease_storage
       PREFECT_REDIS_MESSAGING_HOST: redis
       PREFECT_REDIS_MESSAGING_PORT: "6379"
+      PREFECT_SERVER_DOCKET_URL: redis://redis:6379/1
 
 volumes:
   postgres_data:
@@ -433,5 +501,6 @@ Monitor your multi-server deployment:
 
 ## Further reading
 
+- [Database maintenance](/v3/advanced/database-maintenance) - Monitor table sizes, configure event retention, and manage data growth
 - [Server concepts](/v3/concepts/server)
 - Deploy [Helm charts](/v3/advanced/server-helm) for Kubernetes

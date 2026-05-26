@@ -69,6 +69,12 @@ If True, enables debug mode which may provide additional logging and debugging f
 
 **TOML dotted key path**: `deployments`
 
+### `events`
+
+**Type**: [EventsSettings](#eventssettings)
+
+**TOML dotted key path**: `events`
+
 ### `experiments`
 Settings for controlling experimental features
 
@@ -119,6 +125,13 @@ Settings for controlling task behavior
 **Type**: [TasksSettings](#taskssettings)
 
 **TOML dotted key path**: `tasks`
+
+### `telemetry`
+Settings for configuring telemetry collection
+
+**Type**: [TelemetrySettings](#telemetrysettings)
+
+**TOML dotted key path**: `telemetry`
 
 ### `testing`
 Settings used during testing
@@ -420,6 +433,24 @@ Settings for controlling API client behavior
 **Supported environment variables**:
 `PREFECT_CLIENT_CUSTOM_HEADERS`
 
+### `server_version_check_enabled`
+
+        Whether the client should check the server's API version on startup.
+        When disabled, the client will skip the call to /admin/version that
+        normally runs once per client context entry.  This is useful for worker
+        subprocesses that inherit a known-compatible server configuration and
+        do not need to repeat the version handshake.
+        
+
+**Type**: `boolean`
+
+**Default**: `True`
+
+**TOML dotted key path**: `client.server_version_check_enabled`
+
+**Supported environment variables**:
+`PREFECT_CLIENT_SERVER_VERSION_CHECK_ENABLED`
+
 ### `metrics`
 
 **Type**: [ClientMetricsSettings](#clientmetricssettings)
@@ -452,6 +483,18 @@ Whether or not to enable orchestration telemetry.
 
 **Supported environment variables**:
 `PREFECT_CLOUD_ENABLE_ORCHESTRATION_TELEMETRY`
+
+### `max_log_size`
+Maximum size in characters for a single log when sending logs to Prefect Cloud.
+
+**Type**: `integer`
+
+**Default**: `25000`
+
+**TOML dotted key path**: `cloud.max_log_size`
+
+**Supported environment variables**:
+`PREFECT_CLOUD_MAX_LOG_SIZE`
 
 ### `ui_url`
 The URL of the Prefect Cloud UI. If not set, the client will attempt to infer it.
@@ -497,6 +540,31 @@ The default Docker namespace to use when building images.
 `PREFECT_DEPLOYMENTS_DEFAULT_DOCKER_BUILD_NAMESPACE`, `PREFECT_DEFAULT_DOCKER_BUILD_NAMESPACE`
 
 ---
+## EventsSettings
+Settings for controlling events behavior
+### `worker_max_queue_size`
+
+        Maximum number of events that can be queued for delivery to the
+        Prefect server. When the queue is full, new events are dropped with
+        a warning. Set to 0 for unbounded (the default).
+
+        Warning: setting this value too low may result in data loss as events
+        will be silently dropped when the queue is full.
+        
+
+**Type**: `integer`
+
+**Default**: `0`
+
+**Constraints**:
+- Minimum: 0
+
+**TOML dotted key path**: `events.worker_max_queue_size`
+
+**Supported environment variables**:
+`PREFECT_EVENTS_WORKER_MAX_QUEUE_SIZE`
+
+---
 ## ExperimentsSettings
 Settings for configuring experimental features
 ### `warn`
@@ -511,9 +579,28 @@ If `True`, warn on usage of experimental features.
 **Supported environment variables**:
 `PREFECT_EXPERIMENTS_WARN`, `PREFECT_EXPERIMENTAL_WARN`
 
+### `plugins`
+Settings for the experimental plugin system
+
+**Type**: [PluginsSettings](#pluginssettings)
+
+**TOML dotted key path**: `experiments.plugins`
+
 ---
 ## FlowsSettings
 Settings for controlling flow behavior
+### `heartbeat_frequency`
+Number of seconds between flow run heartbeats. Heartbeats are used to detect crashed flow runs.
+
+**Type**: `integer | None`
+
+**Default**: `180`
+
+**TOML dotted key path**: `flows.heartbeat_frequency`
+
+**Supported environment variables**:
+`PREFECT_FLOWS_HEARTBEAT_FREQUENCY`, `PREFECT_RUNNER_HEARTBEAT_FREQUENCY`
+
 ### `default_retries`
 This value sets the default number of retries for all flows.
 
@@ -739,7 +826,7 @@ The number of logs to batch before sending to the API.
 `PREFECT_LOGGING_TO_API_BATCH_SIZE`
 
 ### `max_log_size`
-The maximum size in bytes for a single log.
+The maximum size in characters for a single log. When connected to Prefect Cloud, this value is capped at `PREFECT_CLOUD_MAX_LOG_SIZE` (default 25,000).
 
 **Type**: `integer`
 
@@ -777,6 +864,81 @@ The maximum size in bytes for a single log.
 
 **Supported environment variables**:
 `PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW`
+
+---
+## PluginsSettings
+Settings for configuring the experimental plugin system
+### `enabled`
+Enable the experimental plugin system.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `experiments.plugins.enabled`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_ENABLED`
+
+### `allow`
+Comma-separated list of plugin names to allow. If set, only these plugins will be loaded.
+
+**Type**: `array | None`
+
+**Default**: `None`
+
+**TOML dotted key path**: `experiments.plugins.allow`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_ALLOW`
+
+### `deny`
+Comma-separated list of plugin names to deny. These plugins will not be loaded.
+
+**Type**: `array | None`
+
+**Default**: `None`
+
+**TOML dotted key path**: `experiments.plugins.deny`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_DENY`
+
+### `setup_timeout_seconds`
+Maximum time in seconds for all plugins to complete their setup hooks.
+
+**Type**: `number`
+
+**Default**: `20.0`
+
+**TOML dotted key path**: `experiments.plugins.setup_timeout_seconds`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_SETUP_TIMEOUT_SECONDS`
+
+### `strict`
+If True, exit if a required plugin fails during setup.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `experiments.plugins.strict`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_STRICT`
+
+### `safe_mode`
+If True, load plugins but do not execute their hooks. Useful for testing.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `experiments.plugins.safe_mode`
+
+**Supported environment variables**:
+`PREFECT_EXPERIMENTS_PLUGINS_SAFE_MODE`
 
 ---
 ## ResultsSettings
@@ -920,17 +1082,17 @@ Number of seconds a runner should wait between queries for scheduled work.
 **Supported environment variables**:
 `PREFECT_RUNNER_POLL_FREQUENCY`
 
-### `heartbeat_frequency`
-Number of seconds a runner should wait between heartbeats for flow runs.
+### `crash_on_cancellation_failure`
+Whether to crash flow runs and shut down the runner when cancellation observing fails. When enabled, if both websocket and polling mechanisms for detecting cancellation events fail, all in-flight flow runs will be marked as crashed and the runner will shut down. When disabled (default), the runner will log an error but continue executing flow runs.
 
-**Type**: `integer | None`
+**Type**: `boolean`
 
-**Default**: `None`
+**Default**: `False`
 
-**TOML dotted key path**: `runner.heartbeat_frequency`
+**TOML dotted key path**: `runner.crash_on_cancellation_failure`
 
 **Supported environment variables**:
-`PREFECT_RUNNER_HEARTBEAT_FREQUENCY`
+`PREFECT_RUNNER_CRASH_ON_CANCELLATION_FAILURE`
 
 ### `server`
 
@@ -953,6 +1115,18 @@ Controls the application_name field for connections opened from the connection p
 
 **Supported environment variables**:
 `PREFECT_SERVER_DATABASE_SQLALCHEMY_CONNECT_ARGS_APPLICATION_NAME`
+
+### `search_path`
+PostgreSQL schema name to set in search_path when using a PostgreSQL database with the Prefect backend. Note: The public schema should be included in the search path (e.g. 'myschema, public') to ensure that pg_trgm and other extensions remain available.
+
+**Type**: `string | None`
+
+**Default**: `None`
+
+**TOML dotted key path**: `server.database.sqlalchemy.connect_args.search_path`
+
+**Supported environment variables**:
+`PREFECT_SERVER_DATABASE_SQLALCHEMY_CONNECT_ARGS_SEARCH_PATH`
 
 ### `statement_cache_size`
 Controls statement cache size for PostgreSQL connections. Setting this to 0 is required when using PgBouncer in transaction mode. Defaults to None.
@@ -1288,6 +1462,21 @@ The default limit applied to queries that can return multiple objects, such as `
 **Supported environment variables**:
 `PREFECT_SERVER_API_CORS_ALLOWED_HEADERS`, `PREFECT_SERVER_CORS_ALLOWED_HEADERS`
 
+### `max_parameter_size`
+The maximum size of parameters (in bytes, JSON-serialized) that can be stored on a flow run or deployment. Set to 0 to disable the limit.
+
+**Type**: `integer`
+
+**Default**: `524288`
+
+**Constraints**:
+- Minimum: 0
+
+**TOML dotted key path**: `server.api.max_parameter_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_API_MAX_PARAMETER_SIZE`
+
 ---
 ## ServerConcurrencySettings
 ### `lease_storage`
@@ -1317,6 +1506,21 @@ Initial duration for deployment concurrency lease in seconds.
 
 **Supported environment variables**:
 `PREFECT_SERVER_CONCURRENCY_INITIAL_DEPLOYMENT_LEASE_DURATION`
+
+### `maximum_concurrency_slot_wait_seconds`
+The maximum number of seconds to wait before retrying when a concurrency slot cannot be acquired.
+
+**Type**: `number`
+
+**Default**: `30`
+
+**Constraints**:
+- Minimum: 0
+
+**TOML dotted key path**: `server.concurrency.maximum_concurrency_slot_wait_seconds`
+
+**Supported environment variables**:
+`PREFECT_SERVER_CONCURRENCY_MAXIMUM_CONCURRENCY_SLOT_WAIT_SECONDS`
 
 ---
 ## ServerDatabaseSettings
@@ -1487,6 +1691,33 @@ The number of seconds to wait before retrying when a deployment flow run cannot 
 
 **Supported environment variables**:
 `PREFECT_SERVER_DEPLOYMENTS_CONCURRENCY_SLOT_WAIT_SECONDS`, `PREFECT_DEPLOYMENT_CONCURRENCY_SLOT_WAIT_SECONDS`
+
+---
+## ServerDocketSettings
+Settings for controlling Docket behavior
+### `name`
+The name of the Docket instance.
+
+**Type**: `string`
+
+**Default**: `prefect-server`
+
+**TOML dotted key path**: `server.docket.name`
+
+**Supported environment variables**:
+`PREFECT_SERVER_DOCKET_NAME`
+
+### `url`
+The URL of the Redis server to use for Docket.
+
+**Type**: `string`
+
+**Default**: `memory://`
+
+**TOML dotted key path**: `server.docket.url`
+
+**Supported environment variables**:
+`PREFECT_SERVER_DOCKET_URL`
 
 ---
 ## ServerEphemeralSettings
@@ -1773,6 +2004,69 @@ The cancellation cleanup service will look for non-terminal tasks and subflows t
 `PREFECT_SERVER_SERVICES_CANCELLATION_CLEANUP_LOOP_SECONDS`, `PREFECT_API_SERVICES_CANCELLATION_CLEANUP_LOOP_SECONDS`
 
 ---
+## ServerServicesDBVacuumSettings
+Settings for controlling the database vacuum service
+### `enabled`
+Comma-separated set of vacuum types to enable. Valid values: 'events', 'flow_runs'. Defaults to 'events'. For backward compatibility, 'true' maps to 'events,flow_runs' and 'false' maps to 'events'. Event vacuum also requires event_persister.enabled (the default).
+
+**Type**: `array | boolean | None`
+
+**Default**: `['events']`
+
+**TOML dotted key path**: `server.services.db_vacuum.enabled`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_DB_VACUUM_ENABLED`
+
+### `loop_seconds`
+The database vacuum service will run this often, in seconds. Defaults to `3600` (1 hour).
+
+**Type**: `number`
+
+**Default**: `3600`
+
+**TOML dotted key path**: `server.services.db_vacuum.loop_seconds`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_DB_VACUUM_LOOP_SECONDS`
+
+### `retention_period`
+How old a flow run must be (based on end_time) before it is eligible for deletion. Accepts seconds. Minimum 1 hour. Defaults to 90 days.
+
+**Type**: `string`
+
+**Default**: `P90D`
+
+**TOML dotted key path**: `server.services.db_vacuum.retention_period`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_DB_VACUUM_RETENTION_PERIOD`
+
+### `batch_size`
+The number of records to delete per database transaction. Defaults to `200`.
+
+**Type**: `integer`
+
+**Default**: `200`
+
+**TOML dotted key path**: `server.services.db_vacuum.batch_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_DB_VACUUM_BATCH_SIZE`
+
+### `event_retention_overrides`
+Per-event-type retention period overrides. Keys are event type strings (e.g. 'prefect.flow-run.heartbeat'), values are retention periods in seconds. Event types not listed fall back to server.events.retention_period. Each override is capped by the global events retention period.
+
+**Type**: `object`
+
+**Default**: `{'prefect.flow-run.heartbeat': 'P7D'}`
+
+**TOML dotted key path**: `server.services.db_vacuum.event_retention_overrides`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_DB_VACUUM_EVENT_RETENTION_OVERRIDES`
+
+---
 ## ServerServicesEventLoggerSettings
 Settings for controlling the event logger service
 ### `enabled`
@@ -1814,6 +2108,18 @@ The number of events the event persister will attempt to insert in one batch.
 **Supported environment variables**:
 `PREFECT_SERVER_SERVICES_EVENT_PERSISTER_BATCH_SIZE`, `PREFECT_API_SERVICES_EVENT_PERSISTER_BATCH_SIZE`
 
+### `read_batch_size`
+The number of events the event persister will attempt to read from the message broker in one batch.
+
+**Type**: `integer`
+
+**Default**: `1`
+
+**TOML dotted key path**: `server.services.event_persister.read_batch_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_EVENT_PERSISTER_READ_BATCH_SIZE`, `PREFECT_API_SERVICES_EVENT_PERSISTER_READ_BATCH_SIZE`
+
 ### `flush_interval`
 The maximum number of seconds between flushes of the event persister.
 
@@ -1826,17 +2132,29 @@ The maximum number of seconds between flushes of the event persister.
 **Supported environment variables**:
 `PREFECT_SERVER_SERVICES_EVENT_PERSISTER_FLUSH_INTERVAL`, `PREFECT_API_SERVICES_EVENT_PERSISTER_FLUSH_INTERVAL`
 
-### `batch_size_delete`
-The number of expired events and event resources the event persister will attempt to delete in one batch.
+### `queue_max_size`
+The maximum number of events that can be queued in memory for persistence. When the queue is full, new events will be dropped.
 
 **Type**: `integer`
 
-**Default**: `10000`
+**Default**: `50000`
 
-**TOML dotted key path**: `server.services.event_persister.batch_size_delete`
+**TOML dotted key path**: `server.services.event_persister.queue_max_size`
 
 **Supported environment variables**:
-`PREFECT_SERVER_SERVICES_EVENT_PERSISTER_BATCH_SIZE_DELETE`
+`PREFECT_SERVER_SERVICES_EVENT_PERSISTER_QUEUE_MAX_SIZE`
+
+### `max_flush_retries`
+The maximum number of consecutive flush failures before events are dropped instead of being re-queued.
+
+**Type**: `integer`
+
+**Default**: `5`
+
+**TOML dotted key path**: `server.services.event_persister.max_flush_retries`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_EVENT_PERSISTER_MAX_FLUSH_RETRIES`
 
 ---
 ## ServerServicesForemanSettings
@@ -2184,6 +2502,12 @@ Settings for controlling server services
 
 **TOML dotted key path**: `server.services.cancellation_cleanup`
 
+### `db_vacuum`
+
+**Type**: [ServerServicesDBVacuumSettings](#serverservicesdbvacuumsettings)
+
+**TOML dotted key path**: `server.services.db_vacuum`
+
 ### `event_persister`
 
 **Type**: [ServerServicesEventPersisterSettings](#serverserviceseventpersistersettings)
@@ -2253,6 +2577,42 @@ Whether or not to start the task run recorder service in the server application.
 **Supported environment variables**:
 `PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_ENABLED`, `PREFECT_API_SERVICES_TASK_RUN_RECORDER_ENABLED`
 
+### `read_batch_size`
+The number of task runs the task run recorder will attempt to read from the message broker in one batch.
+
+**Type**: `integer`
+
+**Default**: `1`
+
+**TOML dotted key path**: `server.services.task_run_recorder.read_batch_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_READ_BATCH_SIZE`
+
+### `batch_size`
+The number of task runs the task run recorder will attempt to insert in one batch.
+
+**Type**: `integer`
+
+**Default**: `1`
+
+**TOML dotted key path**: `server.services.task_run_recorder.batch_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_BATCH_SIZE`
+
+### `flush_interval`
+The maximum number of seconds between flushes of the task run recorder.
+
+**Type**: `number`
+
+**Default**: `5`
+
+**TOML dotted key path**: `server.services.task_run_recorder.flush_interval`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_FLUSH_INTERVAL`
+
 ---
 ## ServerServicesTriggersSettings
 Settings for controlling the triggers service
@@ -2267,6 +2627,18 @@ Whether or not to start the triggers service in the server application.
 
 **Supported environment variables**:
 `PREFECT_SERVER_SERVICES_TRIGGERS_ENABLED`, `PREFECT_API_SERVICES_TRIGGERS_ENABLED`
+
+### `read_batch_size`
+The number of events the triggers service will attempt to read from the message broker in one batch.
+
+**Type**: `integer`
+
+**Default**: `1`
+
+**TOML dotted key path**: `server.services.triggers.read_batch_size`
+
+**Supported environment variables**:
+`PREFECT_SERVER_SERVICES_TRIGGERS_READ_BATCH_SIZE`
 
 ### `pg_notify_reconnect_interval_seconds`
 
@@ -2429,6 +2801,13 @@ Settings for controlling server deployments behavior
 
 **TOML dotted key path**: `server.deployments`
 
+### `docket`
+Settings for controlling server Docket behavior
+
+**Type**: [ServerDocketSettings](#serverdocketsettings)
+
+**TOML dotted key path**: `server.docket`
+
 ### `ephemeral`
 
 **Type**: [ServerEphemeralSettings](#serverephemeralsettings)
@@ -2524,7 +2903,7 @@ The number of seconds to wait before retrying when a task run cannot secure a co
 
 **Type**: `number`
 
-**Default**: `30`
+**Default**: `10`
 
 **Constraints**:
 - Minimum: 0
@@ -2566,6 +2945,18 @@ Whether or not to serve the Prefect UI.
 **Supported environment variables**:
 `PREFECT_SERVER_UI_ENABLED`, `PREFECT_UI_ENABLED`
 
+### `v2_enabled`
+Whether to serve the experimental V2 UI instead of the default V1 UI.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `server.ui.v2_enabled`
+
+**Supported environment variables**:
+`PREFECT_SERVER_UI_V2_ENABLED`
+
 ### `api_url`
 The connection url for communication from the UI to the API. Defaults to `PREFECT_API_URL` if set. Otherwise, the default URL is generated from `PREFECT_SERVER_API_HOST` and `PREFECT_SERVER_API_PORT`.
 
@@ -2601,6 +2992,18 @@ The directory to serve static files from. This should be used when running into 
 
 **Supported environment variables**:
 `PREFECT_SERVER_UI_STATIC_DIRECTORY`, `PREFECT_UI_STATIC_DIRECTORY`
+
+### `show_promotional_content`
+Whether or not to display promotional content in the UI, including upgrade prompts and marketing banners.
+
+**Type**: `boolean`
+
+**Default**: `True`
+
+**TOML dotted key path**: `server.ui.show_promotional_content`
+
+**Supported environment variables**:
+`PREFECT_SERVER_UI_SHOW_PROMOTIONAL_CONTENT`
 
 ---
 ## TasksRunnerSettings
@@ -2746,6 +3149,36 @@ Settings for controlling client-side task scheduling behavior
 **TOML dotted key path**: `tasks.scheduling`
 
 ---
+## TelemetrySettings
+Settings for configuring Prefect telemetry
+### `enable_resource_metrics`
+Whether to enable OS-level resource metric collection in flow run subprocesses.
+
+**Type**: `boolean`
+
+**Default**: `True`
+
+**TOML dotted key path**: `telemetry.enable_resource_metrics`
+
+**Supported environment variables**:
+`PREFECT_TELEMETRY_ENABLE_RESOURCE_METRICS`
+
+### `resource_metrics_interval_seconds`
+Interval in seconds between resource metric collections.
+
+**Type**: `integer`
+
+**Default**: `10`
+
+**Constraints**:
+- Minimum: 1
+
+**TOML dotted key path**: `telemetry.resource_metrics_interval_seconds`
+
+**Supported environment variables**:
+`PREFECT_TELEMETRY_RESOURCE_METRICS_INTERVAL_SECONDS`
+
+---
 ## TestingSettings
 ### `test_mode`
 If `True`, places the API in test mode. This may modify behavior to facilitate testing.
@@ -2797,6 +3230,18 @@ This setting only exists to facilitate unit testing. If in test mode, this setti
 
 ---
 ## WorkerSettings
+### `debug_mode`
+If True, enables debug mode for the worker only. Unlike PREFECT_DEBUG_MODE, this setting does not propagate to flow runs executed by the worker.
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `worker.debug_mode`
+
+**Supported environment variables**:
+`PREFECT_WORKER_DEBUG_MODE`
+
 ### `heartbeat_seconds`
 Number of seconds a worker should wait between sending a heartbeat.
 
@@ -2832,6 +3277,30 @@ The number of seconds into the future a worker should query for scheduled work.
 
 **Supported environment variables**:
 `PREFECT_WORKER_PREFETCH_SECONDS`
+
+### `enable_cancellation`
+Enable worker-side flow run cancellation for pending flow runs. When enabled, the worker will terminate infrastructure for flow runs that are cancelled while still in PENDING state (before the runner starts).
+
+**Type**: `boolean`
+
+**Default**: `False`
+
+**TOML dotted key path**: `worker.enable_cancellation`
+
+**Supported environment variables**:
+`PREFECT_WORKER_ENABLE_CANCELLATION`
+
+### `cancellation_poll_seconds`
+Number of seconds between polls for cancelling flow runs. Used as a fallback when the WebSocket connection for real-time cancellation events is unavailable.
+
+**Type**: `number`
+
+**Default**: `120`
+
+**TOML dotted key path**: `worker.cancellation_poll_seconds`
+
+**Supported environment variables**:
+`PREFECT_WORKER_CANCELLATION_POLL_SECONDS`
 
 ### `webserver`
 Settings for a worker's webserver

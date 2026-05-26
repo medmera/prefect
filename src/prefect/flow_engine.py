@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import multiprocessing
 import multiprocessing.context
 import os
+import threading
 import time
 from contextlib import (
     AsyncExitStack,
@@ -36,16 +38,17 @@ from anyio import CancelScope
 from opentelemetry import propagate, trace
 from typing_extensions import ParamSpec
 
-from prefect import Task
+from prefect import Task, __version__
+from prefect._internal.compatibility.deprecated import deprecated_callable
 from prefect.client.orchestration import PrefectClient, SyncPrefectClient, get_client
 from prefect.client.schemas import FlowRun, TaskRun
 from prefect.client.schemas.filters import FlowRunFilter
 from prefect.client.schemas.sorting import FlowRunSort
-from prefect.concurrency.asyncio import (
+from prefect.concurrency._leases import (
     amaintain_concurrency_lease,
+    maintain_concurrency_lease,
 )
 from prefect.concurrency.context import ConcurrencyContext
-from prefect.concurrency.sync import maintain_concurrency_lease
 from prefect.concurrency.v1.context import ConcurrencyContext as ConcurrencyContextV1
 from prefect.context import (
     AsyncClientContext,
@@ -53,11 +56,15 @@ from prefect.context import (
     SettingsContext,
     SyncClientContext,
     TagsContext,
+    _deployment_id,
+    _deployment_parameters,
     get_settings_context,
     hydrated_context,
     serialize_context,
 )
 from prefect.engine import handle_engine_signals
+from prefect.events.related import RelatedResource, tags_as_related_resources
+from prefect.events.utilities import emit_event
 from prefect.exceptions import (
     Abort,
     MissingFlowError,
@@ -126,6 +133,8 @@ from prefect.utilities.urls import url_for
 P = ParamSpec("P")
 R = TypeVar("R")
 
+MINIMUM_HEARTBEAT_INTERVAL = 30
+
 
 class FlowRunTimeoutError(TimeoutError):
     """Raised when a flow run exceeds its defined timeout."""
@@ -157,6 +166,94 @@ def load_flow_and_flow_run(flow_run_id: UUID) -> tuple[FlowRun, Flow[..., Any]]:
     flow_run = load_flow_run(flow_run_id)
     flow = load_flow(flow_run)
     return flow_run, flow
+
+
+@contextmanager
+def _send_heartbeats(
+    engine: "BaseFlowRunEngine[Any, Any]",
+    join_on_exit: bool = True,
+) -> Generator[None, None, None]:
+    """Context manager that maintains heartbeats for a flow run using a daemon thread.
+
+    Uses a background OS thread instead of an asyncio task so that heartbeats
+    fire even when the event loop is blocked by CPU-bound work.
+
+    Args:
+        engine: The flow run engine instance to emit heartbeats for.
+        join_on_exit: Whether to join the heartbeat thread on exit. Set to
+            `False` in async engines to avoid blocking the event loop.
+
+    Yields:
+        None
+    """
+    heartbeat_seconds = engine.heartbeat_seconds
+    if heartbeat_seconds is None:
+        yield
+        return
+    heartbeat_seconds = max(heartbeat_seconds, MINIMUM_HEARTBEAT_INTERVAL)
+
+    # Pre-compute the event template once to minimize per-heartbeat GIL hold time
+    resource, related = engine._build_heartbeat_event_template()
+
+    stop_event = threading.Event()
+
+    def heartbeat_loop() -> None:
+        while not stop_event.is_set():
+            # Check state before emitting - don't emit if final
+            if (
+                engine.flow_run
+                and engine.flow_run.state
+                and engine.flow_run.state.is_final()
+            ):
+                engine.logger.debug("Flow run in terminal state, stopping heartbeat")
+                return
+
+            try:
+                engine._emit_flow_run_heartbeat(resource, related)
+            except Exception:
+                engine.logger.debug("Failed to emit heartbeat", exc_info=True)
+
+            # Sleep in increments to allow quick shutdown
+            for _ in range(heartbeat_seconds):
+                if stop_event.is_set():
+                    return
+                time.sleep(1)
+
+    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    thread.start()
+    engine.logger.debug("Started flow run heartbeat context")
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        if join_on_exit:
+            thread.join(timeout=2)
+        engine.logger.debug("Stopped flow run heartbeat context")
+
+
+@deprecated_callable(
+    start_date=datetime.datetime(2026, 3, 1),
+    help="Use `_send_heartbeats` instead.",
+)
+@contextmanager
+def send_heartbeats_sync(
+    engine: "FlowRunEngine[Any, Any]",
+) -> Generator[None, None, None]:
+    with _send_heartbeats(engine, join_on_exit=True):
+        yield
+
+
+@deprecated_callable(
+    start_date=datetime.datetime(2026, 3, 1),
+    help="Use `_send_heartbeats` instead.",
+)
+@asynccontextmanager
+async def send_heartbeats_async(
+    engine: "AsyncFlowRunEngine[Any, Any]",
+) -> AsyncGenerator[None, None]:
+    with _send_heartbeats(engine, join_on_exit=False):
+        yield
 
 
 @dataclass
@@ -198,9 +295,88 @@ class BaseFlowRunEngine(Generic[P, R]):
             return False  # TODO: handle this differently?
         return getattr(self, "flow_run").state.is_pending()
 
+    @property
+    def heartbeat_seconds(self) -> Optional[int]:
+        """Get the heartbeat interval from settings."""
+        value = get_current_settings().flows.heartbeat_frequency
+        if value is not None:
+            return max(value, MINIMUM_HEARTBEAT_INTERVAL)
+        return value
+
     def cancel_all_tasks(self) -> None:
         if hasattr(self.flow.task_runner, "cancel_all"):
             self.flow.task_runner.cancel_all()  # type: ignore
+
+    def _build_heartbeat_event_template(
+        self,
+    ) -> tuple[dict[str, str], list[RelatedResource]]:
+        """Pre-compute the heartbeat event resource and related list.
+
+        Called once before starting the heartbeat thread to avoid repeated
+        Pydantic validation (RelatedResource.model_validate) on every tick.
+        """
+        resource: dict[str, str] = {}
+        related: list[RelatedResource] = []
+
+        if not self.flow_run:
+            return resource, related
+
+        resource = {
+            "prefect.resource.id": f"prefect.flow-run.{self.flow_run.id}",
+            "prefect.resource.name": self.flow_run.name or "",
+            "prefect.version": __version__,
+        }
+
+        tags: list[str] = list(self.flow_run.tags or [])
+
+        if self.flow_run.flow_id:
+            related.append(
+                RelatedResource.model_validate(
+                    {
+                        "prefect.resource.id": f"prefect.flow.{self.flow_run.flow_id}",
+                        "prefect.resource.role": "flow",
+                        "prefect.resource.name": self.flow.name if self.flow else "",
+                    }
+                )
+            )
+
+        if self.flow_run.deployment_id:
+            related.append(
+                RelatedResource.model_validate(
+                    {
+                        "prefect.resource.id": f"prefect.deployment.{self.flow_run.deployment_id}",
+                        "prefect.resource.role": "deployment",
+                    }
+                )
+            )
+
+        related += tags_as_related_resources(set(tags))
+
+        return resource, related
+
+    def _emit_flow_run_heartbeat(
+        self,
+        resource: dict[str, str] | None = None,
+        related: list[RelatedResource] | None = None,
+    ) -> None:
+        """Emit a heartbeat event for the current flow run.
+
+        Args:
+            resource: Pre-computed resource dict from _build_heartbeat_event_template.
+            related: Pre-computed related list from _build_heartbeat_event_template.
+                If not provided, builds the template on the fly (backward compat).
+        """
+        if not self.flow_run:
+            return
+
+        if resource is None or related is None:
+            resource, related = self._build_heartbeat_event_template()
+
+        emit_event(
+            event="prefect.flow-run.heartbeat",
+            resource=resource,
+            related=related,
+        )
 
     def _update_otel_labels(
         self, span: trace.Span, client: Union[SyncPrefectClient, PrefectClient]
@@ -341,6 +517,7 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
 
         self._telemetry.update_state(state)
         self.call_hooks(state)
+
         return state
 
     def result(self, raise_on_failure: bool = True) -> "Union[R, State, None]":
@@ -386,6 +563,14 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
 
         link_state_to_flow_run_result(terminal_state, resolved_result)
         self._telemetry.end_span_on_success()
+
+        # Track first flow run milestone for analytics
+        try:
+            from prefect._internal.analytics import try_mark_milestone
+
+            try_mark_milestone("first_flow_run")
+        except Exception:
+            pass
 
         return result
 
@@ -436,6 +621,13 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
             name="TimedOut",
         )
         self.set_state(state)
+        if self.state.is_scheduled():
+            self.logger.info(
+                f"Received non-final state {self.state.name!r} when proposing final"
+                f" state {state.name!r} and will attempt to run again..."
+            )
+            self.set_state(Running())
+            return
         self._raised = exc
         self._telemetry.record_exception(exc)
         self._telemetry.end_span_on_failure(message)
@@ -626,6 +818,13 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
                     else should_persist_result(),
                 )
             )
+            # Set deployment context vars only if this is the top-level deployment run
+            # (nested flows will inherit via ContextVar propagation)
+            if self.flow_run.deployment_id and not _deployment_id.get():
+                id_token = _deployment_id.set(self.flow_run.deployment_id)
+                params_token = _deployment_parameters.set(self.flow_run.parameters)
+                stack.callback(_deployment_id.reset, id_token)
+                stack.callback(_deployment_parameters.reset, params_token)
             stack.enter_context(ConcurrencyContextV1())
             stack.enter_context(ConcurrencyContext())
             if lease_id := self.state.state_details.deployment_concurrency_lease_id:
@@ -731,9 +930,16 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
                     # Do not capture generator exits as crashes
                     raise
                 except BaseException as exc:
-                    # BaseExceptions are caught and handled as crashes
-                    self.handle_crash(exc)
-                    raise
+                    # We don't want to crash a flow run if the user code finished executing
+                    if self.flow_run.state and not self.flow_run.state.is_final():
+                        # BaseExceptions are caught and handled as crashes
+                        self.handle_crash(exc)
+                        raise
+                    else:
+                        self.logger.debug(
+                            "BaseException was raised after user code finished executing",
+                            exc_info=exc,
+                        )
                 finally:
                     # If debugging, use the more complete `repr` than the usual `str` description
                     display_state = (
@@ -775,10 +981,11 @@ class FlowRunEngine(BaseFlowRunEngine[P, R]):
                     seconds=self.flow.timeout_seconds,
                     timeout_exc_type=FlowRunTimeoutError,
                 ):
-                    self.logger.debug(
-                        f"Executing flow {self.flow.name!r} for flow run {self.flow_run.name!r}..."
-                    )
-                    yield self
+                    with _send_heartbeats(self):
+                        self.logger.debug(
+                            f"Executing flow {self.flow.name!r} for flow run {self.flow_run.name!r}..."
+                        )
+                        yield self
             except TimeoutError as exc:
                 self.handle_timeout(exc)
             except Exception as exc:
@@ -914,6 +1121,7 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
 
         self._telemetry.update_state(state)
         await self.call_hooks(state)
+
         return state
 
     async def result(self, raise_on_failure: bool = True) -> "Union[R, State, None]":
@@ -955,6 +1163,14 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
         self._return_value = resolved_result
 
         self._telemetry.end_span_on_success()
+
+        # Track first flow run milestone for analytics
+        try:
+            from prefect._internal.analytics import try_mark_milestone
+
+            try_mark_milestone("first_flow_run")
+        except Exception:
+            pass
 
         return result
 
@@ -1003,6 +1219,13 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
             name="TimedOut",
         )
         await self.set_state(state)
+        if self.state.is_scheduled():
+            self.logger.info(
+                f"Received non-final state {self.state.name!r} when proposing final"
+                f" state {state.name!r} and will attempt to run again..."
+            )
+            await self.set_state(Running())
+            return
         self._raised = exc
 
         self._telemetry.record_exception(exc)
@@ -1196,6 +1419,13 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
                     else should_persist_result(),
                 )
             )
+            # Set deployment context vars only if this is the top-level deployment run
+            # (nested flows will inherit via ContextVar propagation)
+            if self.flow_run.deployment_id and not _deployment_id.get():
+                id_token = _deployment_id.set(self.flow_run.deployment_id)
+                params_token = _deployment_parameters.set(self.flow_run.parameters)
+                stack.callback(_deployment_id.reset, id_token)
+                stack.callback(_deployment_parameters.reset, params_token)
             stack.enter_context(ConcurrencyContextV1())
             stack.enter_context(ConcurrencyContext())
             if lease_id := self.state.state_details.deployment_concurrency_lease_id:
@@ -1305,9 +1535,16 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
                     # Do not capture generator exits as crashes
                     raise
                 except BaseException as exc:
-                    # BaseExceptions are caught and handled as crashes
-                    await self.handle_crash(exc)
-                    raise
+                    # We don't want to crash a flow run if the user code finished executing
+                    if self.flow_run.state and not self.flow_run.state.is_final():
+                        # BaseExceptions are caught and handled as crashes
+                        await self.handle_crash(exc)
+                        raise
+                    else:
+                        self.logger.debug(
+                            "BaseException was raised after user code finished executing",
+                            exc_info=exc,
+                        )
                 finally:
                     # If debugging, use the more complete `repr` than the usual `str` description
                     display_state = (
@@ -1351,10 +1588,11 @@ class AsyncFlowRunEngine(BaseFlowRunEngine[P, R]):
                     seconds=self.flow.timeout_seconds,
                     timeout_exc_type=FlowRunTimeoutError,
                 ):
-                    self.logger.debug(
-                        f"Executing flow {self.flow.name!r} for flow run {self.flow_run.name!r}..."
-                    )
-                    yield self
+                    with _send_heartbeats(self, join_on_exit=False):
+                        self.logger.debug(
+                            f"Executing flow {self.flow.name!r} for flow run {self.flow_run.name!r}..."
+                        )
+                        yield self
             except TimeoutError as exc:
                 await self.handle_timeout(exc)
             except Exception as exc:
@@ -1552,10 +1790,21 @@ def run_flow(
             ret_val = run_flow_sync(**kwargs)
     except (Abort, Pause):
         raise
-    except:
+    except Exception:
         if error_logger:
             error_logger.error(
                 "Engine execution exited with unexpected exception", exc_info=True
+            )
+        raise
+    except BaseException:
+        # This top-level wrapper can fail before setup_run_context() installs
+        # the flow-run-scoped logger onto the engine.  This branch
+        # intentionally preserves per-run error logging for interrupts such
+        # as KeyboardInterrupt and SystemExit that would otherwise bypass
+        # the Exception handler above.
+        if error_logger:
+            error_logger.error(
+                "Engine execution interrupted by base exception", exc_info=True
             )
         raise
     return ret_val
@@ -1584,6 +1833,7 @@ def run_flow_in_subprocess(
     parameters: dict[str, Any] | None = None,
     wait_for: Iterable[PrefectFuture[Any]] | None = None,
     context: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
 ) -> multiprocessing.context.SpawnProcess:
     """
     Run a flow in a subprocess.
@@ -1600,6 +1850,7 @@ def run_flow_in_subprocess(
             the current context will be used. A serialized context should be provided if
             this function is called in a separate memory space from the parent run (e.g.
             in a subprocess or on another machine).
+        env: Additional environment variables to set in the subprocess.
 
     Returns:
         A multiprocessing.context.SpawnProcess representing the process that is running the flow.
@@ -1642,7 +1893,8 @@ def run_flow_in_subprocess(
             | {
                 # TODO: make this a thing we can pass into the engine
                 "PREFECT__ENABLE_CANCELLATION_AND_CRASHED_HOOKS": "false",
-            },
+            }
+            | (env or {}),
             flow=flow,
             flow_run=flow_run,
             parameters=parameters,

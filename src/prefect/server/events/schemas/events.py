@@ -1,4 +1,5 @@
 import copy
+import fnmatch
 from collections import defaultdict
 from typing import (
     TYPE_CHECKING,
@@ -34,6 +35,7 @@ from prefect.settings import (
     PREFECT_EVENTS_MAXIMUM_LABELS_PER_RESOURCE,
     PREFECT_EVENTS_MAXIMUM_RELATED_RESOURCES,
 )
+from prefect.utilities.urls import url_for
 
 if TYPE_CHECKING:
     import logging
@@ -145,6 +147,10 @@ class Event(PrefectBaseModel):
     )
 
     @property
+    def size_bytes(self) -> int:
+        return len(self.model_dump_json().encode())
+
+    @property
     def involved_resources(self) -> Sequence[Resource]:
         return [self.resource] + list(self.related)
 
@@ -208,6 +214,12 @@ class ReceivedEvent(Event):
         description="When the event was received by Prefect Cloud",
     )
 
+    @property
+    def url(self) -> Optional[str]:
+        """Returns the UI URL for this event, allowing users to link to events
+        in automation templates without parsing date strings."""
+        return url_for(self, url_type="ui")
+
     def as_database_row(self) -> dict[str, Any]:
         row = self.model_dump()
         row["resource_id"] = self.resource.id
@@ -237,23 +249,21 @@ class ReceivedEvent(Event):
 
 
 def matches(expected: str, value: Optional[str]) -> bool:
-    """Returns true if the given value matches the expected string, which may
-    include a a negation prefix ("!this-value") or a wildcard suffix
-    ("any-value-starting-with*")"""
+    """Returns true if the given value matches the expected string.
+
+    Args:
+        expected: A glob pattern to match against;
+            if it starts with an `!`, the pattern is negated.
+        value: The value of the label.
+    """
     if value is None:
         return False
 
-    positive = True
-    if expected.startswith("!"):
-        expected = expected[1:]
-        positive = False
+    is_positive = not expected.startswith("!")
+    expected = expected.removeprefix("!")
 
-    if expected.endswith("*"):
-        match = value.startswith(expected[:-1])
-    else:
-        match = value == expected
-
-    return match if positive else not match
+    match = fnmatch.fnmatchcase(value, expected)
+    return match if is_positive else not match
 
 
 class ResourceSpecification(RootModel[Dict[str, Union[str, List[str]]]]):

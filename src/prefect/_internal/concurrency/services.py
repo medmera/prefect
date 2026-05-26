@@ -5,8 +5,10 @@ import asyncio
 import concurrent.futures
 import contextlib
 import logging
+import os
 import queue
 import threading
+import weakref
 from collections.abc import AsyncGenerator, Awaitable, Coroutine, Generator, Hashable
 from typing import TYPE_CHECKING, Any, Generic, NoReturn, Optional, Union, cast
 
@@ -22,13 +24,45 @@ T = TypeVar("T")
 Ts = TypeVarTuple("Ts")
 R = TypeVar("R", infer_variance=True)
 
+# Track all active services for fork handling
+_active_services: weakref.WeakSet[_QueueServiceBase[Any]] = weakref.WeakSet()
+
+
+def _reset_services_after_fork():
+    """
+    Reset service state after fork() to prevent multiprocessing deadlocks on Linux.
+
+    Called by os.register_at_fork() in the child process after fork().
+    """
+    for service in list(_active_services):
+        service.reset_for_fork()
+
+    # Reset the class-level instance tracking
+    _QueueServiceBase.reset_instances_for_fork()
+
+
+# Register fork handler if supported (POSIX systems)
+if hasattr(os, "register_at_fork"):
+    try:
+        os.register_at_fork(after_in_child=_reset_services_after_fork)
+    except RuntimeError as e:
+        # Might fail in certain contexts (e.g., if already in a child process)
+        logger.debug(
+            "failed to register fork handler: %s (this may occur in child processes)",
+            e,
+        )
+        pass
+
 
 class _QueueServiceBase(abc.ABC, Generic[T]):
     _instances: dict[int, Self] = {}
     _instance_lock = threading.Lock()
+    _max_queue_size: int = 0  # 0 means unbounded
 
     def __init__(self, *args: Hashable) -> None:
-        self._queue: queue.Queue[Optional[T]] = queue.Queue()
+        self._queue: queue.Queue[Optional[T]] = queue.Queue(
+            maxsize=self._max_queue_size
+        )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._done_event: Optional[asyncio.Event] = None
         self._task: Optional[asyncio.Task[None]] = None
@@ -43,6 +77,25 @@ class _QueueServiceBase(abc.ABC, Generic[T]):
             name=f"{type(self).__name__}Thread",
         )
         self._logger = logging.getLogger(f"{type(self).__name__}")
+
+        # Track this instance for fork handling
+        _active_services.add(self)
+
+    def reset_for_fork(self) -> None:
+        """Reset instance state after fork() to prevent deadlocks in child process."""
+        self._stopped = True
+        self._started = False
+        self._loop = None
+        self._done_event = None
+        self._task = None
+        self._queue = queue.Queue(maxsize=self._max_queue_size)
+        self._lock = threading.Lock()
+
+    @classmethod
+    def reset_instances_for_fork(cls) -> None:
+        """Reset class-level state after fork() to prevent deadlocks in child process."""
+        cls._instances.clear()
+        cls._instance_lock = threading.Lock()
 
     def start(self) -> None:
         logger.debug("Starting service %r", self)
@@ -295,7 +348,16 @@ class QueueService(_QueueServiceBase[T]):
                 raise RuntimeError("Cannot put items in a stopped service instance.")
 
             logger.debug("Service %r enqueuing item %r", self, item)
-            self._queue.put_nowait(self._prepare_item(item))
+            prepared = self._prepare_item(item)
+            try:
+                self._queue.put_nowait(prepared)
+            except queue.Full:
+                self._logger.warning(
+                    "Service %r queue is full (%d items), dropping item",
+                    type(self).__name__,
+                    self._queue.qsize(),
+                )
+                self._on_item_dropped(prepared)
 
     def _prepare_item(self, item: T) -> T:
         """
@@ -305,6 +367,16 @@ class QueueService(_QueueServiceBase[T]):
         The default implementation returns the item unchanged.
         """
         return item
+
+    def _on_item_dropped(self, item: T) -> None:
+        """
+        Called when a prepared item is dropped because the queue is full.
+
+        Subclasses can override this to clean up any resources allocated
+        during _prepare_item.
+
+        The default implementation is a no-op.
+        """
 
     @abc.abstractmethod
     async def _handle(self, item: T) -> None:

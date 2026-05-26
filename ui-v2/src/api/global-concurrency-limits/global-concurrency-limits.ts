@@ -36,7 +36,7 @@ export const buildListGlobalConcurrencyLimitsQuery = (
 	queryOptions({
 		queryKey: queryKeyFactory.list(filter),
 		queryFn: async () => {
-			const res = await getQueryService().POST(
+			const res = await (await getQueryService()).POST(
 				"/v2/concurrency_limits/filter",
 				{ body: filter },
 			);
@@ -80,8 +80,8 @@ export const useListGlobalConcurrencyLimits = (
 export const useDeleteGlobalConcurrencyLimit = () => {
 	const queryClient = useQueryClient();
 	const { mutate: deleteGlobalConcurrencyLimit, ...rest } = useMutation({
-		mutationFn: (id_or_name: string) =>
-			getQueryService().DELETE("/v2/concurrency_limits/{id_or_name}", {
+		mutationFn: async (id_or_name: string) =>
+			(await getQueryService()).DELETE("/v2/concurrency_limits/{id_or_name}", {
 				params: { path: { id_or_name } },
 			}),
 		onSuccess: () => {
@@ -127,8 +127,10 @@ export const useDeleteGlobalConcurrencyLimit = () => {
 export const useCreateGlobalConcurrencyLimit = () => {
 	const queryClient = useQueryClient();
 	const { mutate: createGlobalConcurrencyLimit, ...rest } = useMutation({
-		mutationFn: (body: components["schemas"]["ConcurrencyLimitV2Create"]) =>
-			getQueryService().POST("/v2/concurrency_limits/", {
+		mutationFn: async (
+			body: components["schemas"]["ConcurrencyLimitV2Create"],
+		) =>
+			(await getQueryService()).POST("/v2/concurrency_limits/", {
 				body,
 			}),
 		onSuccess: () => {
@@ -178,8 +180,11 @@ type GlobalConcurrencyLimitUpdateWithId =
 export const useUpdateGlobalConcurrencyLimit = () => {
 	const queryClient = useQueryClient();
 	const { mutate: updateGlobalConcurrencyLimit, ...rest } = useMutation({
-		mutationFn: ({ id_or_name, ...body }: GlobalConcurrencyLimitUpdateWithId) =>
-			getQueryService().PATCH("/v2/concurrency_limits/{id_or_name}", {
+		mutationFn: async ({
+			id_or_name,
+			...body
+		}: GlobalConcurrencyLimitUpdateWithId) =>
+			(await getQueryService()).PATCH("/v2/concurrency_limits/{id_or_name}", {
 				body,
 				params: { path: { id_or_name } },
 			}),
@@ -192,6 +197,46 @@ export const useUpdateGlobalConcurrencyLimit = () => {
 	});
 	return {
 		updateGlobalConcurrencyLimit,
+		...rest,
+	};
+};
+
+/**
+ * Hook for resetting a global concurrency limit's active slots to 0
+ *
+ * @returns Mutation object for resetting a global concurrency limit with loading/error states and trigger function
+ *
+ * @example
+ * ```ts
+ * const { resetGlobalConcurrencyLimit } = useResetGlobalConcurrencyLimit();
+ *
+ * // Reset a global concurrency limit's active slots by id or name
+ * resetGlobalConcurrencyLimit('id-or-name', {
+ *   onSuccess: () => {
+ *     console.log('Global concurrency limit reset successfully');
+ *   },
+ *   onError: (error) => {
+ *     console.error('Failed to reset global concurrency limit:', error);
+ *   }
+ * });
+ * ```
+ */
+export const useResetGlobalConcurrencyLimit = () => {
+	const queryClient = useQueryClient();
+	const { mutate: resetGlobalConcurrencyLimit, ...rest } = useMutation({
+		mutationFn: async (id_or_name: string) =>
+			(await getQueryService()).PATCH("/v2/concurrency_limits/{id_or_name}", {
+				body: { active_slots: 0 },
+				params: { path: { id_or_name } },
+			}),
+		onSuccess: () => {
+			return queryClient.invalidateQueries({
+				queryKey: queryKeyFactory.lists(),
+			});
+		},
+	});
+	return {
+		resetGlobalConcurrencyLimit,
 		...rest,
 	};
 };

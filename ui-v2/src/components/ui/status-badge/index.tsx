@@ -19,13 +19,13 @@ const STATUS_ICONS = {
 } as const satisfies Record<Status, React.ReactNode>;
 
 const statusBadgeVariants = cva(
-	"gap-2 px-2 text-black/80 font-mono font-light border border-black/10 shadow-none text-nowrap",
+	"gap-2 px-2 text-foreground/80 font-mono font-light border border-foreground/10 shadow-none text-nowrap",
 	{
 		variants: {
 			status: {
-				READY: "bg-green-100 hover:bg-green-100",
-				NOT_READY: "bg-red-100 hover:bg-red-100",
-				PAUSED: "bg-gray-300 hover:bg-gray-300",
+				READY: "bg-state-completed-100 hover:bg-state-completed-200",
+				NOT_READY: "bg-state-failed-100 hover:bg-state-failed-200",
+				PAUSED: "bg-state-pending-100 hover:bg-state-pending-200",
 			} satisfies Record<Status, string>,
 		},
 	},

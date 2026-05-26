@@ -5,6 +5,7 @@ Intended for internal use by the Prefect REST API.
 
 import datetime
 from typing import (
+    Any,
     Awaitable,
     Callable,
     Dict,
@@ -24,7 +25,10 @@ from prefect._internal.uuid7 import uuid7
 from prefect.server.database import PrefectDBInterface, db_injector, orm_models
 from prefect.server.events.clients import PrefectServerEventsClient
 from prefect.server.exceptions import ObjectNotFoundError
-from prefect.server.models.events import work_pool_status_event
+from prefect.server.models.events import (
+    work_pool_status_event,
+    work_pool_updated_event,  # Add this
+)
 from prefect.server.schemas.statuses import WorkQueueStatus
 from prefect.server.utilities.database import UUID as PrefectUUID
 from prefect.types._datetime import DateTime, now
@@ -60,7 +64,7 @@ async def create_work_pool(
 
     """
 
-    pool = db.WorkPool(**work_pool.model_dump())
+    pool = db.WorkPool(**work_pool.model_dump(exclude={"active_slots"}))
 
     if pool.type != "prefect-agent":
         if pool.is_paused:
@@ -180,6 +184,120 @@ async def count_work_pools(
     return result.scalar_one()
 
 
+# States counted against both pool-level and queue-level concurrency by the
+# worker scheduling SQL templates (get-runs-from-worker-queues.sql.jinja).
+SLOT_OCCUPYING_STATES = {
+    schemas.states.StateType.PENDING,
+    schemas.states.StateType.RUNNING,
+}
+
+
+@db_injector
+async def count_work_pool_active_slots(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_id: UUID,
+) -> int:
+    """
+    Count flow runs in slot-occupying states (Pending, Running) for a given
+    work pool. Does not filter on queue pause status — paused queues may
+    still have running/pending runs consuming resources. This matches the
+    behavior of count_work_pool_slot_holders / get_work_pool_slot_holders.
+    """
+    query = (
+        select(sa.func.count())
+        .select_from(db.FlowRun)
+        .join(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .where(
+            db.WorkQueue.work_pool_id == work_pool_id,
+            db.FlowRun.state_type.in_(SLOT_OCCUPYING_STATES),
+        )
+    )
+    result = await session.execute(query)
+    return result.scalar_one()
+
+
+@db_injector
+async def count_work_pool_active_slots_bulk(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_ids: Sequence[UUID],
+) -> dict[UUID, int]:
+    """
+    Count active slots for multiple work pools in a single query.
+    Returns a mapping of work_pool_id -> active slot count.
+    Does not filter on queue pause status (see count_work_pool_active_slots).
+    """
+    if not work_pool_ids:
+        return {}
+
+    query = (
+        select(
+            db.WorkQueue.work_pool_id,
+            sa.func.count(db.FlowRun.id),
+        )
+        .select_from(db.FlowRun)
+        .join(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .where(
+            db.WorkQueue.work_pool_id.in_(work_pool_ids),
+            db.FlowRun.state_type.in_(SLOT_OCCUPYING_STATES),
+        )
+        .group_by(db.WorkQueue.work_pool_id)
+    )
+    result = await session.execute(query)
+    return dict(result.all())
+
+
+@db_injector
+async def count_work_queue_active_slots(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_queue_id: UUID,
+) -> int:
+    """
+    Count flow runs in slot-occupying states (Pending, Running) for a given
+    work queue under a work pool. Counts by work_queue_id FK only.
+    """
+    query = (
+        select(sa.func.count())
+        .select_from(db.FlowRun)
+        .where(
+            db.FlowRun.work_queue_id == work_queue_id,
+            db.FlowRun.state_type.in_(SLOT_OCCUPYING_STATES),
+        )
+    )
+    result = await session.execute(query)
+    return result.scalar_one()
+
+
+@db_injector
+async def count_work_queue_active_slots_bulk(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_queue_ids: Sequence[UUID],
+) -> dict[UUID, int]:
+    """
+    Count active slots for multiple work queues in a single query.
+    Returns a mapping of work_queue_id -> active slot count.
+    """
+    if not work_queue_ids:
+        return {}
+    query = (
+        select(
+            db.FlowRun.work_queue_id,
+            sa.func.count(db.FlowRun.id),
+        )
+        .select_from(db.FlowRun)
+        .where(
+            db.FlowRun.work_queue_id.in_(work_queue_ids),
+            db.FlowRun.state_type.in_(SLOT_OCCUPYING_STATES),
+        )
+        .group_by(db.FlowRun.work_queue_id)
+    )
+    result = await session.execute(query)
+    return dict(result.all())
+
+
 @db_injector
 async def update_work_pool(
     db: PrefectDBInterface,
@@ -256,6 +374,39 @@ async def update_work_pool(
 
         assert wp is not None
         assert current_work_pool is not wp
+
+        # Detect which fields actually changed (excluding status and internal fields)
+        # Fields that should trigger update events (user-updatable fields)
+        WORK_POOL_EVENT_FIELDS = {
+            # "is_paused", # Handled with status
+            "description",
+            "base_job_template",
+            "concurrency_limit",
+            "storage_configuration",
+        }
+
+        changed_fields = {}
+        for field in update_data.keys():
+            if field not in WORK_POOL_EVENT_FIELDS or field == "status":
+                continue
+
+            old_value = getattr(current_work_pool, field, None)
+            new_value = getattr(wp, field, None)
+
+            # Compare values (handle different types)
+            if old_value != new_value:
+                changed_fields[field] = {
+                    "from": old_value,
+                    "to": new_value,
+                }
+
+        # Emit event for non-status field changes
+        if changed_fields:
+            await emit_work_pool_updated_event(
+                session=session,
+                work_pool=wp,
+                changed_fields=changed_fields,
+            )
 
         if "status" in update_data and emit_status_change:
             await emit_status_change(
@@ -506,6 +657,25 @@ async def read_work_queues(
 
 
 @db_injector
+async def count_work_queues(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_id: UUID,
+    work_queue_filter: Optional[schemas.filters.WorkQueueFilter] = None,
+) -> int:
+    """Count work pool queues for a work pool."""
+    query = (
+        sa.select(sa.func.count())
+        .select_from(db.WorkQueue)
+        .where(db.WorkQueue.work_pool_id == work_pool_id)
+    )
+    if work_queue_filter is not None:
+        query = query.where(work_queue_filter.as_sql_filter())
+    result = await session.execute(query)
+    return result.scalar_one()
+
+
+@db_injector
 async def read_work_queue(
     db: PrefectDBInterface,
     session: AsyncSession,
@@ -588,20 +758,25 @@ async def update_work_queue(
 
     update_values = work_queue.model_dump_for_orm(exclude_unset=True)
 
-    if "is_paused" in update_values:
-        if (wq := await session.get(db.WorkQueue, work_queue_id)) is None:
-            return False
+    current_work_queue = await session.get(db.WorkQueue, work_queue_id)
+    if current_work_queue is None:
+        return False
+    session.expunge(current_work_queue)
 
+    if "is_paused" in update_values:
         # Only update the status to paused if it's not already paused. This ensures a work queue that is already
         # paused will not get a status update if it's paused again
-        if update_values.get("is_paused") and wq.status != WorkQueueStatus.PAUSED:
+        if (
+            update_values.get("is_paused")
+            and current_work_queue.status != WorkQueueStatus.PAUSED
+        ):
             update_values["status"] = WorkQueueStatus.PAUSED
 
         # If unpausing, only update status if it's currently paused. This ensures a work queue that is already
         # unpaused will not get a status update if it's unpaused again
         if (
             update_values.get("is_paused") is False
-            and wq.status == WorkQueueStatus.PAUSED
+            and current_work_queue.status == WorkQueueStatus.PAUSED
         ):
             # Default status if unpaused
             update_values["status"] = default_status
@@ -610,7 +785,7 @@ async def update_work_queue(
             if "last_polled" in update_values:
                 last_polled = update_values["last_polled"]
             else:
-                last_polled = wq.last_polled
+                last_polled = current_work_queue.last_polled
 
             # Check if last polled is recent and set status to READY if so
             if is_last_polled_recent(last_polled):
@@ -626,10 +801,45 @@ async def update_work_queue(
     updated = result.rowcount > 0
 
     if updated:
-        if "priority" in update_values or "status" in update_values:
-            updated_work_queue = await session.get(db.WorkQueue, work_queue_id)
-            assert updated_work_queue
+        updated_work_queue = await session.get(db.WorkQueue, work_queue_id)
+        assert updated_work_queue is not None
+        assert current_work_queue is not updated_work_queue
 
+        # Fields that should trigger update events (user-updatable fields)
+        WORK_QUEUE_EVENT_FIELDS = {
+            "name",
+            "description",
+            "concurrency_limit",
+            "priority",
+            # Exclude "is_paused" - handled with status
+            # Exclude "last_polled" - usually auto-updated
+            # Exclude "filter" - deprecated
+        }
+
+        changed_fields = {}
+        for field in update_values.keys():
+            if field not in WORK_QUEUE_EVENT_FIELDS or field == "status":
+                continue
+
+            old_value = getattr(current_work_queue, field, None)
+            new_value = getattr(updated_work_queue, field, None)
+
+            if old_value != new_value:
+                changed_fields[field] = {
+                    "from": old_value,
+                    "to": new_value,
+                }
+
+        if changed_fields:
+            from prefect.server.models.work_queues import emit_work_queue_updated_event
+
+            await emit_work_queue_updated_event(
+                session=session,
+                work_queue=updated_work_queue,
+                changed_fields=changed_fields,
+            )
+
+        if "priority" in update_values or "status" in update_values:
             if "priority" in update_values:
                 await bulk_update_work_queue_priorities(
                     session,
@@ -797,6 +1007,261 @@ async def delete_worker(
     )
 
     return result.rowcount > 0
+
+
+# Work-pool scheduler (get-runs-from-worker-queues.sql.jinja) counts only
+# PENDING and RUNNING against pool/queue concurrency limits.
+WORK_POOL_SLOT_OCCUPYING_STATES = [
+    schemas.states.StateType.PENDING,
+    schemas.states.StateType.RUNNING,
+]
+
+# Work-queue scheduler (query_components.py) also counts CANCELLING.
+WORK_QUEUE_SLOT_OCCUPYING_STATES = [
+    schemas.states.StateType.PENDING,
+    schemas.states.StateType.RUNNING,
+    schemas.states.StateType.CANCELLING,
+]
+
+# Union of both for the slot_acquired_at subquery, which needs to find
+# the earliest entry into any slot-occupying state regardless of context.
+ALL_SLOT_OCCUPYING_STATES = [
+    schemas.states.StateType.PENDING,
+    schemas.states.StateType.RUNNING,
+    schemas.states.StateType.CANCELLING,
+]
+
+
+def _slot_acquired_at_subquery(
+    db: PrefectDBInterface,
+) -> sa.ScalarSelect:
+    """Correlated subquery returning when the current slot-occupying sequence began.
+
+    For a run that has been retried or rescheduled, this finds the start of the
+    *current* slot-occupying sequence — not the first-ever one. It does this by
+    finding the latest non-slot-occupying state and then taking the earliest
+    slot-occupying state after that point.
+    """
+    # Latest non-slot-occupying state timestamp (e.g. SCHEDULED, FAILED before retry)
+    last_non_slot_state = (
+        select(sa.func.max(db.FlowRunState.timestamp))
+        .where(
+            db.FlowRunState.flow_run_id == db.FlowRun.id,
+            db.FlowRunState.type.notin_(ALL_SLOT_OCCUPYING_STATES),
+        )
+        .correlate(db.FlowRun)
+        .scalar_subquery()
+    )
+
+    # Earliest slot-occupying state at or after the last non-slot state.
+    # Uses >= so that a slot-occupying state with the same timestamp as the
+    # preceding non-slot state (possible with imported/manual timestamps or
+    # coarse precision) is still recognized as the current attempt.
+    # If there was never a non-slot state, returns the earliest slot-occupying
+    # state overall (correct for runs that started directly in a slot-occupying state).
+    return (
+        select(sa.func.min(db.FlowRunState.timestamp))
+        .where(
+            db.FlowRunState.flow_run_id == db.FlowRun.id,
+            db.FlowRunState.type.in_(ALL_SLOT_OCCUPYING_STATES),
+            sa.or_(
+                last_non_slot_state.is_(None),
+                db.FlowRunState.timestamp >= last_non_slot_state,
+            ),
+        )
+        .correlate(db.FlowRun)
+        .scalar_subquery()
+        .label("slot_acquired_at")
+    )
+
+
+def _work_pool_slot_holder_filter(
+    db: PrefectDBInterface, work_pool_id: UUID
+) -> sa.ColumnElement:
+    """Common WHERE clause for work-pool slot holder queries."""
+    return sa.and_(
+        db.WorkQueue.work_pool_id == work_pool_id,
+        db.FlowRun.state_type.in_(WORK_POOL_SLOT_OCCUPYING_STATES),
+    )
+
+
+@db_injector
+async def count_work_pool_slot_holders(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_id: UUID,
+) -> int:
+    """Counts flow runs in slot-occupying states for a work pool."""
+    query = (
+        select(sa.func.count())
+        .select_from(db.FlowRun)
+        .join(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .where(_work_pool_slot_holder_filter(db, work_pool_id))
+    )
+    result = await session.execute(query)
+    return result.scalar_one()
+
+
+@db_injector
+async def get_work_pool_slot_holders(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_id: UUID,
+    work_queue_ids: Optional[List[UUID]] = None,
+    flow_run_limit: Optional[int] = None,
+) -> Sequence[tuple[orm_models.FlowRun, Optional[DateTime]]]:
+    """Returns flow runs in slot-occupying states for a work pool.
+
+    Each result is a tuple of (FlowRun, slot_acquired_at) where
+    slot_acquired_at is when the current slot-occupying sequence began.
+
+    Args:
+        work_pool_id: The work pool to query.
+        work_queue_ids: If provided, only return runs for these queues.
+        flow_run_limit: If provided, cap results per work_queue_id.
+    """
+    slot_acquired_at = _slot_acquired_at_subquery(db)
+    # Matches the work-pool scheduler (get-runs-from-worker-queues.sql.jinja):
+    # - Joins on work_queue_id (not name) — fr.work_queue_id = wq.id
+    # - Counts only PENDING and RUNNING (not CANCELLING)
+    # Does NOT filter on queue pause status: the Postgres and SQLite scheduler
+    # templates disagree on this (Postgres excludes paused queues, SQLite
+    # doesn't), and as a status/debugging endpoint we want to show all runs
+    # that are actually consuming resources regardless of pause state.
+    query = (
+        select(db.FlowRun, slot_acquired_at)
+        .join(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .where(_work_pool_slot_holder_filter(db, work_pool_id))
+        .order_by(db.FlowRun.id)
+    )
+    if work_queue_ids is not None:
+        query = query.where(db.FlowRun.work_queue_id.in_(work_queue_ids))
+    result = await session.execute(query)
+    rows = result.all()
+
+    if flow_run_limit is not None and work_queue_ids is not None:
+        # Apply per-queue flow_run_limit in Python (simpler than SQL windowing)
+        from collections import Counter
+
+        counts: Counter[UUID] = Counter()
+        limited: list[tuple] = []
+        for run, sa_val in rows:
+            qid = run.work_queue_id
+            if counts[qid] < flow_run_limit:
+                limited.append((run, sa_val))
+                counts[qid] += 1
+        return limited
+
+    return rows
+
+
+@db_injector
+async def count_work_pool_slot_holders_by_queue(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_pool_id: UUID,
+) -> dict[UUID, int]:
+    """Returns `{work_queue_id: count}` for slot-holding runs in a pool."""
+    query = (
+        select(db.FlowRun.work_queue_id, sa.func.count())
+        .join(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .where(_work_pool_slot_holder_filter(db, work_pool_id))
+        .group_by(db.FlowRun.work_queue_id)
+    )
+    result = await session.execute(query)
+    return dict(result.all())
+
+
+def _work_queue_slot_holder_filter(
+    db: PrefectDBInterface, work_queue_id: UUID, queue_name_subquery: sa.ScalarSelect
+) -> sa.ColumnElement:
+    """Common WHERE clause for work-queue slot holder queries."""
+    return sa.and_(
+        sa.or_(
+            db.FlowRun.work_queue_id == work_queue_id,
+            sa.and_(
+                db.FlowRun.work_queue_id.is_(None),
+                db.FlowRun.work_queue_name == queue_name_subquery,
+            ),
+        ),
+        db.FlowRun.state_type.in_(WORK_QUEUE_SLOT_OCCUPYING_STATES),
+    )
+
+
+@db_injector
+async def count_work_queue_slot_holders(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_queue_id: UUID,
+) -> int:
+    """Counts flow runs in slot-occupying states for a single work queue."""
+    queue_name_subquery = (
+        select(db.WorkQueue.name)
+        .where(db.WorkQueue.id == work_queue_id)
+        .scalar_subquery()
+    )
+    query = (
+        select(sa.func.count())
+        .select_from(db.FlowRun)
+        .where(_work_queue_slot_holder_filter(db, work_queue_id, queue_name_subquery))
+    )
+    result = await session.execute(query)
+    return result.scalar_one()
+
+
+@db_injector
+async def get_work_queue_slot_holders(
+    db: PrefectDBInterface,
+    session: AsyncSession,
+    work_queue_id: UUID,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> Sequence[tuple[orm_models.FlowRun, Optional[DateTime]]]:
+    """Returns flow runs in slot-occupying states for a single work queue.
+
+    Each result is a tuple of (FlowRun, slot_acquired_at) where
+    slot_acquired_at is when the current slot-occupying sequence began.
+    """
+    slot_acquired_at = _slot_acquired_at_subquery(db)
+    # Matches the work-queue scheduler (query_components.py):
+    # - Joins on work_queue_name (FlowRun.work_queue_name == WorkQueue.name)
+    # - Counts PENDING, RUNNING, and CANCELLING
+    queue_name_subquery = (
+        select(db.WorkQueue.name)
+        .where(db.WorkQueue.id == work_queue_id)
+        .scalar_subquery()
+    )
+    query = (
+        select(db.FlowRun, slot_acquired_at)
+        .where(_work_queue_slot_holder_filter(db, work_queue_id, queue_name_subquery))
+        .order_by(db.FlowRun.id)
+    )
+    if offset is not None:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    result = await session.execute(query)
+    return result.all()
+
+
+async def emit_work_pool_updated_event(
+    session: AsyncSession,
+    work_pool: orm_models.WorkPool,
+    changed_fields: Dict[str, Dict[str, Any]],
+) -> None:
+    """Emit an event when work pool fields are updated."""
+    if not changed_fields:
+        return
+
+    async with PrefectServerEventsClient() as events_client:
+        await events_client.emit(
+            await work_pool_updated_event(
+                session=session,
+                work_pool=work_pool,
+                changed_fields=changed_fields,
+                occurred=now("UTC"),
+            )
+        )
 
 
 async def emit_work_pool_status_event(

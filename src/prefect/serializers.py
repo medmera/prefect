@@ -41,6 +41,21 @@ D = TypeVar("D", default=Any)
 _TYPE_ADAPTER_CACHE: dict[str, TypeAdapter[Any]] = {}
 
 
+def _get_importable_class(cls: type) -> type:
+    """
+    Get an importable class from a potentially parameterized generic.
+
+    For Pydantic generic models like `APIResult[str]`, the class name includes
+    type parameters (e.g., `APIResult[str]`) which cannot be imported. This
+    function extracts the origin class (e.g., `APIResult`) which can be imported.
+    """
+    if hasattr(cls, "__pydantic_generic_metadata__"):
+        origin = cls.__pydantic_generic_metadata__.get("origin")
+        if origin is not None:
+            return origin
+    return cls
+
+
 def prefect_json_object_encoder(obj: Any) -> Any:
     """
     `JSONEncoder.default` for encoding objects into JSON with extended type support.
@@ -58,8 +73,9 @@ def prefect_json_object_encoder(obj: Any) -> Any:
             ),
         }
     else:
+        importable_class = _get_importable_class(obj.__class__)
         return {
-            "__class__": to_qualified_name(obj.__class__),
+            "__class__": to_qualified_name(importable_class),
             "data": custom_pydantic_encoder({}, obj),
         }
 
@@ -72,12 +88,20 @@ def prefect_json_object_decoder(result: dict[str, Any]) -> Any:
     if "__class__" in result:
         class_name = result["__class__"]
         if class_name not in _TYPE_ADAPTER_CACHE:
-            _TYPE_ADAPTER_CACHE[class_name] = TypeAdapter(
-                from_qualified_name(class_name)
-            )
+            try:
+                cls = from_qualified_name(class_name)
+            except (ImportError, AttributeError):
+                return result
+            _TYPE_ADAPTER_CACHE[class_name] = TypeAdapter(cls)
         return _TYPE_ADAPTER_CACHE[class_name].validate_python(result["data"])
     elif "__exc_type__" in result:
-        return from_qualified_name(result["__exc_type__"])(result["message"])
+        try:
+            exc_cls = from_qualified_name(result["__exc_type__"])
+        except (ImportError, AttributeError):
+            raise ValueError(f"Invalid exception type: {result['__exc_type__']!r}")
+        if not (isinstance(exc_cls, type) and issubclass(exc_cls, BaseException)):
+            raise ValueError(f"Invalid exception type: {result['__exc_type__']!r}")
+        return exc_cls(result["message"])
     else:
         return result
 

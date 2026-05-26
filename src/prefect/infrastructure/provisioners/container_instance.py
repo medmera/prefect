@@ -31,7 +31,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm
 from rich.syntax import Syntax
 
-from prefect.cli._prompts import prompt, prompt_select_from_table
 from prefect.client.schemas.actions import BlockDocumentCreate
 from prefect.client.utilities import inject_client
 from prefect.exceptions import ObjectAlreadyExists, ObjectNotFound
@@ -226,6 +225,8 @@ class ContainerInstancePushProvisioner:
         Raises:
             RuntimeError: If no Azure subscriptions are found or the Azure CLI command execution fails.
         """
+        from prefect.cli._prompts import prompt_select_from_table
+
         if self._console.is_interactive:
             with Progress(
                 SpinnerColumn(),
@@ -818,6 +819,8 @@ class ContainerInstancePushProvisioner:
     async def _customize_resource_names(
         self, work_pool_name: str, client: "PrefectClient"
     ) -> bool:
+        from prefect.cli._prompts import prompt
+
         self._resource_group_name = prompt(
             "Please enter a name for the resource group",
             default=self._resource_group_name,
@@ -874,6 +877,8 @@ class ContainerInstancePushProvisioner:
         Raises:
             RuntimeError: If client injection fails or the Azure CLI command execution fails.
         """
+        from prefect.cli._prompts import prompt_select_from_table
+
         if not client:
             self._console.print(
                 "Client injection failed, cannot proceed with provisioning.",
@@ -1039,10 +1044,10 @@ class ContainerInstancePushProvisioner:
                     Use any image name to build and push to this registry by default:
                     """
             ),
-            Panel(
-                Syntax(
-                    dedent(
-                        f"""\
+            Syntax(
+                dedent(
+                    f"""\
+                        # example_deploy_script.py
                         from prefect import flow
                         from prefect.docker import DockerImage
 
@@ -1061,12 +1066,9 @@ class ContainerInstancePushProvisioner:
                                     platform="linux/amd64",
                                 )
                             )"""
-                    ),
-                    "python",
-                    background_color="default",
                 ),
-                title="example_deploy_script.py",
-                expand=False,
+                "python",
+                background_color="default",
             ),
         )
 

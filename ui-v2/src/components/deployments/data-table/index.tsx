@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type {
 	ColumnFiltersState,
 	OnChangeFn,
@@ -13,10 +13,10 @@ import { useCallback } from "react";
 import type { DeploymentWithFlow } from "@/api/deployments";
 import type { components } from "@/api/prefect";
 import { useDeleteDeploymentConfirmationDialog } from "@/components/deployments/use-delete-deployment-confirmation-dialog";
+import { FlowIconText } from "@/components/flows/flow-icon-text";
 import { DataTable } from "@/components/ui/data-table";
 import { DeleteConfirmationDialog } from "@/components/ui/delete-confirmation-dialog";
 import { FlowRunActivityBarGraphTooltipProvider } from "@/components/ui/flow-run-activity-bar-graph";
-import { Icon } from "@/components/ui/icons";
 import { SearchInput } from "@/components/ui/input";
 import { ScheduleBadgeGroup } from "@/components/ui/schedule-badge";
 import {
@@ -58,7 +58,7 @@ const createColumns = ({
 			<div className="flex flex-col">
 				<Link to="/deployments/deployment/$id" params={{ id: row.original.id }}>
 					<span
-						className="text-sm font-medium truncate"
+						className="text-sm font-medium truncate text-link hover:text-link-hover"
 						title={row.original.name}
 					>
 						{row.original.name}
@@ -66,14 +66,11 @@ const createColumns = ({
 				</Link>
 
 				{row.original.flow && (
-					<Link to="/flows/flow/$id" params={{ id: row.original.flow_id }}>
-						<span className="text-xs text-muted-foreground flex items-center gap-1">
-							<Icon id="Workflow" size={12} />
-							<span className="truncate" title={row.original.flow.name}>
-								{row.original.flow.name}
-							</span>
-						</span>
-					</Link>
+					<FlowIconText
+						flow={row.original.flow}
+						className="text-xs text-muted-foreground flex items-center gap-1"
+						iconSize={12}
+					/>
 				)}
 			</div>
 		),
@@ -135,6 +132,7 @@ export const DeploymentsDataTable = ({
 	onSortChange,
 	onColumnFiltersChange,
 }: DeploymentsDataTableProps) => {
+	const navigate = useNavigate();
 	const [deleteConfirmationDialogState, confirmDelete] =
 		useDeleteDeploymentConfirmationDialog();
 
@@ -170,12 +168,8 @@ export const DeploymentsDataTable = ({
 
 	const handlePaginationChange: OnChangeFn<PaginationState> = useCallback(
 		(updater) => {
-			let newPagination = pagination;
-			if (typeof updater === "function") {
-				newPagination = updater(pagination);
-			} else {
-				newPagination = updater;
-			}
+			const newPagination =
+				typeof updater === "function" ? updater(pagination) : updater;
 			onPaginationChange(newPagination);
 		},
 		[pagination, onPaginationChange],
@@ -204,28 +198,28 @@ export const DeploymentsDataTable = ({
 	});
 	return (
 		<div>
-			<div className="grid sm:grid-cols-2 md:grid-cols-6 lg:grid-cols-12 gap-2 pb-4 items-center">
-				<div className="sm:col-span-2 md:col-span-6 lg:col-span-4 order-last lg:order-first">
+			<div className="grid sm:grid-cols-2 md:grid-cols-12 gap-2 pb-4 items-center">
+				<div className="sm:col-span-2 md:col-span-3 lg:col-span-4 md:order-first lg:order-first">
 					<p className="text-sm text-muted-foreground">
-						{currentDeploymentsCount}{" "}
+						{currentDeploymentsCount.toLocaleString()}{" "}
 						{pluralize(currentDeploymentsCount, "Deployment")}
 					</p>
 				</div>
-				<div className="sm:col-span-2 md:col-span-2 lg:col-span-3">
+				<div className="sm:col-span-2 md:col-span-3 lg:col-span-3">
 					<SearchInput
 						placeholder="Search deployments"
 						value={nameSearchValue}
 						onChange={(e) => handleNameSearchChange(e.target.value)}
 					/>
 				</div>
-				<div className="xs:col-span-1 md:col-span-2 lg:col-span-3">
+				<div className="sm:col-span-2 md:col-span-3 lg:col-span-3">
 					<TagsInput
 						placeholder="Filter by tags"
 						onChange={handleTagsSearchChange}
 						value={tagsSearchValue}
 					/>
 				</div>
-				<div className="xs:col-span-1 md:col-span-2 lg:col-span-2">
+				<div className="sm:col-span-2 md:col-span-3 lg:col-span-2">
 					<Select value={sort} onValueChange={onSortChange}>
 						<SelectTrigger
 							aria-label="Deployment sort order"
@@ -245,7 +239,15 @@ export const DeploymentsDataTable = ({
 
 			<DeleteConfirmationDialog {...deleteConfirmationDialogState} />
 			<FlowRunActivityBarGraphTooltipProvider>
-				<DataTable table={table} />
+				<DataTable
+					table={table}
+					onRowClick={(row) =>
+						void navigate({
+							to: "/deployments/deployment/$id",
+							params: { id: row.id },
+						})
+					}
+				/>
 			</FlowRunActivityBarGraphTooltipProvider>
 		</div>
 	);

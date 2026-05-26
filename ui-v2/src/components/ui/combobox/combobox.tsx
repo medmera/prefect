@@ -57,7 +57,7 @@ const ComboboxTrigger = ({
 				aria-haspopup="listbox"
 				variant="outline"
 				className={cn(
-					"w-full justify-between",
+					"w-full justify-between bg-card dark:bg-background",
 					selected && "text-muted-foreground",
 				)}
 				id={id}
@@ -107,8 +107,14 @@ const ComboboxCommandEmtpy = ({ children }: { children: React.ReactNode }) => {
 	return <CommandEmpty>{children}</CommandEmpty>;
 };
 
-const ComboboxCommandGroup = ({ children }: { children: React.ReactNode }) => {
-	return <CommandGroup>{children}</CommandGroup>;
+const ComboboxCommandGroup = ({
+	heading,
+	children,
+}: {
+	heading?: string;
+	children: React.ReactNode;
+}) => {
+	return <CommandGroup heading={heading}>{children}</CommandGroup>;
 };
 
 const ComboboxCommandItem = ({
@@ -160,11 +166,11 @@ const ComboboxCommandItem = ({
 
 export {
 	Combobox,
-	ComboboxTrigger,
-	ComboboxContent,
-	ComboboxCommandInput,
-	ComboboxCommandList,
 	ComboboxCommandEmtpy,
 	ComboboxCommandGroup,
+	ComboboxCommandInput,
 	ComboboxCommandItem,
+	ComboboxCommandList,
+	ComboboxContent,
+	ComboboxTrigger,
 };

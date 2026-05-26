@@ -32,6 +32,7 @@ from .cli import CLISettings
 from .client import ClientSettings
 from .cloud import CloudSettings
 from .deployments import DeploymentsSettings
+from .events import EventsSettings
 from .experiments import ExperimentsSettings
 from .flows import FlowsSettings
 from .internal import InternalSettings
@@ -39,6 +40,7 @@ from .logging import LoggingSettings
 from .results import ResultsSettings
 from .runner import RunnerSettings
 from .server import ServerSettings
+from .telemetry import TelemetrySettings
 
 if TYPE_CHECKING:
     from prefect.settings.legacy import Setting
@@ -97,6 +99,11 @@ class Settings(PrefectBaseSettings):
         description="Settings for configuring deployments defaults",
     )
 
+    events: EventsSettings = Field(
+        default_factory=EventsSettings,
+        description="Settings for controlling events behavior",
+    )
+
     experiments: ExperimentsSettings = Field(
         default_factory=ExperimentsSettings,
         description="Settings for controlling experimental features",
@@ -135,6 +142,11 @@ class Settings(PrefectBaseSettings):
     tasks: TasksSettings = Field(
         default_factory=TasksSettings,
         description="Settings for controlling task behavior",
+    )
+
+    telemetry: TelemetrySettings = Field(
+        default_factory=TelemetrySettings,
+        description="Settings for configuring telemetry collection",
     )
 
     testing: TestingSettings = Field(
@@ -237,6 +249,12 @@ class Settings(PrefectBaseSettings):
             self.server.database.connection_url = SecretStr(db_url)
             self.server.database.__pydantic_fields_set__.remove("connection_url")
 
+        if self.connected_to_cloud:
+            # Ensure we don't exceed Cloud's maximum log size
+            self.logging.to_api.max_log_size = min(
+                self.logging.to_api.max_log_size, self.cloud.max_log_size
+            )
+
         return self
 
     @model_validator(mode="after")
@@ -245,6 +263,15 @@ class Settings(PrefectBaseSettings):
         if not self.silence_api_url_misconfiguration:
             _warn_on_misconfigured_api_url(self)
         return self
+
+    @property
+    def connected_to_cloud(self) -> bool:
+        """True when the API URL points at the configured Prefect Cloud API."""
+        return bool(
+            self.api.url
+            and self.cloud.api_url
+            and self.api.url.startswith(self.cloud.api_url)
+        )
 
     ##########################################################################
     # Settings methods

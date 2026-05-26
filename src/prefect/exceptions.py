@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 
 def _trim_traceback(
-    tb: Optional[TracebackType], remove_modules: Iterable[ModuleType]
-) -> Optional[TracebackType]:
+    tb: TracebackType | None, remove_modules: Iterable[ModuleType]
+) -> TracebackType | None:
     """
     Utility to remove frames from specific modules from a traceback.
 
@@ -358,7 +358,7 @@ class PrefectHTTPStatusError(HTTPStatusError):
         else:
             message_components = [error_message, *more_info]
 
-        new_message = "\n".join(message_components)
+        new_message = " - ".join(message_components)
 
         return cls(
             new_message, request=httpx_error.request, response=httpx_error.response
@@ -444,6 +444,17 @@ class ConfigurationError(PrefectException):
     """
     Raised when a configuration is invalid.
     """
+
+
+class EventTooLarge(PrefectException):
+    """
+    Raised when an event exceeds the configured maximum size.
+    """
+
+    def __init__(self, size: int, maximum: int):
+        super().__init__(f"Event is too large to emit ({size} > {maximum} bytes)")
+        self.size = size
+        self.maximum = maximum
 
 
 class ProfileSettingsValidationError(PrefectException):

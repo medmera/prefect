@@ -26,7 +26,6 @@ from prefect.settings.sources import (
     PyprojectTomlConfigSettingsSource,
 )
 from prefect.utilities.collections import visit_collection
-from prefect.utilities.pydantic import handle_secret_render
 
 
 class PrefectBaseSettings(BaseSettings):
@@ -165,9 +164,9 @@ class PrefectBaseSettings(BaseSettings):
     @model_serializer(
         mode="wrap", when_used="always"
     )  # TODO: reconsider `when_used` default for more control
-    def ser_model(
+    def _ser_model(
         self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
-    ) -> Any:
+    ):  # No return type to avoid breaking OpenAPI schema generation (pydantic#8791)
         jsonable_self: dict[str, Any] = handler(self)
         # iterate over fields to ensure child models that have been updated are also included
         for key in type(self).model_fields.keys():
@@ -196,6 +195,8 @@ class PrefectBaseSettings(BaseSettings):
                 if child_jsonable:
                     jsonable_self[key] = child_jsonable
         if info.context and info.context.get("include_secrets") is True:
+            from prefect.utilities.pydantic import handle_secret_render
+
             jsonable_self.update(
                 {
                     field_name: visit_collection(
@@ -268,7 +269,7 @@ def _to_environment_variable_value(
     value: list[object] | set[object] | tuple[object] | Any,
 ) -> str:
     if isinstance(value, (list, set, tuple)):
-        return ",".join(str(v) for v in value)
+        return ",".join(str(v) for v in sorted(value, key=str))
     if isinstance(value, dict):
         return json.dumps(value)
     return str(value)

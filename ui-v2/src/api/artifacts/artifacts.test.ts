@@ -4,13 +4,17 @@ import { buildApiUrl, createWrapper, server } from "@tests/utils";
 import { HttpResponse, http } from "msw";
 import { describe, expect, it } from "vitest";
 
-import { createFakeArtifact } from "@/mocks";
+import { createFakeArtifact, createFakeArtifactCollection } from "@/mocks";
 
 import {
 	type Artifact,
+	type ArtifactCollection,
 	buildCountArtifactsQuery,
+	buildCountLatestArtifactsQuery,
 	buildGetArtifactQuery,
+	buildGetTaskRunResultQuery,
 	buildListArtifactsQuery,
+	buildListLatestArtifactsQuery,
 } from "./index";
 
 describe("artifacts queries and mutations", () => {
@@ -89,6 +93,101 @@ describe("artifacts queries and mutations", () => {
 		);
 
 		// ------------ Assert
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		expect(result.current.data).toEqual(count);
+	});
+
+	it("retrieves task run result artifact", async () => {
+		// ------------ Mock API requests when cache is empty
+		const taskRunId = "test-task-run-id";
+		const mockArtifact = createFakeArtifact({
+			task_run_id: taskRunId,
+			type: "result",
+		});
+		server.use(
+			http.post(buildApiUrl("/artifacts/filter"), () => {
+				return HttpResponse.json([mockArtifact]);
+			}),
+		);
+
+		// ------------ Initialize hooks to test
+		const { result } = renderHook(
+			() => useSuspenseQuery(buildGetTaskRunResultQuery(taskRunId)),
+			{ wrapper: createWrapper() },
+		);
+
+		// ------------ Assert
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		expect(result.current.data).toEqual(mockArtifact);
+	});
+
+	it("returns null when no task run result artifact exists", async () => {
+		// ------------ Mock API requests when cache is empty
+		const taskRunId = "test-task-run-id-no-result";
+		server.use(
+			http.post(buildApiUrl("/artifacts/filter"), () => {
+				return HttpResponse.json([]);
+			}),
+		);
+
+		// ------------ Initialize hooks to test
+		const { result } = renderHook(
+			() => useSuspenseQuery(buildGetTaskRunResultQuery(taskRunId)),
+			{ wrapper: createWrapper() },
+		);
+
+		// ------------ Assert
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		expect(result.current.data).toBeNull();
+	});
+
+	const seedArtifactCollectionsData = () => [
+		createFakeArtifactCollection({ id: "0" }),
+		createFakeArtifactCollection({ id: "1" }),
+	];
+
+	const mockFetchListLatestArtifactsAPI = (
+		collections: Array<ArtifactCollection>,
+	) => {
+		server.use(
+			http.post(buildApiUrl("/artifacts/latest/filter"), () => {
+				return HttpResponse.json(collections);
+			}),
+		);
+	};
+
+	const mockFetchCountLatestArtifactsAPI = (count: number) => {
+		server.use(
+			http.post(buildApiUrl("/artifacts/latest/count"), () => {
+				return HttpResponse.json(count);
+			}),
+		);
+	};
+
+	const latestFilter = { sort: "ID_DESC", offset: 0 } as const;
+
+	it("stores latest artifact collection list data", async () => {
+		const mockList = seedArtifactCollectionsData();
+		mockFetchListLatestArtifactsAPI(mockList);
+
+		const { result } = renderHook(
+			() => useSuspenseQuery(buildListLatestArtifactsQuery(latestFilter)),
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		expect(result.current.data).toEqual(mockList);
+	});
+
+	it("retrieves count of latest artifact collections", async () => {
+		const count = 2;
+		mockFetchCountLatestArtifactsAPI(count);
+
+		const { result } = renderHook(
+			() => useSuspenseQuery(buildCountLatestArtifactsQuery(latestFilter)),
+			{ wrapper: createWrapper() },
+		);
+
 		await waitFor(() => expect(result.current.isSuccess).toBe(true));
 		expect(result.current.data).toEqual(count);
 	});

@@ -2,11 +2,12 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 import warnings
 from pathlib import Path
 from textwrap import dedent
-from typing import Optional
-from unittest.mock import ANY, call
+from typing import Any, Optional
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call
 
 import pytest
 import uv
@@ -14,23 +15,25 @@ import uv
 from prefect._internal.compatibility.deprecated import PrefectDeprecationWarning
 from prefect.blocks.core import Block
 from prefect.blocks.system import Secret
-from prefect.client.orchestration import PrefectClient
+from prefect.client.orchestration import PrefectClient, get_client
 from prefect.deployments.steps import run_step
 from prefect.deployments.steps.core import StepExecutionError, run_steps
 from prefect.deployments.steps.pull import agit_clone, set_working_directory
 from prefect.deployments.steps.utility import run_shell_script
-from prefect.testing.utilities import AsyncMock, MagicMock
 from prefect.utilities.filesystem import tmpchdir
 
 
 @pytest.fixture
 async def variables(prefect_client: PrefectClient):
+    var1_name = f"test_variable_1_{uuid.uuid4()}"
+    var2_name = f"test_variable_2_{uuid.uuid4()}"
     await prefect_client._client.post(
-        "/variables/", json={"name": "test_variable_1", "value": "test_value_1"}
+        "/variables/", json={"name": var1_name, "value": "test_value_1"}
     )
     await prefect_client._client.post(
-        "/variables/", json={"name": "test_variable_2", "value": "test_value_2"}
+        "/variables/", json={"name": var2_name, "value": "test_value_2"}
     )
+    return var1_name, var2_name
 
 
 @pytest.fixture(scope="session")
@@ -67,12 +70,13 @@ class TestRunStep:
             )
 
     async def test_run_step_resolves_block_document_references_before_running(self):
-        await Secret(value="echo 'I am a secret!'").save(name="test-secret")
+        secret_name = f"test-secret-{uuid.uuid4()}"
+        await Secret(value="echo 'I am a secret!'").save(name=secret_name)
 
         output = await run_step(
             {
                 "prefect.deployments.steps.run_shell_script": {
-                    "script": "{{ prefect.blocks.secret.test-secret }}",
+                    "script": f"{{{{ prefect.blocks.secret.{secret_name} }}}}",
                 }
             }
         )
@@ -100,12 +104,13 @@ class TestRunStep:
         }
 
     async def test_run_step_resolves_variables_before_running(self, variables):
+        var1_name, var2_name = variables
         output = await run_step(
             {
                 "prefect.deployments.steps.run_shell_script": {
                     "script": (
-                        "echo '{{ prefect.variables.test_variable_1 }}:{{"
-                        " prefect.variables.test_variable_2 }}'"
+                        f"echo '{{{{ prefect.variables.{var1_name} }}}}:{{{{"
+                        f" prefect.variables.{var2_name} }}}}'"
                     ),
                 }
             }
@@ -131,6 +136,8 @@ class TestRunStep:
         """
         Test that the function attempts to install the package and succeeds.
         """
+        monkeypatch.setattr("prefect.__version__", "3.6.0")
+
         import_module_mock = MagicMock()
         monkeypatch.setattr(
             "prefect.deployments.steps.core.import_module", import_module_mock
@@ -152,7 +159,13 @@ class TestRunStep:
             import_object_mock.call_count == 2
         )  # once before and once after installation
         subprocess.check_call.assert_called_once_with(
-            [uv.find_uv_bin(), "pip", "install", "test-package>=1.0.0"],
+            [
+                uv.find_uv_bin(),
+                "pip",
+                "install",
+                "prefect==3.6.0",
+                "test-package>=1.0.0",
+            ],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
@@ -170,6 +183,8 @@ class TestRunStep:
     async def test_requirement_installation_uses_prefect_extras(
         self, monkeypatch, package, expected
     ):
+        monkeypatch.setattr("prefect.__version__", "3.6.0")
+
         import_module_mock = MagicMock()
         monkeypatch.setattr(
             "prefect.deployments.steps.core.import_module", import_module_mock
@@ -189,7 +204,7 @@ class TestRunStep:
             import_object_mock.call_count == 2
         )  # once before and once after installation
         subprocess.check_call.assert_called_once_with(
-            [uv.find_uv_bin(), "pip", "install", expected],
+            [uv.find_uv_bin(), "pip", "install", "prefect==3.6.0", expected],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
@@ -198,6 +213,8 @@ class TestRunStep:
         """
         Test that passing multiple requirements installs all of them.
         """
+        monkeypatch.setattr("prefect.__version__", "3.6.0")
+
         import_module_mock = MagicMock(side_effect=[None, ImportError])
         monkeypatch.setattr(
             "prefect.deployments.steps.core.import_module", import_module_mock
@@ -221,7 +238,14 @@ class TestRunStep:
 
         import_module_mock.assert_has_calls([call("test_package"), call("another")])
         subprocess.check_call.assert_called_once_with(
-            [uv.find_uv_bin(), "pip", "install", "test-package>=1.0.0", "another"],
+            [
+                uv.find_uv_bin(),
+                "pip",
+                "install",
+                "prefect==3.6.0",
+                "test-package>=1.0.0",
+                "another",
+            ],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
@@ -266,6 +290,331 @@ class TestRunStep:
 
 
 class TestRunSteps:
+    @pytest.mark.usefixtures("clean_asserting_events_client")
+    async def test_run_steps_emits_pull_step_events(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from prefect.events.clients import AssertingEventsClient
+
+        flow_run_id = str(uuid.uuid4())
+        monkeypatch.setenv("PREFECT__FLOW_RUN_ID", flow_run_id)
+        # Monkeypatch the client class so all instances are AssertingEventsClient
+        monkeypatch.setattr(
+            "prefect.events.clients.PrefectEventsClient",
+            AssertingEventsClient,
+        )
+
+        def fake_step(*, script: str, **kwargs: Any) -> dict[str, Any]:
+            return {"result": script, **kwargs}
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            fake_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "first",
+                    "id": "step-one",
+                    "requires": "prefect>=3.0.0",
+                    "extra": "value",
+                }
+            },
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "second",
+                }
+            },
+        ]
+
+        output = await run_steps(steps, {})
+
+        assert output["result"] == "second"
+        # Should emit one event per step
+        assert AssertingEventsClient.last
+        events = [
+            e
+            for client in AssertingEventsClient.all
+            if hasattr(client, "events")
+            for e in client.events
+            if f"prefect.flow-run.{flow_run_id}" in str(e.resource)
+        ]
+        assert len(events) == 2
+
+        # Check first step event
+        first_event = events[0]
+        assert first_event.event == "prefect.flow-run.pull-step.executed"
+        assert dict(first_event.resource) == {
+            "prefect.resource.id": f"prefect.flow-run.{flow_run_id}",
+        }
+        first_payload = first_event.payload
+        assert first_payload["index"] == 0
+        assert first_payload["step_name"] == "run_shell_script"
+        assert first_payload["id"] == "step-one"
+        # inputs includes reserved keywords like 'requires' and 'id'
+        assert first_payload["inputs"] == {
+            "script": "first",
+            "id": "step-one",
+            "requires": "prefect>=3.0.0",
+            "extra": "value",
+        }
+
+        # Check second step event
+        second_event = events[1]
+        assert second_event.event == "prefect.flow-run.pull-step.executed"
+        second_payload = second_event.payload
+        assert second_payload["index"] == 1
+        assert second_payload["step_name"] == "run_shell_script"
+
+    async def test_run_steps_skips_event_without_flow_run_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from prefect.events.clients import AssertingEventsClient
+
+        monkeypatch.delenv("PREFECT__FLOW_RUN_ID", raising=False)
+
+        mock_events_client = AssertingEventsClient()
+        get_events_client_called = False
+
+        def mock_get_events_client(**kwargs):
+            nonlocal get_events_client_called
+            get_events_client_called = True
+            return mock_events_client
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.core.get_events_client",
+            mock_get_events_client,
+            raising=False,
+        )
+
+        def fake_step(*, script: str, **kwargs: Any) -> dict[str, Any]:
+            return {"result": script}
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            fake_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "first",
+                }
+            }
+        ]
+
+        await run_steps(steps, {})
+        # get_events_client should not be called since there's no flow_run_id
+        assert not get_events_client_called
+
+    @pytest.mark.usefixtures("clean_asserting_events_client")
+    async def test_run_steps_emits_event_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from prefect.events.clients import AssertingEventsClient
+
+        flow_run_id = str(uuid.uuid4())
+        monkeypatch.setenv("PREFECT__FLOW_RUN_ID", flow_run_id)
+        monkeypatch.setattr(
+            "prefect.events.clients.PrefectEventsClient",
+            AssertingEventsClient,
+        )
+
+        def fake_step(*, script: str, **kwargs: Any) -> dict[str, Any]:
+            if script == "boom":
+                raise RuntimeError("explode")
+            return {"result": script}
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            fake_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "ok",
+                    "id": "step-one",
+                }
+            },
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "boom",
+                    "id": "step-two",
+                }
+            },
+        ]
+
+        with pytest.raises(StepExecutionError):
+            await run_steps(steps, {})
+
+        # Should emit 2 events: 1 success for first step, 1 failure for second step
+        assert AssertingEventsClient.last
+        events = [
+            e
+            for client in AssertingEventsClient.all
+            if hasattr(client, "events")
+            for e in client.events
+            if f"prefect.flow-run.{flow_run_id}" in str(e.resource)
+        ]
+        assert len(events) == 2
+
+        # First event should be success
+        first_event = events[0]
+        assert first_event.event == "prefect.flow-run.pull-step.executed"
+        first_payload = first_event.payload
+        assert first_payload["id"] == "step-one"
+        assert first_payload["index"] == 0
+
+        # Second event should be failure
+        second_event = events[1]
+        assert second_event.event == "prefect.flow-run.pull-step.failed"
+        second_payload = second_event.payload
+        assert second_payload["id"] == "step-two"
+        assert second_payload["index"] == 1
+        assert second_payload["step_name"] == "run_shell_script"
+        assert second_payload["inputs"]["script"] == "boom"
+
+    @pytest.mark.usefixtures("clean_asserting_events_client")
+    async def test_run_steps_does_not_expose_secrets_in_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from prefect.events.clients import AssertingEventsClient
+
+        flow_run_id = str(uuid.uuid4())
+        monkeypatch.setenv("PREFECT__FLOW_RUN_ID", flow_run_id)
+        monkeypatch.setenv("SECRET_ENV_VAR", "super-secret-value")
+        monkeypatch.setattr(
+            "prefect.events.clients.PrefectEventsClient",
+            AssertingEventsClient,
+        )
+
+        api_key_name = f"api-key-{uuid.uuid4()}"
+        await Secret(value="my-secret-api-key").save(name=api_key_name)
+
+        db_password_name = f"db_password_{uuid.uuid4()}"
+        async with get_client() as client:
+            await client._client.post(
+                "/variables/",
+                json={"name": db_password_name, "value": "secret-password"},
+            )
+
+        def fake_step(
+            *, script: str, api_key: str, password: str, env_secret: str
+        ) -> dict[str, str]:
+            assert api_key == "my-secret-api-key"
+            assert password == "secret-password"
+            assert env_secret == "super-secret-value"
+            return {"result": "success"}
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            fake_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "echo 'test'",
+                    "api_key": f"{{{{ prefect.blocks.secret.{api_key_name} }}}}",
+                    "password": f"{{{{ prefect.variables.{db_password_name} }}}}",
+                    "env_secret": "{{ $SECRET_ENV_VAR }}",
+                    "id": "step-with-secrets",
+                }
+            }
+        ]
+
+        output = await run_steps(steps, {})
+
+        assert output["result"] == "success"
+        assert AssertingEventsClient.last
+        events = [
+            e
+            for client in AssertingEventsClient.all
+            if hasattr(client, "events")
+            for e in client.events
+            if f"prefect.flow-run.{flow_run_id}" in str(e.resource)
+        ]
+        assert len(events) == 1
+        event = events[0]
+        assert event.event == "prefect.flow-run.pull-step.executed"
+
+        # Payload is the step itself, not a list of steps
+        payload = event.payload
+        assert payload["index"] == 0
+        assert payload["id"] == "step-with-secrets"
+
+        step_inputs = payload["inputs"]
+        assert (
+            step_inputs["api_key"] == f"{{{{ prefect.blocks.secret.{api_key_name} }}}}"
+        )
+        assert (
+            step_inputs["password"] == f"{{{{ prefect.variables.{db_password_name} }}}}"
+        )
+        assert step_inputs["env_secret"] == "{{ $SECRET_ENV_VAR }}"
+
+        assert "my-secret-api-key" not in str(payload)
+        assert "secret-password" not in str(payload)
+        assert "super-secret-value" not in str(payload)
+
+    @pytest.mark.usefixtures("clean_asserting_events_client")
+    async def test_run_steps_includes_deployment_as_related_resource(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from prefect.events.clients import AssertingEventsClient
+
+        flow_run_id = str(uuid.uuid4())
+        deployment_id = str(uuid.uuid4())
+        monkeypatch.setenv("PREFECT__FLOW_RUN_ID", flow_run_id)
+        monkeypatch.setattr(
+            "prefect.events.clients.PrefectEventsClient",
+            AssertingEventsClient,
+        )
+
+        def fake_step(*, script: str) -> dict[str, str]:
+            return {"result": "success"}
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            fake_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "echo 'test'",
+                    "id": "test-step",
+                }
+            }
+        ]
+
+        mock_deployment = Mock()
+        mock_deployment.id = deployment_id
+
+        output = await run_steps(steps, {}, deployment=mock_deployment)
+
+        assert output["result"] == "success"
+        assert AssertingEventsClient.last
+        events = [
+            e
+            for client in AssertingEventsClient.all
+            if hasattr(client, "events")
+            for e in client.events
+            if f"prefect.flow-run.{flow_run_id}" in str(e.resource)
+        ]
+        assert len(events) == 1
+        event = events[0]
+        assert event.event == "prefect.flow-run.pull-step.executed"
+
+        related = event.related
+        assert related is not None
+        assert len(related) == 1
+        assert dict(related[0]) == {
+            "prefect.resource.id": f"prefect.deployment.{deployment_id}",
+            "prefect.resource.role": "deployment",
+        }
+
     async def test_run_steps_runs_multiple_steps(self):
         steps = [
             {
@@ -390,6 +739,90 @@ class TestRunSteps:
         await run_steps(steps, {}, print_function=mock_print)
         mock_print.assert_any_call("this is a warning")
 
+    async def test_run_steps_uses_print_function_without_logger(self):
+        """Test that run_steps uses print_function (not logger) when no logger
+        is provided, and does not emit lifecycle log messages."""
+        mock_print = MagicMock()
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "echo 'hello'",
+                }
+            },
+        ]
+
+        await run_steps(steps, {}, print_function=mock_print)
+
+        # print_function should have been called with the step name
+        mock_print.assert_any_call(" > Running run_shell_script step...")
+
+    async def test_run_steps_logs_lifecycle_with_provided_logger(self):
+        """Test that run_steps uses a provided logger for lifecycle messages."""
+        mock_logger = MagicMock()
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "echo 'test'",
+                }
+            },
+        ]
+
+        await run_steps(steps, {}, logger=mock_logger)
+
+        # Verify the provided logger was used for lifecycle messages
+        start_logged = any(
+            "Executing deployment step: %s" in str(c)
+            for c in mock_logger.info.call_args_list
+        )
+        complete_logged = any(
+            "Deployment step '%s' completed successfully" in str(c)
+            for c in mock_logger.info.call_args_list
+        )
+        all_complete_logged = any(
+            "All deployment steps completed successfully" in str(c)
+            for c in mock_logger.info.call_args_list
+        )
+
+        assert start_logged, (
+            f"Expected start log, got: {mock_logger.info.call_args_list}"
+        )
+        assert complete_logged, (
+            f"Expected complete log, got: {mock_logger.info.call_args_list}"
+        )
+        assert all_complete_logged, (
+            f"Expected all-complete log, got: {mock_logger.info.call_args_list}"
+        )
+
+    async def test_run_steps_no_complete_log_on_failure(self, monkeypatch):
+        """Test that the all-complete log is NOT emitted when a step fails."""
+        mock_logger = MagicMock()
+
+        def failing_step(**kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "prefect.deployments.steps.run_shell_script",
+            failing_step,
+        )
+
+        steps = [
+            {
+                "prefect.deployments.steps.run_shell_script": {
+                    "script": "echo 'test'",
+                }
+            },
+        ]
+
+        with pytest.raises(StepExecutionError):
+            await run_steps(steps, {}, logger=mock_logger)
+
+        info_calls = [str(c) for c in mock_logger.info.call_args_list]
+        assert not any(
+            "All deployment steps completed successfully" in c for c in info_calls
+        )
+
 
 class MockCredentials:
     def __init__(
@@ -485,6 +918,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -505,16 +939,18 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=True,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
     async def test_git_clone_with_access_token(self, git_repository_mock):
-        await Secret(value="my-access-token").save(name="my-access-token")
+        token_name = f"my-access-token-{uuid.uuid4()}"
+        await Secret(value="my-access-token").save(name=token_name)
         await run_step(
             {
                 "prefect.deployments.steps.git_clone": {
                     "repository": "https://github.com/org/repo.git",
-                    "access_token": "{{ prefect.blocks.secret.my-access-token }}",
+                    "access_token": f"{{{{ prefect.blocks.secret.{token_name} }}}}",
                 }
             }
         )
@@ -525,24 +961,27 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
     async def test_git_clone_with_credentials(self, git_repository_mock):
+        slug = f"mockgitcredentials-{uuid.uuid4().hex[:8]}"
+
         class MockGitCredentials(Block):
+            _block_type_slug = slug
             username: str
             password: str
 
+        creds_name = f"my-credentials-{uuid.uuid4()}"
         await MockGitCredentials(username="marvin42", password="hunter2").save(
-            name="my-credentials"
+            name=creds_name
         )
         await run_step(
             {
                 "prefect.deployments.steps.git_clone": {
                     "repository": "https://github.com/org/repo.git",
-                    "credentials": (
-                        "{{ prefect.blocks.mockgitcredentials.my-credentials }}"
-                    ),
+                    "credentials": (f"{{{{ prefect.blocks.{slug}.{creds_name} }}}}"),
                 }
             }
         )
@@ -553,6 +992,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -590,6 +1030,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
 
         assert mock_git_repo.call_args_list == [expected_call]
@@ -607,6 +1048,7 @@ class TestGitCloneStep:
             commit_sha="1234567890",
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -622,6 +1064,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -645,6 +1088,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=True,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -669,6 +1113,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -725,6 +1170,7 @@ class TestGitCloneStep:
             commit_sha="1234567890",
             include_submodules=False,
             directories=None,
+            name=None,
         )
         git_repository_mock.return_value.pull_code.assert_awaited_once()
 
@@ -769,6 +1215,7 @@ class TestGitCloneStep:
             commit_sha=None,
             include_submodules=False,
             directories=None,
+            name=None,
         )
         assert mock_git_repo.call_args_list == [expected_call]
 
@@ -948,6 +1395,100 @@ class TestRunShellScript:
         assert result["stderr"] == ""
 
 
+class TestRunShellScriptShellMode:
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Pipe operator test requires Unix shell"
+    )
+    async def test_pipe_operator(self, capsys):
+        result = await run_shell_script(
+            "echo hello world | tr '[:lower:]' '[:upper:]'",
+            shell=True,
+            stream_output=True,
+        )
+        assert result["stdout"] == "HELLO WORLD"
+        assert result["stderr"] == ""
+
+        out, _ = capsys.readouterr()
+        assert out.strip() == "HELLO WORLD"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Redirect test requires Unix shell"
+    )
+    async def test_output_redirect(self, tmp_path):
+        outfile = tmp_path / "output.txt"
+        await run_shell_script(
+            f"echo redirected > {outfile}",
+            shell=True,
+            stream_output=False,
+        )
+        assert outfile.read_text().strip() == "redirected"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Logical operator test requires Unix shell"
+    )
+    async def test_logical_and_operator(self):
+        result = await run_shell_script(
+            "echo first && echo second",
+            shell=True,
+            stream_output=False,
+        )
+        assert result["stdout"] == "first\nsecond"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Shell mode test requires Unix shell"
+    )
+    async def test_shell_mode_with_env(self):
+        result = await run_shell_script(
+            "echo $MY_VAR | tr '[:lower:]' '[:upper:]'",
+            shell=True,
+            env={"MY_VAR": "hello"},
+            stream_output=False,
+        )
+        assert result["stdout"] == "HELLO"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Shell mode test requires Unix shell"
+    )
+    async def test_shell_mode_with_directory(self):
+        parent_dir = str(Path.cwd().parent)
+        result = await run_shell_script(
+            "pwd | cat",
+            shell=True,
+            directory=parent_dir,
+            stream_output=False,
+        )
+        assert result["stdout"] == parent_dir
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Shell mode test requires Unix shell"
+    )
+    async def test_shell_mode_multiline(self):
+        script = """
+        echo first | tr '[:lower:]' '[:upper:]'
+        echo second | tr '[:lower:]' '[:upper:]'
+        """
+        result = await run_shell_script(script, shell=True, stream_output=False)
+        assert result["stdout"] == "FIRST\nSECOND"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Shell mode test requires Unix shell"
+    )
+    async def test_shell_mode_failure_raises(self):
+        with pytest.raises(RuntimeError, match="failed with error code"):
+            await run_shell_script(
+                "exit 1",
+                shell=True,
+                stream_output=False,
+            )
+
+    async def test_default_shell_false_preserves_existing_behavior(self, capsys):
+        result = await run_shell_script("echo Hello World", stream_output=True)
+        assert result["stdout"] == "Hello World"
+
+        out, _ = capsys.readouterr()
+        assert out.strip() == "Hello World"
+
+
 class MockProcess:
     def __init__(self, returncode=0):
         self.returncode = returncode
@@ -1038,6 +1579,16 @@ class TestPipInstallRequirements:
             mock_stream_capture,
         )
 
+        # Mock GitRepository so the git_clone step doesn't make real network
+        # calls, which can fail due to transient GitHub outages.
+        git_repository_mock = MagicMock()
+        git_repository_mock.return_value.pull_code = AsyncMock()
+        git_repository_mock.return_value.destination = tmp_path / "hello-projects"
+        monkeypatch.setattr(
+            "prefect.deployments.steps.pull.GitRepository",
+            git_repository_mock,
+        )
+
         steps = [
             {
                 "prefect.deployments.steps.git_clone": {
@@ -1114,6 +1665,7 @@ class TestPullWithBlock:
     @pytest.fixture
     async def test_block(self, monkeypatch, tmp_path):
         monkeypatch.chdir(str(tmp_path))  # ensures never writes to active directory
+        doc_name = f"test-block-{uuid.uuid4().hex[:8]}"
 
         class FakeStorageBlock(Block):
             _block_type_slug = "fake-storage-block"
@@ -1132,7 +1684,7 @@ class TestPullWithBlock:
                 (Path(local_path) / "flows.py").write_text(self.code)
 
         block = FakeStorageBlock()
-        await block.save("test-block")
+        await block.save(doc_name)
         return block
 
     async def test_normal_operation(self, test_block: Block):
@@ -1180,7 +1732,8 @@ class TestPullWithBlock:
                 }
             )
 
-        assert "Unable to load block 'in-the/wind'" in caplog.text
+        assert "Failed to load storage block with slug in-the/wind" in caplog.text
+        assert "Verify the block exists and you have access to it" in caplog.text
 
     async def test_incorrect_type_of_block(self, caplog):
         """
@@ -1188,12 +1741,15 @@ class TestPullWithBlock:
         have a `get_directory` method, `run_step` should raise and log
         a message.
         """
+        slug = f"wrong-{uuid.uuid4().hex[:8]}"
+        doc_name = f"test-block-{uuid.uuid4().hex[:8]}"
 
         class Wrong(Block):
+            _block_type_slug = slug
             square_peg: str = "round_hole"
 
         block = Wrong()
-        await block.save("test-block")
+        await block.save(doc_name)
 
         with pytest.raises(ValueError):
             await run_step(

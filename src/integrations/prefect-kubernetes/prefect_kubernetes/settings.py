@@ -32,6 +32,16 @@ Namespaces = Annotated[
 class KubernetesObserverSettings(PrefectBaseSettings):
     model_config = build_settings_config(("integrations", "kubernetes", "observer"))
 
+    enabled: bool = Field(
+        default=True,
+        description="Whether the Kubernetes observer is enabled to watch for Prefect-submitted Kubernetes pod and job events.",
+    )
+
+    replicate_pod_events: bool = Field(
+        default=True,
+        description="Whether the Kubernetes observer should replicate Prefect-submitted Kubernetes pod events, which can be used for Prefect Automations.",
+    )
+
     namespaces: Namespaces = Field(
         default_factory=set,
         description="The namespaces to watch for Prefect-submitted Kubernetes "
@@ -44,6 +54,57 @@ class KubernetesObserverSettings(PrefectBaseSettings):
         "Prefect-submitted Kubernetes jobs and pods. If not provided, the watch will "
         "include all pods and jobs with the `prefect.io/flow-run-id` label. Labels "
         "should be provided in the format `key=value`.",
+    )
+
+    startup_event_concurrency: int = Field(
+        default=5,
+        description="Maximum number of concurrent API calls when checking for "
+        "duplicate events during observer startup. This helps prevent overloading "
+        "the API server when there are many existing pods/jobs in the cluster.",
+    )
+
+    forward_crashed_run_logs: bool = Field(
+        default=True,
+        description="Whether to fetch and forward container logs for flow runs "
+        "that crashed before establishing connectivity to the Prefect server "
+        "(e.g., OOMKilled during import, bad entrypoint, missing dependencies).",
+    )
+
+    forward_crashed_run_logs_tail_lines: int = Field(
+        default=500,
+        ge=1,
+        description="Number of tail lines to fetch from crashed pod containers "
+        "when forwarding logs.",
+    )
+
+
+class KubernetesWorkerCreateJobRetrySettings(PrefectBaseSettings):
+    model_config = build_settings_config(
+        ("integrations", "kubernetes", "worker", "create_job_retry")
+    )
+
+    max_retries: int = Field(
+        default=3,
+        ge=1,
+        description="The maximum number of attempts to retry creating a Kubernetes job before giving up.",
+    )
+
+    delay_seconds: int = Field(
+        default=1,
+        ge=0,
+        description="The fixed delay in seconds between retries when creating a Kubernetes job.",
+    )
+
+    jitter_min_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="The minimum jitter in seconds to add to the delay between retries when creating a Kubernetes job.",
+    )
+
+    jitter_max_seconds: int = Field(
+        default=3,
+        ge=0,
+        description="The maximum jitter in seconds to add to the delay between retries when creating a Kubernetes job.",
     )
 
 
@@ -88,6 +149,11 @@ class KubernetesWorkerSettings(PrefectBaseSettings):
             "prefect_integrations_kubernetes_worker_add_tcp_keepalive",
             "prefect_kubernetes_worker_add_tcp_keepalive",
         ),
+    )
+
+    create_job_retry: KubernetesWorkerCreateJobRetrySettings = Field(
+        description="Settings for controlling retry behavior when creating Kubernetes jobs.",
+        default_factory=KubernetesWorkerCreateJobRetrySettings,
     )
 
 
