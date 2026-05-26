@@ -55,7 +55,7 @@ jobs:
       - name: Create pull request (clean merge)
         if: inputs.dry_run == false && steps.prepare.outputs.conflicts == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PREFECT_REPO_PAT }}
           BASE_TAG: ${{ inputs.base_tag }}
           PREP_BRANCH: ${{ steps.prepare.outputs.prep_branch }}
         run: |
@@ -86,7 +86,7 @@ jobs:
       - name: Create pull request (conflicts present)
         if: inputs.dry_run == false && steps.prepare.outputs.conflicts == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PREFECT_REPO_PAT }}
           BASE_TAG: ${{ inputs.base_tag }}
           PREP_BRANCH: ${{ steps.prepare.outputs.prep_branch }}
         run: |
