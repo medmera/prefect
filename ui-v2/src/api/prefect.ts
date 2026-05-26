@@ -3144,6 +3144,8 @@ export interface components {
              * @default 60
              */
             request_timeout: number;
+            /** @description Settings for interacting with the Prefect API using IAP. */
+            iap?: components["schemas"]["IAPSettings"];
         };
         /** Artifact */
         Artifact: {
@@ -8404,6 +8406,34 @@ export interface components {
              */
             sum_estimated_lateness: number;
         };
+        /**
+         * IAPSettings
+         * @description Settings for interacting with the Prefect API using IAP
+         */
+        IAPSettings: {
+            /**
+             * Enabled
+             * @description Whether to enable IAP authentication. If enabled, the client will use IAP to authenticate with the Prefect API.
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Client Id Gcp Secret Version
+             * @description The name of the GCP secret to use for the client ID.
+             */
+            client_id_gcp_secret_version?: string | null;
+            /**
+             * Impersonate Service Account
+             * @description The email of the service account to impersonate for the API when using the service-account mode.
+             */
+            impersonate_service_account?: string | null;
+            /**
+             * Auth Header Name
+             * @description The name of the HTTP header to use for IAP authentication.
+             * @default Authorization
+             */
+            auth_header_name: string;
+        };
         /** InternalSettings */
         InternalSettings: {
             /**
@@ -8444,7 +8474,7 @@ export interface components {
          */
         IntervalSchedule: {
             /** Interval */
-            interval: number;
+            interval: number | string;
             /**
              * Anchor Date
              * Format: date-time
