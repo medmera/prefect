@@ -19,6 +19,8 @@ from prefect.settings import (
 from prefect.testing.cli import invoke_and_assert
 from prefect.utilities.asyncutils import run_sync_in_worker_thread
 
+pytestmark = pytest.mark.clear_db
+
 
 @pytest.fixture
 def interactive_console(monkeypatch: pytest.MonkeyPatch):
@@ -1529,6 +1531,15 @@ class TestDeploymentList:
         parsed = json.loads(result.stdout.strip())
         descriptions = [d["description"] for d in parsed if d.get("description")]
         assert any("\n" in desc for desc in descriptions)
+
+    @pytest.mark.usefixtures("setup_many_deployments")
+    def test_list_deployments_by_created(self):
+        """Regression test for https://github.com/PrefectHQ/prefect/issues/21768"""
+        invoke_and_assert(
+            ["deployment", "ls", "--by-created"],
+            expected_code=0,
+            expected_output_contains="Deployments",
+        )
 
     @pytest.mark.usefixtures("setup_many_deployments")
     def test_list_deployments_output_is_not_json(self):

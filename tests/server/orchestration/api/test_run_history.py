@@ -12,6 +12,8 @@ from prefect.server import models
 from prefect.server.schemas import actions, core, responses, states
 from prefect.server.schemas.states import StateType
 
+pytestmark = pytest.mark.clear_db
+
 
 def datetime_range(
     start: datetime, end: datetime, interval: timedelta
@@ -289,7 +291,7 @@ async def test_history_returns_maximum_items(client, route):
     assert len(response.json()) == 500
 
     intervals = [
-        Instant.parse_iso(r["interval_start"]).py_datetime() for r in response.json()
+        Instant.parse_iso(r["interval_start"]).to_stdlib() for r in response.json()
     ]
     assert min(intervals) == dt
     assert max(intervals) == dt + timedelta(minutes=499)

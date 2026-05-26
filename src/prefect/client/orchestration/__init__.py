@@ -115,6 +115,8 @@ from prefect.client.schemas.objects import (
     FlowRunResult,
     Parameter,
     Constant,
+    ServerDefaultResultStorage,
+    ServerDefaultResultStorageUpdate,
     TaskRunPolicy,
     WorkQueue,
     WorkQueueStatusDetail,
@@ -141,7 +143,7 @@ from prefect.settings import (
 )
 from prefect.types._datetime import now
 
-from prefect.client._version_checking import (
+from prefect._internal.version_checking import (
     _api_version_check_key,
     _cache_api_version_check,
     _clear_api_version_check_cache,
@@ -1094,6 +1096,27 @@ class PrefectClient(
         res = await self._client.get("/admin/version")
         return res.json()
 
+    async def read_server_default_result_storage(
+        self,
+    ) -> ServerDefaultResultStorage:
+        response = await self._client.get("/admin/storage")
+        return ServerDefaultResultStorage.model_validate(response.json())
+
+    async def update_server_default_result_storage(
+        self,
+        default_result_storage_block_id: UUID,
+    ) -> ServerDefaultResultStorage:
+        response = await self._client.put(
+            "/admin/storage",
+            json=ServerDefaultResultStorageUpdate(
+                default_result_storage_block_id=default_result_storage_block_id
+            ).model_dump(mode="json"),
+        )
+        return ServerDefaultResultStorage.model_validate(response.json())
+
+    async def clear_server_default_result_storage(self) -> None:
+        await self._client.delete("/admin/storage")
+
     def client_version(self) -> str:
         return prefect.__version__
 
@@ -1465,6 +1488,25 @@ class SyncPrefectClient(
     def api_version(self) -> str:
         res = self._client.get("/admin/version")
         return res.json()
+
+    def read_server_default_result_storage(self) -> ServerDefaultResultStorage:
+        response = self._client.get("/admin/storage")
+        return ServerDefaultResultStorage.model_validate(response.json())
+
+    def update_server_default_result_storage(
+        self,
+        default_result_storage_block_id: UUID,
+    ) -> ServerDefaultResultStorage:
+        response = self._client.put(
+            "/admin/storage",
+            json=ServerDefaultResultStorageUpdate(
+                default_result_storage_block_id=default_result_storage_block_id
+            ).model_dump(mode="json"),
+        )
+        return ServerDefaultResultStorage.model_validate(response.json())
+
+    def clear_server_default_result_storage(self) -> None:
+        self._client.delete("/admin/storage")
 
     def client_version(self) -> str:
         return prefect.__version__
