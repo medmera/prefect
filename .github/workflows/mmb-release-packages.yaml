@@ -170,14 +170,13 @@ jobs:
         run: ./scripts/create-mmb-release-tags.sh
 
   release-docker-images:
-    name: Docker (${{ matrix.python-version }} - ${{ matrix.image-type }})
+    name: Docker (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
     if: ${{ inputs.release_docker }}
     strategy:
       matrix:
-        image-type: ["", "poetry-gcloud"]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
 
     steps:
@@ -216,8 +215,7 @@ jobs:
             "${{ inputs.dry_run }}" \
             "true" \
             "${{ inputs.force_release_version }}" \
-            "${{ matrix.python-version }}" \
-            "${{ matrix.image-type }}"
+            "${{ matrix.python-version }}"
 
       - name: Reauthenticate to Google Cloud (Workload Identity)
         id: gcp_auth_push
@@ -243,8 +241,7 @@ jobs:
             "${{ inputs.dry_run }}" \
             "false" \
             "${{ inputs.force_release_version }}" \
-            "${{ matrix.python-version }}" \
-            "${{ matrix.image-type }}"
+            "${{ matrix.python-version }}"
 
       - name: Create Docker release summary
         if: always()

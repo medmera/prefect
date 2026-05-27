@@ -10,7 +10,6 @@ DRY_RUN="${4:-false}"
 NO_PUSH="${5:-false}"
 FORCE_RELEASE_VERSION="${6:-false}"
 SINGLE_PYTHON_VERSION="${7:-}"
-IMAGE_TYPE="${8:-}"
 
 # Docker build configuration
 PYTHON_VERSIONS=("3.9" "3.10" "3.11" "3.12" "3.13")
@@ -292,10 +291,6 @@ generate_tags() {
     
     # Build base tag
     local tag="${PREFECT_VERSION}-python${python_version}${flavor}"
-    # Append image type at the end when provided (e.g., 3.4.12.dev2-python3.12-poetry-gcloud)
-    if [[ -n "$IMAGE_TYPE" ]]; then
-        tag+="-${IMAGE_TYPE}"
-    fi
     
     # Version-specific tag
     tags+=("${base_name}:${tag}")
@@ -324,11 +319,7 @@ build_and_push_image() {
     if [[ "$image" == "prefect-client" ]]; then
         dockerfile="client/Dockerfile"
     else
-        if [[ -n "$IMAGE_TYPE" ]]; then
-            dockerfile="Dockerfile.${IMAGE_TYPE}"
-        else
-            dockerfile="Dockerfile"
-        fi
+        dockerfile="Dockerfile"
     fi
     
     build_args+=("--build-arg" "PYTHON_VERSION=$python_version")
@@ -542,7 +533,6 @@ main() {
     log "Platforms: $PLATFORMS"
     log "Dry run: $DRY_RUN"
     log "No push: $NO_PUSH"
-    log "Image type: ${IMAGE_TYPE:-<default>}"
     
     PREFECT_VERSION=$(get_version)
     log "Prefect version: $PREFECT_VERSION"
@@ -597,7 +587,7 @@ main() {
 
 # Show usage if help is requested
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [DRY_RUN] [NO_PUSH] [FORCE_RELEASE_VERSION] [SINGLE_PYTHON_VERSION] [IMAGE_TYPE]"
+    echo "Usage: $0 [PROJECT_ID] [REGION] [REPO_NAME] [DRY_RUN] [NO_PUSH] [FORCE_RELEASE_VERSION] [SINGLE_PYTHON_VERSION]"
     echo ""
     echo "Build and publish Prefect Docker images to GCP Artifact Registry"
     echo "Uses clean git tag versions instead of dirty development versions"
@@ -610,7 +600,6 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  NO_PUSH                Build locally without pushing to registry (optional, default: 'false', set to 'true' to skip push)"
     echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
     echo "  SINGLE_PYTHON_VERSION  Build only for specific Python version (optional, e.g., '3.11'). If not specified, builds for all versions."
-    echo "  IMAGE_TYPE            Suffix of Dockerfile to use (optional). Example: 'poetry-gcloud' uses 'Dockerfile.poetry-gcloud'.\n                         If empty, uses 'Dockerfile'. Also prefixes the image tag as '<image-type>-<prefect-version>-python<version>'."
     echo ""
     echo "Version handling:"
     echo "  - If FORCE_RELEASE_VERSION=true: Only tags matching x.y.z (e.g., 3.4.11) are allowed."
@@ -628,8 +617,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  $0 my-project us-west1 my-docker-repo                             # Custom region/repo, all versions"
     echo "  $0 my-project us-west1 my-docker-repo true                        # Dry run, all versions"
     echo "  $0 my-project us-west1 my-docker-repo false true                  # Build locally without pushing"
-    echo "  $0 my-project us-central1 prefect-docker false false '' 3.11      # Build only Python 3.11 with default Dockerfile"
-    echo "  $0 my-project us-central1 prefect-docker false false '' 3.12 poetry-gcloud  # Build using Dockerfile.poetry-gcloud"
+    echo "  $0 my-project us-central1 prefect-docker false false '' 3.11      # Build only Python 3.11"
     echo ""
     echo "Note: This script builds multi-platform images (amd64/arm64) which requires"
     echo "      Docker buildx and may take significant time and resources."
