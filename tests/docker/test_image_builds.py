@@ -168,7 +168,7 @@ def test_from_prefect_image(docker: DockerClient, prefect_base_image: str):
         image_id = image.build()
 
     output = docker.containers.run(image_id, remove=True).decode().strip()
-    assert output == prefect.__version__
+    assert output.removesuffix(".dirty") == prefect.__version__
 
 
 def test_copying_file(contexts: Path, docker: DockerClient, prefect_base_image: str):

@@ -1,5 +1,7 @@
 # MMB Release Process
 
+> **Full guide:** see [`MMB_DOCUMENTATION.md`](../MMB_DOCUMENTATION.md) for local setup (`just`, `gh`), CI vs local responsibilities, and troubleshooting.
+
 This document describes how to prepare and publish new MMB releases of Prefect
 and its integration packages (e.g. `prefect-gcp`) to the internal GCP Artifact
 Registry.
@@ -24,17 +26,18 @@ while tracking upstream Prefect releases.
 ## Workflow overview
 
 ```
-1. mmb-sync-main          Sync fork main and all tags from upstream
+1. mmb-sync-main (GitHub Actions)   Sync fork main and all tags from upstream
         ↓
-2. mmb-prepare-release    Create release-prep/<tag>, merge upstream tag, open PR
+2. mmb-prepare-release (local)      Create release-prep/<tag>, merge upstream tag, open PR
         ↓
-3. Review & merge PR      Resolve any conflicts, then merge into release
+3. Review & merge PR                CI runs on PR; merge into release when green
         ↓
-4. mmb-release-packages   Build and publish Python packages + Docker images
+4. mmb-release-packages (GitHub Actions)   Build and publish Python packages + Docker images
 ```
 
-All four steps are GitHub Actions workflows that can be dispatched from the
-**Actions** tab in GitHub.
+Steps 1, 3 (CI), and 4 run in GitHub Actions. Step 2 runs locally with your
+git and `gh` credentials so you can resolve merge conflicts interactively before
+pushing.
 
 ---
 
@@ -53,54 +56,77 @@ Run this before preparing a release so that the new tags are available.
 
 ---
 
-### 2. Prepare release (`mmb-prepare-release`)
+### 2. Prepare release (local)
 
-Dispatch **MMB - Prepare Release** from the Actions tab with:
+Run from a clean working tree in your local clone:
 
-| Input | Example | Description |
-|-------|---------|-------------|
-| `base_tag` | `3.4.25` | The upstream Prefect tag to adopt |
-| `dry_run` | `false` | Set `true` to preview without making changes |
+```bash
+# Preview first
+./scripts/mmb-prepare-release.sh --dry-run 3.4.25
 
-What the workflow does:
+# Create branch, merge, resolve conflicts, push, and open PR
+./scripts/mmb-prepare-release.sh 3.4.25
 
-1. Creates a new branch `release-prep/3.4.25` from the current `release` HEAD
-2. Runs `git merge 3.4.25` — merging the upstream tag into our branch
-3. Pushes `release-prep/3.4.25` and opens a PR → `release`
+# Or via just
+just mmb-prepare-release 3.4.25
+```
+
+**Prerequisites:**
+
+- Clean working tree (commit or stash first)
+- `gh` CLI installed and authenticated (`gh auth login`)
+- Upstream tags synced via step 1
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview commits and branch plan without making changes |
+| `--no-pr` | Push the branch but skip `gh pr create` |
+| `--no-open` | Create the PR but do not open it in a browser |
+
+What the script does:
+
+1. Fetches `upstream` and `origin` tags
+2. Creates `release-prep/3.4.25` from the current `origin/release` HEAD
+3. Runs `git merge 3.4.25`
+4. If conflicts occur, pauses for interactive resolution (editor, `git mergetool`)
+5. Pushes the branch and opens a PR → `release` via `gh`
 
 **Clean merge:** the PR is ready to review and merge immediately.
 
-**Conflicts:** the workflow commits the conflict markers so the branch can be
-pushed, marks the PR with the `needs-conflict-resolution` label, and includes
-resolution instructions in the PR body.
+**Conflicts:** resolve them locally before the branch is pushed. The script
+validates that no conflict markers or unmerged paths remain, then commits and
+pushes a clean merge commit.
 
-> Use **dry run** first to see which upstream commits would be merged and whether
-> conflicts are likely.
+> Use `--dry-run` first to see which upstream commits would be merged.
+
+For headless automation (no interactive conflict resolution), use
+`./scripts/prepare-release-branch.sh` instead. It exits on conflicts unless
+`--commit-conflicts` is passed.
 
 ---
 
 ### 3. Review and merge the PR
 
-Open the PR created by step 2.
+Open the PR created by step 2 (or the URL printed by the script).
 
 **No conflicts:** review the diff (upstream changes merged cleanly with MMB
-changes) and merge.
+changes) and merge once **MMB - Unit tests** CI is green.
 
-**With conflicts:** the commit on the branch contains raw conflict markers
-(`<<<<<<<`, `=======`, `>>>>>>>`). Resolve them:
+**With conflicts:** these should already be resolved before push. If you need
+to make further changes after the PR is opened:
 
 ```bash
 git fetch origin
 git checkout release-prep/3.4.25
 
-# Edit each conflicted file to resolve markers, then:
-git add <resolved-files>
-git commit -m "resolve conflicts merging 3.4.25"
+# Make edits, then:
+git add <files>
+git commit -m "address review feedback for 3.4.25 merge"
 git push origin release-prep/3.4.25
 ```
 
-Once the PR is green and conflicts are resolved, merge it. The `release` branch
-now contains the upstream changes plus all MMB customisations.
+Once the PR is green, merge it. The `release` branch now contains the upstream
+changes plus all MMB customisations.
 
 The `release-prep/<tag>` branch can be deleted after the PR is merged.
 
@@ -136,6 +162,32 @@ current `release` branch HEAD:
 After merging a new upstream tag via the prepare-release PR, `git describe`
 automatically picks up the new version. No manual tagging is required.
 
+### MMB release tags
+
+After a successful publish, the **MMB - Release Packages** workflow creates
+annotated git tags on the released commit to mark exactly what was published
+internally:
+
+| Published package | Tag created |
+|-------------------|-------------|
+| `prefect` core | `3.4.25-mmb` |
+| `prefect-gcp` | `prefect-gcp-0.6.17-mmb` |
+| `prefect-aws` | `prefect-aws-0.5.13-mmb` |
+| (all integrations) | `{package}-{version}-mmb` |
+
+Tags are created and pushed by `scripts/create-mmb-release-tags.sh` using the
+`PREFECT_REPO_PAT` secret. A few important behaviors:
+
+- **Per-package tagging:** only packages that were successfully uploaded receive
+  a tag. If a single integration fails to upload while others succeed, only the
+  successful ones are tagged.
+- **Dry runs never create tags.** When the workflow is dispatched with
+  `dry_run=true`, the tag step is skipped entirely.
+- **Idempotent re-runs:** if a tag already points at the same commit (e.g. when
+  retrying a partially failed run), the script skips it silently. If a tag
+  already exists at a *different* commit, the step fails with an error rather
+  than silently moving the tag.
+
 ---
 
 ## Adding MMB-specific changes
@@ -162,15 +214,29 @@ upstream merges.
 Run `mmb-sync-main` first to pull the latest upstream tags into this fork.
 
 **"Branch release-prep/X.Y.Z already exists"**
-A previous prepare-release run left a branch behind. Delete it:
+The local script resets an existing prep branch automatically. To start fresh,
+delete the remote branch first:
 ```bash
 git push origin --delete release-prep/X.Y.Z
 ```
-Then re-run the workflow.
+Then re-run `./scripts/mmb-prepare-release.sh X.Y.Z`.
 
 **"Tag is already an ancestor of release"**
 The `release` branch already contains this tag (it was merged in a previous
 cycle). Either the release is already prepared, or you need a newer tag.
+
+**"gh is not authenticated"**
+Run `gh auth login` and ensure you have permission to push branches and create
+PRs on the fork.
+
+**"Tag X.Y.Z-mmb already exists at a DIFFERENT commit"**
+A previous release run already tagged a different commit. If you intentionally
+want to re-tag (e.g. after amending the release branch), delete the old tag
+first:
+```bash
+git push origin --delete 3.4.25-mmb
+```
+Then re-run the workflow. The script will never silently move an existing tag.
 
 **Build produces wrong version for an integration package**
 Verify that the integration tag (e.g. `prefect-gcp-0.6.17`) is an ancestor of

@@ -92,24 +92,13 @@ COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /bin/uv
 # Copy the repository in; requires full git history for versions to generate correctly
 COPY . ./
 
-# Capture the clean version before UI bundle injection makes the tree dirty, then
-# freeze it in pyproject.toml.  Injecting the UI bundles into gitignored paths
-# makes git report an untracked-files dirty state, which causes versioningit to
-# append ".dirty" to the version string during the later `uv build --sdist` call.
-# By pre-writing _build_info.py (via --write) and switching pyproject.toml from a
-# dynamic VCS version to the captured static value, hatchling skips the versioningit
-# VCS lookup entirely and the sdist carries the same clean version that the test-host
-# editable install sees.
-RUN PREFECT_VERSION="$(uv run --no-project --with versioningit python -m versioningit --write .)" && \
-    sed -i 's/dynamic = \["version"\]/version = "'"${PREFECT_VERSION}"'"/' pyproject.toml
-
 # Package the V1 UI into the distributable.
 COPY --from=ui-builder /opt/ui/dist ./src/prefect/server/ui
 
 # Package the V2 UI into the distributable.
 COPY --from=ui-v2-builder /opt/ui-v2/dist ./src/prefect/server/ui-v2
 
-# Create a source distributable archive; ensuring existing dists are removed first.
+# Create a source distributable archive; ensuring existing dists are removed first
 RUN rm -rf dist && PREFECT_REQUIRE_PACKAGED_UI_BUNDLES=1 uv build --sdist --out-dir dist
 RUN mv "dist/prefect-"*".tar.gz" "dist/prefect.tar.gz"
 

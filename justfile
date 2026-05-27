@@ -103,6 +103,11 @@ generate-docs:
     @just generate-examples
     @echo "Documentation generation complete!"
 
+# Prepare an MMB upstream merge release PR locally
+# Usage: just mmb-prepare-release 3.4.25
+mmb-prepare-release TAG *FLAGS:
+    ./scripts/mmb-prepare-release.sh {{FLAGS}} {{TAG}}
+
 # Prepare release notes from a GitHub draft release
 # Usage: just prepare-release 3.5.0
 prepare-release VERSION:

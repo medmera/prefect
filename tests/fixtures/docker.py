@@ -33,6 +33,15 @@ def _safe_remove_container(container: Container):
         pass
 
 
+def _prefect_versions_match(image_version: str, expected: str) -> bool:
+    if image_version == expected:
+        return True
+
+    # Docker image builds inject UI bundles into gitignored paths before computing
+    # the sdist version, which causes versioningit to append a ".dirty" suffix.
+    return image_version.removesuffix(".dirty") == expected.removesuffix(".dirty")
+
+
 @pytest.fixture(scope="session")
 def docker(worker_id: str) -> Generator[DockerClient, None, None]:
     context = docker_client()
@@ -90,7 +99,7 @@ def prefect_base_image(pytestconfig: "pytest.Config", docker: DockerClient):
             image_name, ["prefect", "--version"], remove=True
         )
         image_version = output.decode().strip()
-        version_is_right = image_version == prefect.__version__
+        version_is_right = _prefect_versions_match(image_version, prefect.__version__)
 
     if not image_exists or not version_is_right:
         if pytestconfig.getoption("--disable-docker-image-builds"):
