@@ -44,11 +44,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     if: ${{ inputs.release_python }}
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      release_tags: ${{ steps.python_release.outputs.release_tags }}
+      script_exit_code: ${{ steps.python_release.outputs.script_exit_code }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.PREFECT_REPO_PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -80,7 +87,6 @@ jobs:
             "${{ inputs.build_integrations }}" \
             "${{ inputs.dry_run }}" \
             "${{ inputs.force_release_version }}"
-        continue-on-error: true
 
       - name: Create Python release summary
         if: always()
@@ -97,26 +103,32 @@ jobs:
 
           # Check if the script failed and why
           if [[ "${{ steps.python_release.outputs.script_failed }}" == "true" ]]; then
-            local exit_code="${{ steps.python_release.outputs.script_exit_code }}"
+            exit_code="${{ steps.python_release.outputs.script_exit_code }}"
             echo "⚠️ **Script completed with exit code: $exit_code**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            
-            # Interpret exit codes
+
             case $exit_code in
               1)
-                echo "This indicates some packages failed to upload, but the script handled the error gracefully." >> $GITHUB_STEP_SUMMARY
-                echo "Check the logs above for details on which packages succeeded and which failed." >> $GITHUB_STEP_SUMMARY
+                echo "Some packages failed to upload. Check the logs above for details on which packages succeeded and which failed." >> $GITHUB_STEP_SUMMARY
                 ;;
               2)
-                echo "This indicates a configuration or setup error." >> $GITHUB_STEP_SUMMARY
+                echo "A configuration or setup error occurred." >> $GITHUB_STEP_SUMMARY
                 ;;
               *)
-                echo "This indicates an unexpected error occurred." >> $GITHUB_STEP_SUMMARY
+                echo "An unexpected error occurred." >> $GITHUB_STEP_SUMMARY
                 ;;
             esac
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Note:** The workflow will continue even if some packages failed to upload." >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ job.status }}" == "success" ]]; then
+
+            release_tags="${{ steps.python_release.outputs.release_tags }}"
+            if [[ -n "$release_tags" ]]; then
+              echo "**Packages that were successfully uploaded (MMB tags will be created):**" >> $GITHUB_STEP_SUMMARY
+              IFS=',' read -ra tags <<< "$release_tags"
+              for tag in "${tags[@]}"; do
+                echo "- \`$tag\`" >> $GITHUB_STEP_SUMMARY
+              done
+            fi
+          elif [[ "${{ steps.python_release.outcome }}" == "success" ]]; then
             if [[ "${{ inputs.dry_run }}" == "true" ]]; then
               echo "✅ **Dry run completed successfully**" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
@@ -131,12 +143,31 @@ jobs:
               echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
               echo "pip install --index-url https://${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}-python.pkg.dev/${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}/${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}/simple/ prefect" >> $GITHUB_STEP_SUMMARY
               echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+              release_tags="${{ steps.python_release.outputs.release_tags }}"
+              if [[ -n "$release_tags" ]]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "**MMB release tags to be created:**" >> $GITHUB_STEP_SUMMARY
+                IFS=',' read -ra tags <<< "$release_tags"
+                for tag in "${tags[@]}"; do
+                  echo "- \`$tag\`" >> $GITHUB_STEP_SUMMARY
+                done
+              fi
             fi
           else
             echo "❌ **Python package release failed**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Check the job logs for detailed error information." >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: Create MMB release tags
+        if: >-
+          !cancelled() &&
+          inputs.dry_run != true &&
+          steps.python_release.outputs.release_tags != ''
+        env:
+          RELEASE_TAGS: ${{ steps.python_release.outputs.release_tags }}
+        run: ./scripts/create-mmb-release-tags.sh
 
   release-docker-images:
     name: Docker (${{ matrix.python-version }} - ${{ matrix.image-type }})

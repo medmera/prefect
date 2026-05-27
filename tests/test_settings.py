@@ -272,15 +272,32 @@ SUPPORTED_SETTINGS = {
     "PREFECT_EXPERIMENTS_PLUGINS_ALLOW": {
         "test_value": "plugin1,plugin2",
         "expected_value": {"plugin1", "plugin2"},
+        "legacy": True,
     },
     "PREFECT_EXPERIMENTS_PLUGINS_DENY": {
         "test_value": "plugin3",
         "expected_value": {"plugin3"},
+        "legacy": True,
     },
-    "PREFECT_EXPERIMENTS_PLUGINS_ENABLED": {"test_value": True},
-    "PREFECT_EXPERIMENTS_PLUGINS_SAFE_MODE": {"test_value": True},
-    "PREFECT_EXPERIMENTS_PLUGINS_SETUP_TIMEOUT_SECONDS": {"test_value": 30.0},
-    "PREFECT_EXPERIMENTS_PLUGINS_STRICT": {"test_value": True},
+    "PREFECT_EXPERIMENTS_PLUGINS_ENABLED": {"test_value": True, "legacy": True},
+    "PREFECT_EXPERIMENTS_PLUGINS_SAFE_MODE": {"test_value": True, "legacy": True},
+    "PREFECT_EXPERIMENTS_PLUGINS_SETUP_TIMEOUT_SECONDS": {
+        "test_value": 30.0,
+        "legacy": True,
+    },
+    "PREFECT_EXPERIMENTS_PLUGINS_STRICT": {"test_value": True, "legacy": True},
+    "PREFECT_PLUGINS_ALLOW": {
+        "test_value": "plugin1,plugin2",
+        "expected_value": {"plugin1", "plugin2"},
+    },
+    "PREFECT_PLUGINS_DENY": {
+        "test_value": "plugin3",
+        "expected_value": {"plugin3"},
+    },
+    "PREFECT_PLUGINS_ENABLED": {"test_value": True},
+    "PREFECT_PLUGINS_SAFE_MODE": {"test_value": True},
+    "PREFECT_PLUGINS_SETUP_TIMEOUT_SECONDS": {"test_value": 30.0},
+    "PREFECT_PLUGINS_STRICT": {"test_value": True},
     "PREFECT_FLOW_DEFAULT_RETRIES": {"test_value": 10, "legacy": True},
     "PREFECT_FLOWS_DEFAULT_RETRIES": {"test_value": 10},
     "PREFECT_FLOW_DEFAULT_RETRY_DELAY_SECONDS": {"test_value": 10, "legacy": True},
@@ -1559,6 +1576,21 @@ class TestSettingsSources:
         os.unlink(".env")
 
         assert Settings().client.retry_extra_codes == set()
+
+    def test_nested_setting_loaded_from_dotenv(
+        self, temporary_env_file: Callable[[str], None]
+    ):
+        """Regression test for https://github.com/PrefectHQ/prefect/issues/21664
+
+        Pydantic-settings 2.14.0 added a new positional parameter to
+        `DotEnvSettingsSource.__init__`. Passing arguments to `super().__init__`
+        by position in `FilteredDotEnvSettingsSource` caused the `env_prefix`
+        value to be interpreted as `case_sensitive`, breaking nested setting
+        resolution from `.env` files (e.g. `PREFECT_API_URL` -> `api.url`).
+        """
+        temporary_env_file("PREFECT_API_URL=http://from-dotenv:4200/api")
+
+        assert Settings().api.url == "http://from-dotenv:4200/api"
 
     def test_env_fifo_does_not_hang(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

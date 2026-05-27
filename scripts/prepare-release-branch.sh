@@ -1,42 +1,32 @@
 #!/bin/bash
 
-# Script to prepare a release-prep branch by merging an upstream tag into
-# the current release branch.
+# Headless script to prepare a release-prep branch by merging an upstream tag into
+# the current release branch and pushing it for PR review.
 #
-# This replaces the old reconstruct-release-branch.sh cherry-pick approach.
-# Instead of resetting the release branch and replaying MMB commits, we keep
-# the release branch alive and merge the new upstream tag into a temporary
-# release-prep/<tag> branch. A PR is then opened to merge that into release.
+# For interactive conflict resolution and automatic PR creation, use:
+#   ./scripts/mmb-prepare-release.sh <tag>
 #
 # Usage:
-#   prepare-release-branch.sh [--dry-run] <tag>
+#   prepare-release-branch.sh [--dry-run] [--commit-conflicts] <tag>
 #
 # Examples:
 #   prepare-release-branch.sh 3.4.25
 #   prepare-release-branch.sh --dry-run 3.4.25
+#   prepare-release-branch.sh --commit-conflicts 3.4.25
 
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=prepare-release-branch-lib.sh
+source "${SCRIPT_DIR}/prepare-release-branch-lib.sh"
 
-UPSTREAM_REMOTE="upstream"
-ORIGIN_REMOTE="origin"
-RELEASE_BRANCH="release"
 DRY_RUN=false
+COMMIT_CONFLICTS=false
 BASE_TAG=""
-
-print_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 show_help() {
     cat <<EOF
-Usage: $0 [--dry-run] <tag>
+Usage: $0 [--dry-run] [--commit-conflicts] <tag>
 
 Prepare a release-prep/<tag> branch by merging <tag> into the current
 release branch, then push it for PR review.
@@ -45,28 +35,28 @@ Arguments:
   <tag>        Upstream tag to merge (e.g. 3.4.25)
 
 Options:
-  --dry-run    Show what would be done without making changes
-  -h, --help   Show this help
+  --dry-run           Show what would be done without making changes
+  --commit-conflicts  Commit conflict markers and push (headless emergency use)
+  -h, --help          Show this help
 
 The script:
   1. Fetches all remotes and tags
   2. Creates release-prep/<tag> from origin/release, or resets an existing
-     remote prep branch to match release (safe to rerun after a failed PR step)
+     remote prep branch to match release (safe to rerun)
   3. Merges <tag> into that branch
-  4. If conflicts: commits conflict markers and sets CONFLICTS output
+  4. On conflicts: exits with code 2 unless --commit-conflicts is set
   5. Pushes the branch (unless --dry-run)
 
-After this script completes, the caller (workflow or human) opens a PR
-release-prep/<tag> → release and resolves any conflicts there.
+Prefer ./scripts/mmb-prepare-release.sh for the normal local release workflow.
 EOF
 }
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -h|--help)   show_help; exit 0 ;;
-        --dry-run)   DRY_RUN=true; shift ;;
-        -*)          print_error "Unknown option: $1"; show_help; exit 1 ;;
+        -h|--help)            show_help; exit 0 ;;
+        --dry-run)            DRY_RUN=true; shift ;;
+        --commit-conflicts)   COMMIT_CONFLICTS=true; shift ;;
+        -*)                   print_error "Unknown option: $1"; show_help; exit 1 ;;
         *)
             if [[ -z "$BASE_TAG" ]]; then
                 BASE_TAG="$1"
@@ -85,148 +75,50 @@ if [[ -z "$BASE_TAG" ]]; then
     exit 1
 fi
 
-PREP_BRANCH="release-prep/${BASE_TAG}"
+PREP_BRANCH="$(prep_branch_for_tag "${BASE_TAG}")"
 
-# ── Pre-flight checks ──────────────────────────────────────────────────────────
+require_git_repo
+require_clean_working_tree
+ensure_upstream_remote
+fetch_remotes
 
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    print_error "Not in a git repository"
-    exit 1
+if ! validate_tag "${BASE_TAG}"; then
+    status=$?
+    if [[ "${status}" -eq 2 ]]; then
+        exit 0
+    fi
+    exit "${status}"
 fi
-
-if ! git diff-index --quiet HEAD --; then
-    print_error "Working tree has uncommitted changes. Please commit or stash first."
-    git status --porcelain >&2
-    exit 1
-fi
-
-# ── Fetch ──────────────────────────────────────────────────────────────────────
-
-print_step "Fetching all remotes and tags..."
-
-if git remote | grep -q "^${UPSTREAM_REMOTE}$"; then
-    git fetch "$UPSTREAM_REMOTE" --tags --quiet
-else
-    print_warning "No '${UPSTREAM_REMOTE}' remote found — relying on tags already present"
-fi
-git fetch "$ORIGIN_REMOTE" --tags --quiet
-print_success "Fetch complete"
-
-# ── Validate tag ───────────────────────────────────────────────────────────────
-
-if ! git rev-parse "${BASE_TAG}" >/dev/null 2>&1; then
-    print_error "Tag '${BASE_TAG}' not found after fetch."
-    echo ""
-    echo "Tags matching pattern:"
-    git tag -l "${BASE_TAG}*" | head -10
-    exit 1
-fi
-
-TAG_COMMIT=$(git rev-parse "${BASE_TAG}")
-RELEASE_COMMIT=$(git rev-parse "${ORIGIN_REMOTE}/${RELEASE_BRANCH}")
-
-print_step "Tag '${BASE_TAG}' → ${TAG_COMMIT:0:10}"
-print_step "release HEAD   → ${RELEASE_COMMIT:0:10}"
-echo ""
-
-# Check that this tag isn't already an ancestor of release (i.e. already merged)
-if git merge-base --is-ancestor "${BASE_TAG}" "${RELEASE_COMMIT}"; then
-    print_warning "Tag '${BASE_TAG}' is already an ancestor of ${RELEASE_BRANCH}."
-    print_warning "Nothing to do — release is already up to date with this tag."
-    exit 0
-fi
-
-# ── Dry run ────────────────────────────────────────────────────────────────────
 
 if [[ "$DRY_RUN" == "true" ]]; then
-    echo ""
-    print_step "DRY RUN — no changes will be made"
-    echo ""
-    if git ls-remote --exit-code "$ORIGIN_REMOTE" "refs/heads/${PREP_BRANCH}" >/dev/null 2>&1; then
-        echo "Would reset existing branch: ${PREP_BRANCH}"
-    else
-        echo "Would create branch: ${PREP_BRANCH}"
-    fi
-    echo "  from: ${ORIGIN_REMOTE}/${RELEASE_BRANCH} (${RELEASE_COMMIT:0:10})"
-    echo "  merge: ${BASE_TAG} (${TAG_COMMIT:0:10})"
-    echo ""
-    echo "Commits in ${BASE_TAG} not yet in ${RELEASE_BRANCH}:"
-    git log --oneline "${RELEASE_COMMIT}..${BASE_TAG}" | head -20
+    show_dry_run_preview "${BASE_TAG}"
     echo ""
     echo "To run for real:"
-    echo "  $0 ${BASE_TAG}"
+    echo "  ./scripts/mmb-prepare-release.sh ${BASE_TAG}"
     exit 0
 fi
 
-# ── Prep branch: create or reset from release ────────────────────────────────
-
-PREP_BRANCH_EXISTS_ON_ORIGIN=false
-if git ls-remote --exit-code "$ORIGIN_REMOTE" "refs/heads/${PREP_BRANCH}" >/dev/null 2>&1; then
-    PREP_BRANCH_EXISTS_ON_ORIGIN=true
-    print_step "Branch '${PREP_BRANCH}' already exists on ${ORIGIN_REMOTE}; resetting from ${ORIGIN_REMOTE}/${RELEASE_BRANCH} and re-merging ${BASE_TAG} (retry / idempotent run)."
-else
-    print_step "Creating ${PREP_BRANCH} from ${ORIGIN_REMOTE}/${RELEASE_BRANCH}..."
-fi
-
-git checkout -B "${PREP_BRANCH}" "${ORIGIN_REMOTE}/${RELEASE_BRANCH}"
-if [[ "$PREP_BRANCH_EXISTS_ON_ORIGIN" == "true" ]]; then
-    print_success "Branch reset to match ${ORIGIN_REMOTE}/${RELEASE_BRANCH}"
-else
-    print_success "Branch created"
-fi
-
-echo ""
-print_step "Merging ${BASE_TAG} into ${PREP_BRANCH}..."
+create_prep_branch "${PREP_BRANCH}"
 
 CONFLICTS=false
-
-if git merge "${BASE_TAG}" --no-edit -m "Merge upstream ${BASE_TAG} into release"; then
-    print_success "Clean merge — no conflicts"
+if merge_upstream_tag "${BASE_TAG}"; then
+    :
 else
     CONFLICTS=true
-    print_warning "Merge had conflicts. Committing conflict markers for PR review."
-    echo ""
-    echo "Conflicted files:"
-    git diff --name-only --diff-filter=U | sed 's/^/  /'
-    echo ""
-
-    # Stage everything (including conflict markers) and create a commit so the
-    # branch is pushable. The PR description will flag these for resolution.
-    git add --all
-    git commit \
-        -m "Merge upstream ${BASE_TAG} into release [CONFLICTS NEED RESOLUTION]" \
-        -m "The following files have merge conflicts that must be resolved before" \
-        -m "merging this PR into release:" \
-        -m "$(git diff --cached --name-only --diff-filter=U 2>/dev/null || git show --stat HEAD | tail -n +2)" \
-        --no-verify
-    print_warning "Conflict markers committed. Resolve them in the PR branch before merging."
+    if [[ "${COMMIT_CONFLICTS}" == "true" ]]; then
+        commit_conflict_markers "${BASE_TAG}"
+    else
+        print_error "Merge has conflicts. Resolve them locally with:"
+        echo "  ./scripts/mmb-prepare-release.sh ${BASE_TAG}"
+        exit 2
+    fi
 fi
 
-# ── Push ───────────────────────────────────────────────────────────────────────
-
-echo ""
-print_step "Pushing ${PREP_BRANCH} to ${ORIGIN_REMOTE}..."
-if [[ "$PREP_BRANCH_EXISTS_ON_ORIGIN" == "true" ]]; then
-    git push --force-with-lease "${ORIGIN_REMOTE}" "${PREP_BRANCH}"
-else
-    git push "${ORIGIN_REMOTE}" "${PREP_BRANCH}"
-fi
-print_success "Branch pushed: ${ORIGIN_REMOTE}/${PREP_BRANCH}"
-
-# ── Output for workflow consumption ───────────────────────────────────────────
+push_prep_branch "${PREP_BRANCH}"
 
 if [[ "${CONFLICTS}" == "true" ]]; then
     echo ""
-    print_warning "RESULT: conflicts were found. PR needs manual resolution."
-    # Write to GITHUB_OUTPUT if running inside Actions
-    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        echo "conflicts=true" >> "$GITHUB_OUTPUT"
-        echo "prep_branch=${PREP_BRANCH}" >> "$GITHUB_OUTPUT"
-    fi
+    print_warning "RESULT: conflicts were committed. PR needs manual resolution."
 else
-    print_success "RESULT: clean merge. PR is ready to review and merge."
-    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        echo "conflicts=false" >> "$GITHUB_OUTPUT"
-        echo "prep_branch=${PREP_BRANCH}" >> "$GITHUB_OUTPUT"
-    fi
+    print_success "RESULT: clean merge. Branch is ready for PR review."
 fi

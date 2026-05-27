@@ -1,3 +1,4 @@
+import logging
 import urllib
 from typing import Type
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -352,6 +353,38 @@ class TestSlackWebhook:
         )
 
 
+class TestAppriseLoggingLevels:
+    async def test_notify_does_not_force_apprise_to_debug(self):
+        apprise_logger = logging.getLogger("apprise")
+        root_logger = logging.getLogger()
+
+        original_apprise_level = apprise_logger.level
+        original_root_level = root_logger.level
+
+        try:
+            root_logger.setLevel(logging.WARNING)
+            apprise_logger.setLevel(logging.NOTSET)
+
+            with patch("apprise.Apprise", autospec=True) as AppriseMock:
+                apprise_instance_mock = AppriseMock.return_value
+
+                async def _assert_level(*args, **kwargs):
+                    assert logging.getLogger("apprise").level == logging.WARNING
+                    return True
+
+                apprise_instance_mock.async_notify = AsyncMock(
+                    side_effect=_assert_level
+                )
+
+                block = SlackWebhook(
+                    url="https://hooks.slack.com/services/T1234/B5678/abcdefghijk"
+                )
+                await block.notify("test")
+        finally:
+            apprise_logger.setLevel(original_apprise_level)
+            root_logger.setLevel(original_root_level)
+
+
 class TestMattermostWebhook:
     async def test_notify_async(self):
         mm_block = MattermostWebhook(
@@ -502,7 +535,7 @@ class TestOpsgenieWebhook:
             AppriseMock.assert_called_once()
             apprise_instance_mock.add.assert_called_once_with(
                 servers=f"opsgenie://{self.API_KEY}/?action=new&region=us&priority=normal&"
-                "batch=no&%3Ainfo=note&%3Asuccess=close&%3Awarning=new&%3Afailure="
+                "batch=no&:info=note&:success=close&:warning=new&:failure="
                 "new&format=text&overflow=upstream"
             )
 
@@ -529,7 +562,7 @@ class TestOpsgenieWebhook:
             AppriseMock.assert_called_once()
             apprise_instance_mock.add.assert_called_once_with(
                 servers=f"opsgenie://{self.API_KEY}/{targets}?{params}"
-                "&%3Ainfo=note&%3Asuccess=close&%3Awarning=new&%3Afailure=new&format=text&overflow=upstream"
+                "&:info=note&:success=close&:warning=new&:failure=new&format=text&overflow=upstream"
             )
 
             apprise_instance_mock.notify.assert_called_once_with(
@@ -604,7 +637,7 @@ class TestPagerDutyWebhook:
                     ),
                     call(
                         "pagerduty://int_key@api_key/Prefect/Notification?region=us"
-                        "&image=yes&%2BPrefect+Notification+Body=test&format=text&overflow=upstream"
+                        "&image=yes&%2BPrefect%20Notification%20Body=test&format=text&overflow=upstream"
                     ),
                 ],
                 any_order=False,
@@ -660,7 +693,7 @@ class TestPagerDutyWebhook:
                     ),
                     call(
                         "pagerduty://int_key@api_key/Prefect/Notification?region=us"
-                        "&image=yes&%2BPrefect+Notification+Body=test&format=text&overflow=upstream"
+                        "&image=yes&%2BPrefect%20Notification%20Body=test&format=text&overflow=upstream"
                     ),
                 ],
                 any_order=False,

@@ -49,6 +49,33 @@ success() {
 declare -a BACKUP_FILES=()
 declare -a TEMP_DIRS=()
 
+# Comma-separated list of MMB release tags earned by successful uploads
+RELEASE_TAGS=""
+
+# Append a tag name to RELEASE_TAGS. Call only after a confirmed successful upload.
+record_release_tag() {
+    local tag="$1"
+    if [[ -z "$RELEASE_TAGS" ]]; then
+        RELEASE_TAGS="$tag"
+    else
+        RELEASE_TAGS+=",$tag"
+    fi
+}
+
+# Write release_tags, script_exit_code, and script_failed to GITHUB_OUTPUT when
+# running inside GitHub Actions. This is a no-op in local runs.
+emit_github_outputs() {
+    local exit_code="$1"
+    [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+    local failed="true"
+    [[ "$exit_code" == "0" ]] && failed="false"
+    {
+        echo "release_tags=${RELEASE_TAGS}"
+        echo "script_exit_code=${exit_code}"
+        echo "script_failed=${failed}"
+    } >> "$GITHUB_OUTPUT"
+}
+
 # Cleanup function for emergency restoration
 cleanup_on_exit() {
     local exit_code=$?
@@ -449,6 +476,15 @@ upload_integration_packages() {
                 
                 uploaded_count=$((uploaded_count + 1))
                 success "$package_name uploaded successfully"
+
+                # Record the MMB release tag for this integration
+                local int_version
+                int_version=$(get_integration_tag_version "$package_name")
+                if [[ -n "$int_version" ]]; then
+                    record_release_tag "${package_name}-${int_version}-mmb"
+                else
+                    warn "No clean version tag found for $package_name — skipping MMB release tag"
+                fi
             else
                 failed_count=$((failed_count + 1))
                 warn "Failed to upload $package_name - continuing with next package"
@@ -705,6 +741,7 @@ main() {
         if upload_packages "prefect" "dist/prefect"; then
             upload_results+=("✓ prefect package uploaded successfully")
             successful_uploads=$((successful_uploads + 1))
+            record_release_tag "${VERSION}-mmb"
         else
             upload_results+=("✗ prefect package upload failed")
         fi
@@ -738,14 +775,17 @@ main() {
     
     if [[ $successful_uploads -eq $total_upload_attempts ]]; then
         success "All packages released successfully!"
+        emit_github_outputs $EXIT_SUCCESS
         exit $EXIT_SUCCESS
     elif [[ $successful_uploads -gt 0 ]]; then
         warn "Partial success - some packages were uploaded, but others failed"
         warn "This is considered a partial failure but the script handled it gracefully"
+        emit_github_outputs $EXIT_PARTIAL_FAILURE
         exit $EXIT_PARTIAL_FAILURE
     else
         warn "No packages were uploaded successfully"
         warn "This is considered a partial failure but the script handled it gracefully"
+        emit_github_outputs $EXIT_PARTIAL_FAILURE
         exit $EXIT_PARTIAL_FAILURE
     fi
     log "Repository URL: https://console.cloud.google.com/artifacts/browse/${PROJECT_ID}/${REGION}/${REPO_NAME}"
