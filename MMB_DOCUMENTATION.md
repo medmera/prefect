@@ -210,6 +210,33 @@ After step 2, a PR is opened: `release-prep/3.4.25` → `release`.
 
 **CI trigger:** `.github/workflows/mmb-python-tests.yaml` runs on pull requests that touch Python source, tests, `pyproject.toml`, `Dockerfile`, etc. A typical upstream merge PR will satisfy these path filters.
 
+**IAP and client auth (check on every upstream merge)**
+
+When upstream touches client or connection code, scan the merge diff for:
+
+1. **`src/prefect/_internal/version_checking.py`** — Must still apply `IAPAuth` when `[api.iap] enabled` (mirror `get_client()`). Upstream may rewrite this module (Prefect 3.7+ added it); re-apply the `[MMB]` patch if conflict resolution dropped IAP.
+2. **`src/prefect/client/orchestration/__init__.py`** — `get_client()` must still set `httpx_settings["auth"] = IAPAuth()` when IAP enabled.
+3. **`src/prefect/_internal/websockets.py`** — Must still inject IAP headers via `IAPTokenManager` when IAP enabled.
+4. **`src/prefect/client/iap_auth.py`** — MMB-specific; should not be deleted by merge. If upstream adds their own IAP support, reconcile rather than drop.
+5. **New standalone HTTP to the API** — Grep the PR diff for `httpx.AsyncClient(` / `httpx.Client(` combined with `/admin/version` or `PREFECT_API_URL`. Any new path must use `get_client()` or copy the IAP guard from `get_client()`. Today only `version_checking.py` is the exception.
+6. **New WebSocket clients** — Must use `websocket_connect()` from `_internal/websockets.py`, not raw `websockets.connect()`.
+7. **Settings** — `[api.iap]` keys in `src/prefect/settings/models/api.py` must remain; upstream renames of env vars need MMB profile updates.
+
+Quick grep during PR review (copy-paste):
+
+```bash
+# After resolving merge conflicts locally on release-prep/X.Y.Z:
+git diff release...HEAD -- 'src/prefect/_internal/version_checking.py' \
+  'src/prefect/client/orchestration/__init__.py' \
+  'src/prefect/_internal/websockets.py' 'src/prefect/client/iap_auth.py'
+
+rg 'httpx\.(AsyncClient|Client)\(' src/prefect/_internal/version_checking.py \
+  src/prefect/client/ src/prefect/events/ src/prefect/logging/
+
+uv run pytest tests/_internal/test_version_checking.py \
+  tests/client/test_prefect_client.py -k "CheckServerVersion or version_check" -x
+```
+
 3. Merge the PR when green
 
 The `release` branch now contains upstream changes plus all MMB customisations. Delete `release-prep/3.4.25` after merge.
