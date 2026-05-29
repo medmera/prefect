@@ -147,14 +147,44 @@ async def check_server_version(
     if headers:
         httpx_kwargs["headers"] = headers
 
+    if settings.api.iap.enabled:
+        try:
+            from prefect.client.iap_auth import IAPAuth
+        except ImportError:
+            raise ImportError(
+                "IAP authentication is not available. Please install the prefect "
+                "(or prefect-client) package with the 'gcp-iap' extra."
+            ) from None
+        httpx_kwargs["auth"] = IAPAuth(
+            auth_header_name=settings.api.iap.auth_header_name,
+        )
+
     try:
         async with httpx.AsyncClient(**httpx_kwargs) as http_client:  # type: ignore[arg-type]
             response = await http_client.get(f"{api_url}/admin/version")
             response.raise_for_status()
             api_version_str: str = response.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            if raise_on_error:
+                raise
+            logger.debug(
+                "Unable to check server version at %s: %s",
+                _sanitize_url(api_url),
+                e,
+            )
+            return
+        if raise_on_error:
+            raise RuntimeError(
+                f"Failed to reach API at {_sanitize_url(api_url)}"
+            ) from e
+        logger.debug(
+            "Unable to check server version at %s: %s",
+            _sanitize_url(api_url),
+            e,
+        )
+        return
     except Exception as e:
-        if "Unauthorized" in str(e):
-            raise
         if raise_on_error:
             raise RuntimeError(
                 f"Failed to reach API at {_sanitize_url(api_url)}"
