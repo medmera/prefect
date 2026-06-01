@@ -28,6 +28,21 @@ on:
         required: false
         default: false
         type: boolean
+      version_post:
+        description: "PEP 440 post-release number for prefect (empty = none, e.g. 1 → .post1)"
+        required: false
+        default: ""
+        type: string
+      integration_version_post:
+        description: "Post-release number for integrations (empty = none; independent of core)"
+        required: false
+        default: ""
+        type: string
+      base_version_override:
+        description: "Override core base x.y.z from git (empty = auto from nearest upstream tag)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -48,6 +63,9 @@ jobs:
       BUILD_INTEGRATIONS: ${{ inputs.build_integrations }}
       DRY_RUN: ${{ inputs.dry_run }}
       FORCE_RELEASE_VERSION: ${{ inputs.force_release_version }}
+      VERSION_POST: ${{ inputs.version_post }}
+      INTEGRATION_VERSION_POST: ${{ inputs.integration_version_post }}
+      BASE_VERSION_OVERRIDE: ${{ inputs.base_version_override }}
       ARTIFACT_REGISTRY_GCP_PROJECT: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}
       ARTIFACT_REGISTRY_GCP_REGION: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}
       ARTIFACT_REGISTRY_PYTHON_NAME: ${{ vars.ARTIFACT_REGISTRY_PYTHON_NAME }}
@@ -113,6 +131,9 @@ jobs:
           echo "- Repository: ${ARTIFACT_REGISTRY_PYTHON_NAME}" >> $GITHUB_STEP_SUMMARY
           echo "- Build integrations: ${BUILD_INTEGRATIONS}" >> $GITHUB_STEP_SUMMARY
           echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version post (core): ${VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version post (integrations): ${INTEGRATION_VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "- Base version override: ${BASE_VERSION_OVERRIDE:-none}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Check if the script failed and why
@@ -191,6 +212,8 @@ jobs:
     env:
       DRY_RUN: ${{ inputs.dry_run }}
       FORCE_RELEASE_VERSION: ${{ inputs.force_release_version }}
+      VERSION_POST: ${{ inputs.version_post }}
+      BASE_VERSION_OVERRIDE: ${{ inputs.base_version_override }}
       ARTIFACT_REGISTRY_GCP_PROJECT: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}
       ARTIFACT_REGISTRY_GCP_REGION: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}
       ARTIFACT_REGISTRY_DOCKER_NAME: ${{ vars.ARTIFACT_REGISTRY_DOCKER_NAME }}
@@ -284,6 +307,8 @@ jobs:
           echo "- Python version: ${PYTHON_VERSION}" >> $GITHUB_STEP_SUMMARY
           echo "- Platforms: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
           echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version post (core): ${VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "- Base version override: ${BASE_VERSION_OVERRIDE:-none}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [[ "$JOB_STATUS" == "success" ]]; then
@@ -319,6 +344,9 @@ jobs:
       RELEASE_DOCKER: ${{ inputs.release_docker }}
       BUILD_INTEGRATIONS: ${{ inputs.build_integrations }}
       DRY_RUN: ${{ inputs.dry_run }}
+      VERSION_POST: ${{ inputs.version_post }}
+      INTEGRATION_VERSION_POST: ${{ inputs.integration_version_post }}
+      BASE_VERSION_OVERRIDE: ${{ inputs.base_version_override }}
       ARTIFACT_REGISTRY_GCP_PROJECT: ${{ vars.ARTIFACT_REGISTRY_GCP_PROJECT }}
       ARTIFACT_REGISTRY_GCP_REGION: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}
 
@@ -337,6 +365,9 @@ jobs:
           echo "- Docker images: ${RELEASE_DOCKER}" >> $GITHUB_STEP_SUMMARY
           echo "- Build integrations: ${BUILD_INTEGRATIONS}" >> $GITHUB_STEP_SUMMARY
           echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version post (core): ${VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version post (integrations): ${INTEGRATION_VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "- Base version override: ${BASE_VERSION_OVERRIDE:-none}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Check job statuses

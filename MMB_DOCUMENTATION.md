@@ -270,11 +270,27 @@ Run only after the prepare-release PR is merged into `release`.
 | `release_docker` | Build and push Docker images |
 | `build_integrations` | Include integration packages (e.g. `prefect-gcp`) |
 | `dry_run` | Preview without publishing |
-| `force_release_version` | Require strict `x.y.z` version (no pre-release suffixes) |
+| `force_release_version` | Require strict `x.y.z` version (no pre-release suffixes on base) |
+| `version_post` | PEP 440 post number for prefect (empty = none; `1` → `.post1`) |
+| `integration_version_post` | Post number for integrations (empty = none; independent of core) |
+| `base_version_override` | Force core base `x.y.z` (empty = auto from nearest upstream ancestor tag) |
 
-The workflow builds from `release` HEAD. Versions come from `git describe` and the nearest ancestor tag — no manual version bump needed after merging the upstream tag.
+The workflow builds from `release` HEAD. Base versions come from the nearest **upstream-style** ancestor tag on HEAD (`git describe`); trailing `-mmb` on describe results is stripped. Python and Docker use the same resolution (`scripts/release-version-lib.sh`).
 
-**MMB release tags:** after a successful publish, `scripts/create-mmb-release-tags.sh` creates annotated tags like `3.4.25-mmb`, `prefect-gcp-0.6.17-mmb` on the released commit. Dry runs skip tagging. Re-runs are idempotent unless a tag already points at a different commit.
+**MMB release tags:** after a successful publish, `scripts/create-mmb-release-tags.sh` creates annotated tags like `3.4.25-mmb`, `prefect-gcp-0.6.17-mmb`, or `3.7.2.post1-mmb` on the released commit. Dry runs skip tagging. Re-runs are idempotent unless a tag already points at a different commit.
+
+### Post-release (MMB patch)
+
+When Artifact Registry already has `x.y.z` and you need to publish a fix on `release` without a new upstream tag:
+
+1. Merge the `[MMB]` fix into `release`.
+2. Dispatch **MMB - Release Packages** with `version_post=1` (and `integration_version_post` only if integration code changed).
+3. Set `build_integrations=false` for core-only patches.
+4. Run `dry_run=true` first; confirm logs show e.g. `3.7.2.post1`, not `3.7.2-mmb`.
+5. Run again with `dry_run=false` for Python and Docker.
+6. Pin installs to `prefect==3.7.2.post1` — `pip install prefect==3.7.2` does not pick up post releases.
+
+Do not create upstream-style git tags for post releases unless you explicitly want them on the fork mirror.
 
 ---
 
@@ -298,8 +314,10 @@ These commits stay on `release` permanently and are preserved across future upst
 | `scripts/mmb-prepare-release.sh` | **Primary.** Interactive release prep + PR creation |
 | `scripts/prepare-release-branch.sh` | Headless git merge/push (no PR, no interactive conflicts) |
 | `scripts/prepare-release-branch-lib.sh` | Shared library (sourced by the above; not run directly) |
+| `scripts/release-version-lib.sh` | Shared version resolution (sourced by release scripts; not run directly) |
 | `scripts/release-python-packages.sh` | Build/publish Python packages to GCP Artifact Registry |
 | `scripts/release-docker-images.sh` | Build/publish Docker images to GCP Artifact Registry |
+| `scripts/test-release-version-lib.sh` | Local tests for version resolution |
 | `scripts/create-mmb-release-tags.sh` | Create `-mmb` tags after successful publish (called by CI) |
 | `scripts/mmb-disable-non-mmb-workflows.sh` | Disable non-MMB GitHub Actions workflows after upstream sync |
 
@@ -329,7 +347,7 @@ Package versions on `release` are derived from upstream git tags that are ancest
 | prefect-gcp | `prefect-gcp-x.y.z` | `prefect-gcp-0.6.17` |
 | other integrations | `prefect-{name}-x.y.z` | same pattern |
 
-After merging a new upstream tag via the prepare-release PR, `git describe` picks up the new version automatically.
+After merging a new upstream tag via the prepare-release PR, `git describe` picks up the new version automatically. Optional `version_post` / `integration_version_post` workflow inputs append `.postN` for MMB-only republishs.
 
 Verify an integration tag is included:
 
@@ -392,6 +410,14 @@ Then re-run **MMB - Release Packages**. Tags are never silently moved.
 ### Build produces wrong integration version
 
 The integration tag must be an ancestor of `release` HEAD. If the prepare-release PR for the corresponding upstream release has not been merged, the version will be wrong.
+
+### Python upload fails: version already exists
+
+The registry rejects re-uploading the same version (e.g. `3.7.2` after a prior successful release). Use `version_post=1` to publish `3.7.2.post1`. Run `dry_run=true` first to confirm the resolved version in the job log.
+
+### Version resolution fails after a prior MMB release
+
+MMB publish tags (`3.7.2-mmb`) are stripped when resolving versions. If resolution still fails, set `base_version_override` to the intended upstream base (e.g. `3.7.2`) and add `version_post` as needed.
 
 ---
 

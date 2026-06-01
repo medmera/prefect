@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/release-version-lib.sh
+source "${SCRIPT_DIR}/release-version-lib.sh"
+
 # Parse command line arguments
 PROJECT_ID="$1"
 REGION="$2"
@@ -336,10 +340,17 @@ build_integration_packages() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log "DRY RUN: Integration package versions that would be used:"
         for package in "${packages[@]}"; do
-            local tag_version
+            local tag_version int_base raw_tag
             tag_version=$(get_integration_tag_version "$package")
             if [[ -n "$tag_version" ]]; then
-                log "  $package: $tag_version (from git tag)"
+                raw_tag=$(git describe --tags --match "${package}-*" --abbrev=0 HEAD 2>/dev/null) || true
+                if [[ -n "$raw_tag" ]]; then
+                    int_base="${raw_tag#${package}-}"
+                    int_base=$(release_version_normalize_tag "$int_base")
+                else
+                    int_base="unknown"
+                fi
+                log "  $package: $tag_version (base=${int_base}, integration_post=${INTEGRATION_VERSION_POST:-none})"
             else
                 warn "  $package: no clean tag found, would use dynamic version"
             fi
@@ -543,45 +554,15 @@ upload_packages() {
     fi
 }
 
-# Get the nearest ancestor tag for prefect core (x.x.x format).
-# Uses git describe to find the tag that is actually an ancestor of the current
-# commit, so the version matches the code in the working tree.
+# Nearest ancestor upstream-style tag for prefect core (base only, no .postN).
 get_prefect_tag_version() {
-    local tag
-    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-        # Strict x.y.z only — no pre-release suffixes
-        tag=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 HEAD 2>/dev/null) || true
-        if [[ -n "$tag" ]] && echo "$tag" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
-            echo "$tag"
-        fi
-    else
-        tag=$(git describe --tags --match "[0-9]*.[0-9]*.[0-9]*" --abbrev=0 HEAD 2>/dev/null) || true
-        if [[ -n "$tag" ]] && echo "$tag" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$"; then
-            echo "$tag"
-        fi
-    fi
+    release_version_resolve_prefect_base 2>/dev/null || true
 }
 
-# Get the nearest ancestor tag for an integration package (prefect-{name}-x.x.x format).
-# Uses git describe to find the tag that is actually an ancestor of the current
-# commit, so the version matches the code in the working tree.
+# Nearest ancestor tag version for an integration package (includes .postN when set).
 get_integration_tag_version() {
     local package_name="$1"
-    local tag
-    tag=$(git describe --tags --match "${package_name}-*" --abbrev=0 HEAD 2>/dev/null) || true
-    if [[ -z "$tag" ]]; then
-        return 0
-    fi
-    local version="${tag#${package_name}-}"
-    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-        if echo "$version" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
-            echo "$version"
-        fi
-    else
-        if echo "$version" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$"; then
-            echo "$version"
-        fi
-    fi
+    release_version_resolve_integration "$package_name" 2>/dev/null || true
 }
 
 # Create clean version files temporarily
@@ -657,19 +638,20 @@ EOF
     echo "$temp_version_file"
 }
 
-# Get current version (original function, now with tag-based override)
+# Full prefect package version (base from git/override + optional VERSION_POST).
 get_version() {
-    local tag_version
-    tag_version=$(get_prefect_tag_version)
-    if [[ -n "$tag_version" ]]; then
-        echo "$tag_version"
-    else
+    local version base
+    version=$(release_version_resolve_prefect_core 2>/dev/null) || version=""
+    if [[ -z "$version" ]]; then
         if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-            config_error "No clean release version tag (x.y.z) found. Please create a tag matching x.y.z before running this script with FORCE_RELEASE_VERSION=true."
+            config_error "No clean release version tag (x.y.z) found. Set BASE_VERSION_OVERRIDE or create an upstream x.y.z tag ancestor of HEAD."
         else
-            config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+            config_error "No clean version tag found. Set BASE_VERSION_OVERRIDE or create a tag matching x.y.z (or x.y.z.suffix) ancestor of HEAD."
         fi
     fi
+    base=$(release_version_resolve_prefect_base 2>/dev/null) || base=""
+    release_version_log_resolved "prefect" "$version" "$base" "${VERSION_POST}"
+    echo "$version"
 }
 
 # Main execution
@@ -684,6 +666,10 @@ main() {
     log "Repository: $REPO_NAME"
     log "Build integrations: $BUILD_INTEGRATIONS"
     log "Dry run: $DRY_RUN"
+    log "Version post (core): ${VERSION_POST:-none}"
+    log "Version post (integrations): ${INTEGRATION_VERSION_POST:-none}"
+    log "Base version override: ${BASE_VERSION_OVERRIDE:-none}"
+    log "Force release version: $FORCE_RELEASE_VERSION"
     
     # Get version
     VERSION=$(get_version)
@@ -823,11 +809,17 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  DRY_RUN             Preview versions without building/uploading (optional, default: 'false', set to 'true' for dry run)"
     echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
     echo ""
+    echo "Environment variables (optional):"
+    echo "  VERSION_POST              PEP 440 post number for prefect (e.g. 1 → .post1)"
+    echo "  INTEGRATION_VERSION_POST  Post number for integrations (independent of core)"
+    echo "  BASE_VERSION_OVERRIDE     Force core base x.y.z before post suffix"
+    echo ""
     echo "Version handling:"
-    echo "  - If FORCE_RELEASE_VERSION=true: Only tags matching x.y.z (e.g., 3.4.11) are allowed."
-    echo "  - Otherwise: Allows x.y.z or x.y.z.suffix (e.g., 3.4.11.dev1)"
-    echo "  - Integrations: Uses latest tag matching prefect-{name}-x.x.x pattern if FORCE_RELEASE_VERSION, else allows suffixes."
-    echo "  - Falls back to dynamic version if no clean tag found (unless FORCE_RELEASE_VERSION=true)"
+    echo "  - Base from nearest upstream-style ancestor tag on HEAD (MMB -mmb tags stripped)."
+    echo "  - If FORCE_RELEASE_VERSION=true: base must be x.y.z only."
+    echo "  - Otherwise: base may include upstream suffixes (e.g. 3.4.11.dev1)."
+    echo "  - VERSION_POST / INTEGRATION_VERSION_POST append .postN after base."
+    echo "  - Integrations: nearest prefect-{name}-* ancestor tag; dynamic version if none."
     echo ""
     echo "Examples:"
     echo "  $0 my-project us-central1 prefect-pypi                  # Basic usage"
@@ -851,5 +843,4 @@ if [[ -z "$REPO_NAME" ]]; then
     config_error "REPO_NAME is required as the third argument"
 fi
 
-main "$@"
 main "$@"

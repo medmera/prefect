@@ -142,11 +142,25 @@ Dispatch **MMB - Release Packages** from the Actions tab.
 | `release_docker` | Build and push Docker images |
 | `build_integrations` | Include integration packages (e.g. `prefect-gcp`) |
 | `dry_run` | Preview without actually publishing |
-| `force_release_version` | Require a strict `x.y.z` tag (no pre-release suffixes) |
+| `force_release_version` | Require a strict `x.y.z` base (no pre-release suffixes on base) |
+| `version_post` | Post number for prefect (empty = none; `1` → `.post1`) |
+| `integration_version_post` | Post number for integrations (empty = none) |
+| `base_version_override` | Force core base `x.y.z` (empty = auto from git) |
 
-The workflow builds from the `release` branch HEAD and determines versions
-using `git describe` to find the nearest ancestor tag — so the version number
-always matches the actual code in the working tree.
+The workflow builds from the `release` branch HEAD. Base versions use the nearest
+upstream-style ancestor tag (`git describe`); `-mmb` suffixes on tags are
+ignored for version numbers. Python and Docker share `scripts/release-version-lib.sh`.
+
+### Post-release (MMB-only patch)
+
+If `x.y.z` is already in Artifact Registry and you fixed `release` without a new
+upstream tag:
+
+1. Merge the fix to `release`.
+2. Dispatch with `version_post=1`, `build_integrations=false` (unless integrations changed).
+3. `dry_run=true` — confirm `x.y.z.post1` in logs.
+4. `dry_run=false` — publish Python and Docker.
+5. Install with `prefect==x.y.z.post1`.
 
 ---
 
@@ -170,7 +184,7 @@ internally:
 
 | Published package | Tag created |
 |-------------------|-------------|
-| `prefect` core | `3.4.25-mmb` |
+| `prefect` core | `3.4.25-mmb` or `3.7.2.post1-mmb` |
 | `prefect-gcp` | `prefect-gcp-0.6.17-mmb` |
 | `prefect-aws` | `prefect-aws-0.5.13-mmb` |
 | (all integrations) | `{package}-{version}-mmb` |
@@ -246,3 +260,10 @@ git merge-base --is-ancestor prefect-gcp-0.6.17 release && echo "ancestor" || ec
 ```
 If it is not an ancestor, the prepare-release PR for the corresponding upstream
 tag has not been merged yet.
+
+**Python upload fails: version already exists**
+Use `version_post=1` (or the next post number) to publish a new immutable version.
+`pip install prefect==x.y.z` will not install a post release.
+
+**Version resolution fails after `-mmb` tags exist**
+MMB tags are stripped during resolution. Use `base_version_override` if needed.

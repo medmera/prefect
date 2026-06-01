@@ -8,6 +8,7 @@
 # Expected environment variables:
 #   RELEASE_TAGS  Comma-separated list of tag names, e.g.:
 #                 "3.4.25-mmb,prefect-gcp-0.6.17-mmb,prefect-aws-0.5.13-mmb"
+#                 "3.7.2.post1-mmb" (post-release patch)
 #
 # The script is idempotent:
 #   - If a tag already points at the current HEAD it is skipped (safe to re-run).
@@ -16,6 +17,7 @@
 #
 # Usage (called by the GitHub Actions workflow):
 #   RELEASE_TAGS="3.4.25-mmb,prefect-gcp-0.6.17-mmb" ./scripts/create-mmb-release-tags.sh
+#   RELEASE_TAGS="3.7.2.post1-mmb" ./scripts/create-mmb-release-tags.sh
 
 set -euo pipefail
 

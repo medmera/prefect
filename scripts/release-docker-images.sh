@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/release-version-lib.sh
+source "${SCRIPT_DIR}/release-version-lib.sh"
+
 # Parse command line arguments
 PROJECT_ID="$1"
 REGION="$2"
@@ -213,15 +217,6 @@ setup_buildx() {
     success "Docker buildx ready."
 }
 
-# Get latest tag for prefect core (x.x.x or x.x.x.anything or x.x.xanything format) by creation date
-get_prefect_tag_version() {
-    if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null | head -1
-    else
-        git tag --list --sort=-creatordate | grep -E "^[0-9]+\.[0-9]+\.[0-9]+([.]?[a-zA-Z0-9]+)*$" 2>/dev/null | head -1
-    fi
-}
-
 # Create clean version files temporarily (same as Python script)
 create_temp_version_files() {
     local version="$1"
@@ -243,19 +238,20 @@ EOF
     echo "$temp_build_info_file"
 }
 
-# Get current version (original function, now with tag-based override)
+# Full prefect version (same resolution as release-python-packages.sh).
 get_version() {
-    local tag_version
-    tag_version=$(get_prefect_tag_version)
-    if [[ -n "$tag_version" ]]; then
-        echo "$tag_version"
-    else
+    local version base
+    version=$(release_version_resolve_prefect_core 2>/dev/null) || version=""
+    if [[ -z "$version" ]]; then
         if [[ "$FORCE_RELEASE_VERSION" == "true" ]]; then
-            error "No clean release version tag (x.y.z) found. Please create a tag matching x.y.z before running this script with FORCE_RELEASE_VERSION=true."
+            error "No clean release version tag (x.y.z) found. Set BASE_VERSION_OVERRIDE or create an upstream x.y.z tag ancestor of HEAD."
         else
-            config_error "No clean version tag found. Please create a tag matching x.y.z or x.y.z.suffix before running this script."
+            error "No clean version tag found. Set BASE_VERSION_OVERRIDE or create a tag matching x.y.z (or x.y.z.suffix) ancestor of HEAD."
         fi
     fi
+    base=$(release_version_resolve_prefect_base 2>/dev/null) || base=""
+    release_version_log_resolved "prefect (docker)" "$version" "$base" "${VERSION_POST}"
+    echo "$version"
 }
 
 # Generate tags for an image
@@ -533,6 +529,9 @@ main() {
     log "Platforms: $PLATFORMS"
     log "Dry run: $DRY_RUN"
     log "No push: $NO_PUSH"
+    log "Version post (core): ${VERSION_POST:-none}"
+    log "Base version override: ${BASE_VERSION_OVERRIDE:-none}"
+    log "Force release version: $FORCE_RELEASE_VERSION"
     
     PREFECT_VERSION=$(get_version)
     log "Prefect version: $PREFECT_VERSION"
@@ -601,10 +600,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
     echo "  SINGLE_PYTHON_VERSION  Build only for specific Python version (optional, e.g., '3.11'). If not specified, builds for all versions."
     echo ""
+    echo ""
+    echo "Environment variables (optional):"
+    echo "  VERSION_POST            PEP 440 post number for prefect (e.g. 1 → .post1)"
+    echo "  BASE_VERSION_OVERRIDE   Force core base x.y.z before post suffix"
+    echo ""
     echo "Version handling:"
-    echo "  - If FORCE_RELEASE_VERSION=true: Only tags matching x.y.z (e.g., 3.4.11) are allowed."
-    echo "  - Otherwise: Allows x.y.z or x.y.z.suffix (e.g., 3.4.11.dev1)"
-    echo "  - Passes clean version to Docker build process"
+    echo "  - Same as release-python-packages.sh: nearest upstream-style ancestor tag on HEAD."
+    echo "  - MMB -mmb tags are stripped; VERSION_POST appends .postN when set."
+    echo "  - If FORCE_RELEASE_VERSION=true: base must be x.y.z only."
+    echo "  - Passes resolved version to Docker build and image tags"
     echo ""
     echo "Configuration:"
     echo "  Python versions: ${PYTHON_VERSIONS[*]}"
