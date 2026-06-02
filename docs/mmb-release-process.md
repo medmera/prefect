@@ -165,7 +165,7 @@ ignored for version numbers. Python and Docker share `scripts/release-version-li
 
 Integration packages are published only when listed in
 [`scripts/mmb-publish-integrations.conf`](../scripts/mmb-publish-integrations.conf)
-(currently `prefect-gcp` and `prefect-dbt`). Core `prefect` is always published
+(currently `prefect-gcp`, `prefect-dbt`, and `prefect-shell`). Core `prefect` is always published
 when `release_python=true`.
 
 ### Post-release (MMB-only patch)

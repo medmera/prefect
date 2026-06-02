@@ -4,7 +4,7 @@
 # Sourced by release-python-packages.sh and test-mmb-release-lib.sh.
 #
 # Config: scripts/mmb-publish-integrations.conf (default)
-# Override (local testing): MMB_PUBLISH_INTEGRATIONS=prefect-gcp,prefect-dbt
+# Override (local testing): MMB_PUBLISH_INTEGRATIONS=prefect-gcp,prefect-dbt,prefect-shell
 
 MMB_PUBLISH_INTEGRATIONS_CONF="${MMB_PUBLISH_INTEGRATIONS_CONF:-scripts/mmb-publish-integrations.conf}"
 MMB_PUBLISH_ALLOWLIST=()
