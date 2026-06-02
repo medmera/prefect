@@ -5,6 +5,10 @@ from typing import Literal, TypeAlias
 SettingAccessor: TypeAlias = Literal[
     "api.auth_string",
     "api.enable_http2",
+    "api.iap.auth_header_name",
+    "api.iap.client_id_gcp_secret_version",
+    "api.iap.enabled",
+    "api.iap.impersonate_service_account",
     "api.key",
     "api.request_timeout",
     "api.ssl_cert_file",
