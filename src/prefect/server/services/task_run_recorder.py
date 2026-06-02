@@ -37,13 +37,11 @@ from prefect.settings.models.server.services import ServicesBaseSetting
 if TYPE_CHECKING:
     import logging
 
-    TaskRunUpsertKey = tuple[str, UUID] | tuple[str, UUID, str, str]
-    TaskRunBatchKey = tuple[frozenset[str], str]
-    TaskRunBatchByKey = tuple[TaskRunBatchKey, list[dict[str, Any]]]
-
 logger: "logging.Logger" = get_logger(__name__)
 
 DEFAULT_PERSIST_MAX_RETRIES = 5
+
+TaskRunUpsertKey = tuple[str, UUID] | tuple[str, UUID, str, str]
 
 
 def _task_run_upsert_key(task_run: TaskRun) -> TaskRunUpsertKey:
@@ -333,19 +331,16 @@ async def _record_bulk_task_run_events(events: list[ReceivedEvent]) -> None:
                 return "natural-key"
             return "id"
 
-        # Batch contiguous rows by keys to avoid column mismatches during bulk insert.
-        # Keeping only contiguous runs preserves the global conflict-key sort order
-        # established above for deterministic lock acquisition.
-        batches_by_keys: list[TaskRunBatchByKey] = []
+        # Batch by keys to avoid column mismatches during bulk insert.
+        # Each batch preserves the conflict-key sort order established above for
+        # deterministic lock acquisition, preventing deadlocks under concurrency.
+        batches_by_keys: dict[tuple[frozenset[str], str], list] = {}
         for tr in unique_task_runs:
             key_signature = (
                 frozenset(tr["task_run_dict"].keys()),
                 conflict_target(tr),
             )
-            if batches_by_keys and batches_by_keys[-1][0] == key_signature:
-                batches_by_keys[-1][1].append(tr)
-            else:
-                batches_by_keys.append((key_signature, [tr]))
+            batches_by_keys.setdefault(key_signature, []).append(tr)
 
         logger.debug(
             f"Partitioned task runs into {len(batches_by_keys)} groups by update columns"
@@ -353,7 +348,7 @@ async def _record_bulk_task_run_events(events: list[ReceivedEvent]) -> None:
 
         canonical_task_run_ids: dict[TaskRunUpsertKey, UUID] = {}
 
-        for (column_keys, conflict_target_name), batch in batches_by_keys:
+        for (column_keys, conflict_target_name), batch in batches_by_keys.items():
             update_cols = set(column_keys) - {"id", "created"}
 
             logger.debug(f"Preparing to bulk insert {len(batch)} task runs")

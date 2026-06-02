@@ -33,6 +33,7 @@ type BlocksPageProps = {
 	onClearFilters: () => void;
 	defaultResultStorageBlockId: string | undefined;
 	defaultResultStorageBlock: BlockDocument | undefined;
+	storageBlockDocuments: Array<BlockDocument> | undefined;
 	onUpdateDefaultResultStorage: (blockDocumentId: string) => void;
 	onClearDefaultResultStorage: () => void;
 	isUpdatingDefaultResultStorage: boolean;
@@ -73,6 +74,7 @@ export const BlocksPage = ({
 	onClearFilters,
 	defaultResultStorageBlockId,
 	defaultResultStorageBlock,
+	storageBlockDocuments,
 	onUpdateDefaultResultStorage,
 	onClearDefaultResultStorage,
 	isUpdatingDefaultResultStorage,
@@ -98,6 +100,7 @@ export const BlocksPage = ({
 			<DefaultResultStorageCard
 				defaultResultStorageBlockId={defaultResultStorageBlockId}
 				defaultResultStorageBlock={defaultResultStorageBlock}
+				storageBlockDocuments={storageBlockDocuments}
 				onUpdateDefaultResultStorage={onUpdateDefaultResultStorage}
 				onClearDefaultResultStorage={onClearDefaultResultStorage}
 				isUpdatingDefaultResultStorage={isUpdatingDefaultResultStorage}

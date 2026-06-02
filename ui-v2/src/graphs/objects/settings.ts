@@ -138,10 +138,7 @@ export function resetHorizontalScaleMultiplier(): void {
 	setHorizontalScaleMultiplier(layout.horizontalScaleMultiplierDefault);
 }
 
-export function setLayoutMode(
-	horizontal: HorizontalMode,
-	vertical: VerticalMode,
-): void {
+export function setLayoutMode({ horizontal, vertical }: LayoutSettings): void {
 	if (layout.horizontal === horizontal && layout.vertical === vertical) {
 		return;
 	}
@@ -150,7 +147,6 @@ export function setLayoutMode(
 
 	layout.horizontal = horizontal;
 	layout.vertical = vertical;
-	layout.disableGuides = layout.isDependency() || layout.isLeftAligned();
 
 	emit();
 }

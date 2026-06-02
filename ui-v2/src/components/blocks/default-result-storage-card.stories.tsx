@@ -1,13 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react";
-import { buildApiUrl } from "@tests/utils/handlers";
-import { HttpResponse, http } from "msw";
 import { fn } from "storybook/test";
 import { createFakeBlockDocument } from "@/mocks";
-import {
-	reactQueryDecorator,
-	routerDecorator,
-	toastDecorator,
-} from "@/storybook/utils";
+import { routerDecorator, toastDecorator } from "@/storybook/utils";
 import { DefaultResultStorageCard } from "./default-result-storage-card";
 
 const storageBlockDocument = createFakeBlockDocument({
@@ -28,28 +22,14 @@ const storageBlockDocument = createFakeBlockDocument({
 	},
 });
 
-const MOCK_STORAGE_BLOCKS = [
-	storageBlockDocument,
-	createFakeBlockDocument({ name: "gcs-results" }),
-	createFakeBlockDocument({ name: "azure-results" }),
-];
-
 const meta = {
 	title: "Components/Blocks/DefaultResultStorageCard",
 	component: DefaultResultStorageCard,
-	decorators: [reactQueryDecorator, toastDecorator, routerDecorator],
-	parameters: {
-		msw: {
-			handlers: [
-				http.post(buildApiUrl("/block_documents/filter"), () => {
-					return HttpResponse.json(MOCK_STORAGE_BLOCKS);
-				}),
-			],
-		},
-	},
+	decorators: [toastDecorator, routerDecorator],
 	args: {
 		defaultResultStorageBlockId: storageBlockDocument.id,
 		defaultResultStorageBlock: storageBlockDocument,
+		storageBlockDocuments: [storageBlockDocument],
 		onUpdateDefaultResultStorage: fn(),
 		onClearDefaultResultStorage: fn(),
 		isUpdatingDefaultResultStorage: false,
@@ -74,6 +54,7 @@ export const LoadingConfiguredBlock: StoryObj<typeof DefaultResultStorageCard> =
 		args: {
 			defaultResultStorageBlockId: storageBlockDocument.id,
 			defaultResultStorageBlock: undefined,
+			storageBlockDocuments: [],
 			isLoadingDefaultResultStorageBlock: true,
 		},
 	};

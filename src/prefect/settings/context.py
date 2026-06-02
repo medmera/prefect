@@ -4,10 +4,7 @@ from typing import TYPE_CHECKING, Any, Generator, Iterable, Mapping, Optional
 from prefect.settings.models.root import Settings
 
 if TYPE_CHECKING:
-    from prefect.settings._types import SettingAccessor
     from prefect.settings.legacy import Setting
-
-    SettingKey = Setting | SettingAccessor
 
 
 def get_current_settings() -> Settings:
@@ -26,9 +23,9 @@ def get_current_settings() -> Settings:
 
 @contextmanager
 def temporary_settings(
-    updates: Optional[Mapping["SettingKey", Any]] = None,
-    set_defaults: Optional[Mapping["SettingKey", Any]] = None,
-    restore_defaults: Optional[Iterable["SettingKey"]] = None,
+    updates: Optional[Mapping["Setting", Any]] = None,
+    set_defaults: Optional[Mapping["Setting", Any]] = None,
+    restore_defaults: Optional[Iterable["Setting"]] = None,
 ) -> Generator[Settings, None, None]:
     """
     Temporarily override the current settings by entering a new profile.
@@ -42,9 +39,6 @@ def temporary_settings(
 
         with temporary_settings(updates={PREFECT_API_URL: "foo"}):
            assert PREFECT_API_URL.value() == "foo"
-
-           with temporary_settings(updates={"api.url": "bar"}):
-                assert get_current_settings().api.url == "bar"
 
            with temporary_settings(set_defaults={PREFECT_API_URL: "bar"}):
                 assert PREFECT_API_URL.value() == "foo"

@@ -10,7 +10,6 @@ export {
 	setDisabledEvents,
 	setHorizontalMode,
 	setHorizontalScaleMultiplier,
-	setLayoutMode,
 	setVerticalMode,
 	start,
 	stop,

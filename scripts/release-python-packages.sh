@@ -5,8 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release-version-lib.sh
 source "${SCRIPT_DIR}/release-version-lib.sh"
-# shellcheck source=scripts/mmb-release-lib.sh
-source "${SCRIPT_DIR}/mmb-release-lib.sh"
 
 # Parse command line arguments
 PROJECT_ID="$1"
@@ -336,34 +334,8 @@ build_integration_packages() {
         warn "No integration packages found in src/integrations/"
         return 0
     fi
-
-    log "Discovered ${#packages[@]} integration packages in repo: ${packages[*]}"
-
-    if ! validate_mmb_publish_allowlist; then
-        config_error "Invalid MMB publish allowlist (see ${MMB_PUBLISH_INTEGRATIONS_CONF})"
-    fi
-
-    mmb_partition_integrations_for_publish "${packages[@]}"
-    packages=("${MMB_PUBLISHABLE_INTEGRATIONS[@]}")
-
-    if [[ ${#MMB_PUBLISH_ALLOWLIST[@]} -gt 0 ]]; then
-        log "MMB publish allowlist: ${MMB_PUBLISH_ALLOWLIST[*]}"
-    else
-        warn "MMB publish allowlist is empty — no integration packages will be published"
-    fi
-
-    if [[ ${#packages[@]} -gt 0 ]]; then
-        log "Publishing integrations: ${packages[*]}"
-    fi
-
-    if [[ ${#MMB_SKIPPED_INTEGRATIONS[@]} -gt 0 ]]; then
-        log "Skipping integrations (not in MMB allowlist): ${MMB_SKIPPED_INTEGRATIONS[*]}"
-    fi
-
-    if [[ ${#packages[@]} -eq 0 ]]; then
-        log "No allowlisted integration packages to build"
-        return 0
-    fi
+    
+    log "Found ${#packages[@]} integration packages: ${packages[*]}"
     
     if [[ "$DRY_RUN" == "true" ]]; then
         log "DRY RUN: Integration package versions that would be used:"
@@ -693,14 +665,6 @@ main() {
     log "Region: $REGION"
     log "Repository: $REPO_NAME"
     log "Build integrations: $BUILD_INTEGRATIONS"
-    if [[ "$BUILD_INTEGRATIONS" == "true" ]]; then
-        load_mmb_publish_allowlist
-        if [[ ${#MMB_PUBLISH_ALLOWLIST[@]} -gt 0 ]]; then
-            log "MMB integration allowlist (${MMB_PUBLISH_INTEGRATIONS_CONF}): ${MMB_PUBLISH_ALLOWLIST[*]}"
-        else
-            log "MMB integration allowlist (${MMB_PUBLISH_INTEGRATIONS_CONF}): (empty — core prefect only)"
-        fi
-    fi
     log "Dry run: $DRY_RUN"
     log "Version post (core): ${VERSION_POST:-none}"
     log "Version post (integrations): ${INTEGRATION_VERSION_POST:-none}"
@@ -841,19 +805,14 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  PROJECT_ID          GCP project ID (required)"
     echo "  REGION              GCP region (required, e.g., us-central1, us-west1, europe-west1)"
     echo "  REPO_NAME           Repository name (required)"
-    echo "  BUILD_INTEGRATIONS  Build allowlisted integration packages (optional, default: 'true', set to 'false' to skip all)"
+    echo "  BUILD_INTEGRATIONS  Build integration packages (optional, default: 'true', set to 'false' to skip)"
     echo "  DRY_RUN             Preview versions without building/uploading (optional, default: 'false', set to 'true' for dry run)"
     echo "  FORCE_RELEASE_VERSION  Only allow x.y.z tags (no suffixes) for version (optional, default: 'false', set to 'true' to require strict release version)"
-    echo ""
-    echo "MMB integration allowlist:"
-    echo "  ${MMB_PUBLISH_INTEGRATIONS_CONF}  Package names to publish (core prefect is always published)"
     echo ""
     echo "Environment variables (optional):"
     echo "  VERSION_POST              PEP 440 post number for prefect (e.g. 1 → .post1)"
     echo "  INTEGRATION_VERSION_POST  Post number for integrations (independent of core)"
     echo "  BASE_VERSION_OVERRIDE     Force core base x.y.z before post suffix"
-    echo "  MMB_PUBLISH_INTEGRATIONS  Comma-separated allowlist override (local testing only)"
-    echo "  MMB_PUBLISH_INTEGRATIONS_CONF  Path to allowlist file (default: scripts/mmb-publish-integrations.conf)"
     echo ""
     echo "Version handling:"
     echo "  - Base from nearest upstream-style ancestor tag on HEAD (MMB -mmb tags stripped)."
