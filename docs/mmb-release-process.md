@@ -125,8 +125,20 @@ git commit -m "address review feedback for 3.4.25 merge"
 git push origin release-prep/3.4.25
 ```
 
-Once the PR is green, merge it. The `release` branch now contains the upstream
-changes plus all MMB customisations.
+Once the PR is green, merge it with a **merge commit** — never squash or rebase.
+Squash merges drop upstream tag ancestry, so `git describe` resolves wrong package
+versions during release (e.g. `prefect-gcp==0.6.18.post1` instead of `0.6.19`).
+
+```bash
+gh pr merge --merge   # correct
+# Do NOT use: gh pr merge --squash or --rebase
+```
+
+The `release-prep/<tag>` branch is merged locally with `git merge <tag>`, which
+creates a two-parent merge commit. GitHub must preserve that structure when
+landing the PR on `release`.
+
+The `release` branch now contains the upstream changes plus all MMB customisations.
 
 The `release-prep/<tag>` branch can be deleted after the PR is merged.
 
