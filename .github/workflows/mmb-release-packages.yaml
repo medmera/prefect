@@ -14,7 +14,7 @@ on:
         default: true
         type: boolean
       build_integrations:
-        description: "Build integration packages (Python only)"
+        description: "Include allowlisted integration packages (see scripts/mmb-publish-integrations.conf)"
         required: false
         default: true
         type: boolean
@@ -130,6 +130,12 @@ jobs:
           echo "- Region: ${ARTIFACT_REGISTRY_GCP_REGION}" >> $GITHUB_STEP_SUMMARY
           echo "- Repository: ${ARTIFACT_REGISTRY_PYTHON_NAME}" >> $GITHUB_STEP_SUMMARY
           echo "- Build integrations: ${BUILD_INTEGRATIONS}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${BUILD_INTEGRATIONS}" == "true" ]]; then
+            echo "- MMB integration allowlist:" >> $GITHUB_STEP_SUMMARY
+            grep -v '^[[:space:]]*#' scripts/mmb-publish-integrations.conf | grep -v '^[[:space:]]*$' | while read -r pkg; do
+              echo "  - \`${pkg}\`" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
           echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
           echo "- Version post (core): ${VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
           echo "- Version post (integrations): ${INTEGRATION_VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
@@ -351,6 +357,9 @@ jobs:
       ARTIFACT_REGISTRY_GCP_REGION: ${{ vars.ARTIFACT_REGISTRY_GCP_REGION }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
       - name: Create overall summary
         env:
           PYTHON_STATUS: ${{ needs.release-python-packages.result || 'skipped' }}
@@ -364,6 +373,12 @@ jobs:
           echo "- Python packages: ${RELEASE_PYTHON}" >> $GITHUB_STEP_SUMMARY
           echo "- Docker images: ${RELEASE_DOCKER}" >> $GITHUB_STEP_SUMMARY
           echo "- Build integrations: ${BUILD_INTEGRATIONS}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${BUILD_INTEGRATIONS}" == "true" ]]; then
+            echo "- MMB integration allowlist:" >> $GITHUB_STEP_SUMMARY
+            grep -v '^[[:space:]]*#' scripts/mmb-publish-integrations.conf | grep -v '^[[:space:]]*$' | while read -r pkg; do
+              echo "  - \`${pkg}\`" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
           echo "- Dry run: ${DRY_RUN}" >> $GITHUB_STEP_SUMMARY
           echo "- Version post (core): ${VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
           echo "- Version post (integrations): ${INTEGRATION_VERSION_POST:-none}" >> $GITHUB_STEP_SUMMARY
