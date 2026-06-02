@@ -5402,7 +5402,10 @@ export interface components {
              *             When disabled, the client will skip the call to /admin/version that
              *             normally runs once per client context entry.  This is useful for worker
              *             subprocesses that inherit a known-compatible server configuration and
-             *             do not need to repeat the version handshake.
+             *             do not need to repeat the version handshake.  May be required on
+             *             IAP-protected deployments running builds before IAP was added to the
+             *             version check; prefer upgrading to a release that includes IAP-aware
+             *             version checking.
              * @default true
              */
             server_version_check_enabled: boolean;
