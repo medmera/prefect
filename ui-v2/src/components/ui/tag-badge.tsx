@@ -6,7 +6,6 @@ type TagBadgeProps = {
 	tag: string;
 	variant?: BadgeProps["variant"];
 	onRemove?: () => void;
-	onClick?: () => void;
 	className?: string;
 };
 
@@ -14,19 +13,13 @@ export const TagBadge = ({
 	tag,
 	variant,
 	onRemove,
-	onClick,
 	className,
 }: TagBadgeProps) => {
 	return (
 		<Badge
 			variant={variant}
-			className={cn(
-				"ml-1 max-w-40",
-				onClick && "cursor-pointer hover:bg-accent",
-				className,
-			)}
+			className={cn("ml-1 max-w-40", className)}
 			title={tag}
-			onClick={onClick}
 		>
 			<span className="truncate">{tag}</span>
 			{onRemove && (

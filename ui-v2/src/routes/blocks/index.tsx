@@ -32,6 +32,21 @@ const searchParams = z.object({
 	limit: z.number().int().positive().optional().default(10).catch(10),
 });
 
+const storageBlockDocumentsFilter = {
+	sort: "BLOCK_TYPE_AND_NAME_ASC",
+	include_secrets: false,
+	offset: 0,
+	limit: 200,
+	block_documents: {
+		operator: "and_",
+		is_anonymous: { eq_: false },
+	},
+	block_schemas: {
+		operator: "and_",
+		block_capabilities: { all_: ["write-path"] },
+	},
+} satisfies BlockDocumentsFilter;
+
 export const Route = createFileRoute("/blocks/")({
 	validateSearch: zodValidator(searchParams),
 	component: function RouteComponent() {
@@ -80,12 +95,28 @@ export const Route = createFileRoute("/blocks/")({
 			buildCountFilterBlockDocumentsQuery(blockDocumentsFilter),
 		);
 		const {
+			data: storageBlockDocuments,
+			isLoading: isLoadingStorageBlockDocuments,
+		} = useQuery(
+			buildListFilterBlockDocumentsQuery(storageBlockDocumentsFilter),
+		);
+		const {
 			data: defaultResultStorageBlock,
-			isLoading: isLoadingDefaultResultStorageBlock,
+			isLoading: isLoadingDefaultResultStorageBlockDetail,
 		} = useQuery({
 			...buildGetBlockDocumentQuery(defaultResultStorageBlockId ?? ""),
 			enabled: Boolean(defaultResultStorageBlockId),
 		});
+		const resolvedDefaultResultStorageBlock =
+			defaultResultStorageBlock ??
+			storageBlockDocuments?.find(
+				(blockDocument) => blockDocument.id === defaultResultStorageBlockId,
+			);
+		const isLoadingDefaultResultStorageBlock =
+			Boolean(defaultResultStorageBlockId) &&
+			!resolvedDefaultResultStorageBlock &&
+			(isLoadingDefaultResultStorageBlockDetail ||
+				isLoadingStorageBlockDocuments);
 		const {
 			updateDefaultResultStorage,
 			isPending: isUpdatingDefaultResultStorage,
@@ -157,7 +188,8 @@ export const Route = createFileRoute("/blocks/")({
 				onPaginationChange={onPaginationChange}
 				onClearFilters={onClearFilters}
 				defaultResultStorageBlockId={defaultResultStorageBlockId}
-				defaultResultStorageBlock={defaultResultStorageBlock}
+				defaultResultStorageBlock={resolvedDefaultResultStorageBlock}
+				storageBlockDocuments={storageBlockDocuments}
 				onUpdateDefaultResultStorage={handleUpdateDefaultResultStorage}
 				onClearDefaultResultStorage={handleClearDefaultResultStorage}
 				isUpdatingDefaultResultStorage={isUpdatingDefaultResultStorage}
@@ -193,6 +225,9 @@ export const Route = createFileRoute("/blocks/")({
 		void queryClient.prefetchQuery(buildListFilterBlockTypesQuery());
 		void queryClient.prefetchQuery(buildCountAllBlockDocumentsQuery());
 		void queryClient.prefetchQuery(buildGetDefaultResultStorageQuery());
+		void queryClient.prefetchQuery(
+			buildListFilterBlockDocumentsQuery(storageBlockDocumentsFilter),
+		);
 		void queryClient.prefetchQuery(
 			buildListFilterBlockDocumentsQuery(paginatedFilter),
 		);

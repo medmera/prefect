@@ -268,7 +268,7 @@ Run only after the prepare-release PR is merged into `release`.
 |-------|-------------|
 | `release_python` | Build and publish Python wheels/sdists |
 | `release_docker` | Build and push Docker images |
-| `build_integrations` | Include allowlisted integration packages (see `scripts/mmb-publish-integrations.conf`) |
+| `build_integrations` | Include integration packages (e.g. `prefect-gcp`) |
 | `dry_run` | Preview without publishing |
 | `force_release_version` | Require strict `x.y.z` version (no pre-release suffixes on base) |
 | `version_post` | PEP 440 post number for prefect (empty = none; `1` → `.post1`) |
@@ -276,8 +276,6 @@ Run only after the prepare-release PR is merged into `release`.
 | `base_version_override` | Force core base `x.y.z` (empty = auto from nearest upstream ancestor tag) |
 
 The workflow builds from `release` HEAD. Base versions come from the nearest **upstream-style** ancestor tag on HEAD (`git describe`); trailing `-mmb` on describe results is stripped. Python and Docker use the same resolution (`scripts/release-version-lib.sh`).
-
-**MMB publish allowlist:** core `prefect` is always published when `release_python=true`. Integration packages are restricted to the names listed in [`scripts/mmb-publish-integrations.conf`](scripts/mmb-publish-integrations.conf) (currently `prefect-gcp` and `prefect-dbt`). Other integrations in the upstream monorepo are skipped at release time — they are not built, uploaded, or tagged. Set `build_integrations=false` to skip all integrations (e.g. core-only `.postN` patches). To publish an additional integration later, add its directory name to the config file in a `[MMB]` commit.
 
 **MMB release tags:** after a successful publish, `scripts/create-mmb-release-tags.sh` creates annotated tags like `3.4.25-mmb`, `prefect-gcp-0.6.17-mmb`, or `3.7.2.post1-mmb` on the released commit. Dry runs skip tagging. Re-runs are idempotent unless a tag already points at a different commit.
 
@@ -313,9 +311,6 @@ These commits stay on `release` permanently and are preserved across future upst
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/mmb-publish-integrations.conf` | Allowlist of integration packages published to Artifact Registry |
-| `scripts/mmb-release-lib.sh` | Shared allowlist load/filter helpers (sourced by release scripts; not run directly) |
-| `scripts/test-mmb-release-lib.sh` | Local tests for allowlist helpers |
 | `scripts/mmb-prepare-release.sh` | **Primary.** Interactive release prep + PR creation |
 | `scripts/prepare-release-branch.sh` | Headless git merge/push (no PR, no interactive conflicts) |
 | `scripts/prepare-release-branch-lib.sh` | Shared library (sourced by the above; not run directly) |

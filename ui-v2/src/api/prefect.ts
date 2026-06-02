@@ -5402,10 +5402,7 @@ export interface components {
              *             When disabled, the client will skip the call to /admin/version that
              *             normally runs once per client context entry.  This is useful for worker
              *             subprocesses that inherit a known-compatible server configuration and
-             *             do not need to repeat the version handshake.  May be required on
-             *             IAP-protected deployments running builds before IAP was added to the
-             *             version check; prefer upgrading to a release that includes IAP-aware
-             *             version checking.
+             *             do not need to repeat the version handshake.
              * @default true
              */
             server_version_check_enabled: boolean;
@@ -9370,12 +9367,6 @@ export interface components {
              * @default false
              */
             crash_on_cancellation_failure: boolean;
-            /**
-             * Auto Install Dependencies
-             * @description Whether runners may install dependencies before executing flow runs. Enable this when deployments pull code that needs dependencies prepared at runtime.
-             * @default false
-             */
-            auto_install_dependencies: boolean;
             server?: components["schemas"]["RunnerServerSettings"];
         };
         /**
@@ -9742,18 +9733,6 @@ export interface components {
              * @default *
              */
             cors_allowed_headers: string;
-            /**
-             * Websocket Ping Interval
-             * @description WebSocket ping interval in seconds. Only applies when starting the server with `prefect server start`.
-             * @default 20
-             */
-            websocket_ping_interval: number;
-            /**
-             * Websocket Ping Timeout
-             * @description WebSocket ping timeout in seconds. Only applies when starting the server with `prefect server start`.
-             * @default 20
-             */
-            websocket_ping_timeout: number;
             /**
              * Max Parameter Size
              * @description The maximum size of parameters (in bytes, JSON-serialized) that can be stored on a flow run or deployment. Set to 0 to disable the limit.
@@ -10521,8 +10500,6 @@ export interface components {
             tasks?: components["schemas"]["ServerTasksSettings"];
             /** @description Settings for controlling server UI behavior */
             ui?: components["schemas"]["ServerUISettings"];
-            /** @description Settings for controlling server worker channel behavior */
-            worker_channel?: components["schemas"]["ServerWorkerChannelSettings"];
         };
         /**
          * ServerTasksSchedulingSettings
@@ -10604,35 +10581,6 @@ export interface components {
              * @default true
              */
             show_promotional_content: boolean;
-        };
-        /**
-         * ServerWorkerChannelSettings
-         * @description Settings for server-side worker channel storage and delivery policy.
-         */
-        ServerWorkerChannelSettings: {
-            /**
-             * Cleanup Queue Storage
-             * @description The module to use for storing worker cleanup delivery messages. The default in-memory backend stores messages, leases, wakeups, and dead-letter entries only in the current server process; use a Redis-backed storage module for high availability or restart-safe cleanup delivery.
-             * @default prefect.server.worker_communication.cleanup_queue.memory
-             */
-            cleanup_queue_storage: string;
-            /**
-             * Cleanup Lease Seconds
-             * @description The default cleanup message reservation lease duration in seconds.
-             * @default 30
-             */
-            cleanup_lease_seconds: number;
-            /**
-             * Cleanup Max Delivery Attempts
-             * @description The maximum number of committed cleanup reservations before a message is moved to the dead-letter queue.
-             * @default 3
-             */
-            cleanup_max_delivery_attempts: number;
-            /**
-             * Cleanup Completed Idempotency Retention Seconds
-             * @description How long completed cleanup idempotency records are retained after acknowledgement. None keeps them for the lifetime of the current server process. The in-memory backend does not survive restart; use Redis for high availability or restart-safe cleanup idempotency.
-             */
-            cleanup_completed_idempotency_retention_seconds?: number | null;
         };
         /**
          * SetStateStatus

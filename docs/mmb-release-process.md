@@ -140,7 +140,7 @@ Dispatch **MMB - Release Packages** from the Actions tab.
 |-------|-------------|
 | `release_python` | Build and publish Python wheels/sdists |
 | `release_docker` | Build and push Docker images |
-| `build_integrations` | Include allowlisted integration packages (see `scripts/mmb-publish-integrations.conf`) |
+| `build_integrations` | Include integration packages (e.g. `prefect-gcp`) |
 | `dry_run` | Preview without actually publishing |
 | `force_release_version` | Require a strict `x.y.z` base (no pre-release suffixes on base) |
 | `version_post` | Post number for prefect (empty = none; `1` → `.post1`) |
@@ -150,11 +150,6 @@ Dispatch **MMB - Release Packages** from the Actions tab.
 The workflow builds from the `release` branch HEAD. Base versions use the nearest
 upstream-style ancestor tag (`git describe`); `-mmb` suffixes on tags are
 ignored for version numbers. Python and Docker share `scripts/release-version-lib.sh`.
-
-Integration packages are published only when listed in
-[`scripts/mmb-publish-integrations.conf`](../scripts/mmb-publish-integrations.conf)
-(currently `prefect-gcp` and `prefect-dbt`). Core `prefect` is always published
-when `release_python=true`.
 
 ### Post-release (MMB-only patch)
 
@@ -191,8 +186,8 @@ internally:
 |-------------------|-------------|
 | `prefect` core | `3.4.25-mmb` or `3.7.2.post1-mmb` |
 | `prefect-gcp` | `prefect-gcp-0.6.17-mmb` |
-| `prefect-dbt` | `prefect-dbt-0.7.20-mmb` |
-| (allowlisted integrations only) | `{package}-{version}-mmb` |
+| `prefect-aws` | `prefect-aws-0.5.13-mmb` |
+| (all integrations) | `{package}-{version}-mmb` |
 
 Tags are created and pushed by `scripts/create-mmb-release-tags.sh` using the
 `PREFECT_REPO_PAT` secret. A few important behaviors:

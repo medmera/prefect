@@ -1,5 +1,3 @@
-import { useNavigate } from "@tanstack/react-router";
-import { useCallback } from "react";
 import type { Deployment } from "@/api/deployments";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { TagBadgeGroup } from "@/components/ui/tag-badge-group";
@@ -22,15 +20,6 @@ const FieldValue = ({
 	children: React.ReactNode;
 }) => <dd className={cn("text-sm", className)}>{children}</dd>;
 export const DeploymentMetadata = ({ deployment }: DeploymentMetadataProps) => {
-	const navigate = useNavigate();
-
-	const handleTagClick = useCallback(
-		(tag: string) => {
-			void navigate({ to: "/deployments", search: { tags: [tag] } });
-		},
-		[navigate],
-	);
-
 	const TOP_FIELDS = [
 		{
 			field: "Status",
@@ -140,11 +129,7 @@ export const DeploymentMetadata = ({ deployment }: DeploymentMetadataProps) => {
 			ComponentValue: () =>
 				deployment.tags && deployment.tags.length > 0 ? (
 					<dd>
-						<TagBadgeGroup
-							tags={deployment.tags}
-							maxTagsDisplayed={4}
-							onTagClick={handleTagClick}
-						/>
+						<TagBadgeGroup tags={deployment.tags} maxTagsDisplayed={4} />
 					</dd>
 				) : (
 					<None />

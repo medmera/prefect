@@ -1159,9 +1159,8 @@ class RetryFailedTasks(TaskRunOrchestrationRule):
         else:
             base_delay = delay or 0
 
-        # guard against negative relative jitter inputs; also guard against
-        # base_delay == 0: clamped_poisson_interval(0, ...) divides by zero.
-        if run_settings.retry_jitter_factor and base_delay > 0:
+        # guard against negative relative jitter inputs
+        if run_settings.retry_jitter_factor:
             delay = clamped_poisson_interval(
                 base_delay, clamping_factor=run_settings.retry_jitter_factor
             )
