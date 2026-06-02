@@ -167,7 +167,8 @@ branch, bringing in all upstream changes while preserving MMB customisations.
 ### Review checklist
 - [ ] Confirm the diff looks correct (upstream changes + no unintended modifications)
 - [ ] Verify integration package code is at the expected version
-- [ ] Merge when satisfied — then run **MMB - Release Packages** to publish
+- [ ] Merge with a **merge commit** (\`gh pr merge --merge\`) — do NOT squash or rebase
+- [ ] Then run **MMB - Release Packages** to publish
 EOF
     else
         cat <<EOF
@@ -185,7 +186,8 @@ branch, bringing in all upstream changes while preserving MMB customisations.
 ### Review checklist
 - [ ] Confirm the diff looks correct (upstream changes + no unintended modifications)
 - [ ] Verify integration package code is at the expected version
-- [ ] Merge when satisfied — then run **MMB - Release Packages** to publish
+- [ ] Merge with a **merge commit** (\`gh pr merge --merge\`) — do NOT squash or rebase
+- [ ] Then run **MMB - Release Packages** to publish
 EOF
     fi
 }
@@ -250,7 +252,7 @@ print_summary() {
     echo "Next steps:"
     echo "  1. Review the PR diff"
     echo "  2. Wait for mmb-python-tests CI to pass"
-    echo "  3. Merge the PR into release"
+    echo "  3. Merge the PR with a MERGE COMMIT (gh pr merge --merge). Do NOT squash."
     echo "  4. Dispatch MMB - Release Packages from GitHub Actions"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }

@@ -207,6 +207,11 @@ After step 2, a PR is opened: `release-prep/3.4.25` → `release`.
 
 1. Review the diff on GitHub
 2. Wait for **MMB - Unit tests** to pass
+3. Merge with a **merge commit** (`gh pr merge --merge`) — **never squash or rebase**
+
+Squash-merging a release-prep PR breaks upstream tag ancestry on `release`. Version
+resolution then falls back to older tags and may require `.postN` overrides. The
+local prep script already creates a proper merge commit; GitHub must preserve it.
 
 **CI trigger:** `.github/workflows/mmb-python-tests.yaml` runs on pull requests that touch Python source, tests, `pyproject.toml`, `Dockerfile`, etc. A typical upstream merge PR will satisfy these path filters.
 
