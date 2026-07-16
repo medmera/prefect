@@ -79,7 +79,7 @@ jobs:
       script_exit_code: ${{ steps.python_release.outputs.script_exit_code }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ env.PREFECT_REPO_PAT }}
@@ -233,7 +233,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -358,7 +358,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@v7
 
       - name: Create overall summary
         env:
