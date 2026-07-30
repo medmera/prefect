@@ -311,7 +311,11 @@ async def update_deployment(
             )
             try:
                 deployment.check_valid_configuration(work_pool.base_job_template)
-            except (MissingVariableError, jsonschema.exceptions.ValidationError) as exc:
+            except (
+                MissingVariableError,
+                jsonschema.exceptions.ValidationError,
+                ValidationError,
+            ) as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Error creating deployment: {exc!r}",
@@ -605,7 +609,7 @@ async def paginate_deployments(
         results=results,
         count=count,
         limit=limit,
-        pages=(count + limit - 1) // limit,
+        pages=(count + limit - 1) // limit if limit > 0 else 0,
         page=page,
     )
 

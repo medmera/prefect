@@ -1,6 +1,8 @@
 import asyncio
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -22,8 +24,10 @@ from prefect.runner.storage import (
     LocalStorage,
     RemoteStorage,
     RunnerStorage,
+    _clear_read_only_attributes,
     _get_git_clone_error_hint,
     _get_remote_storage_error_hint,
+    _rmtree_including_read_only,
     create_storage_from_source,
 )
 from prefect.utilities.filesystem import tmpchdir
@@ -334,6 +338,36 @@ class TestGitRepository:
         # Should NOT raise - the URLs match (same repo, same credentials)
         # Before fix: raises ValueError because stripped URL != URL with creds
         await repo.pull_code()
+
+    async def test_pull_code_clears_readonly_before_pull(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Regression test for GitHub issue #22446.
+
+        On Windows, git object files are read-only, so a `git pull` that needs
+        to repack or replace them fails with `[WinError 5] Access is denied`.
+        The read-only attribute on the `.git` directory must be cleared before
+        pulling.
+        """
+
+        async def mock_run_process(*args, **kwargs):
+            class Result:
+                stdout = "https://github.com/org/repo.git".encode()
+
+            return Result()
+
+        monkeypatch.setattr("prefect.runner.storage.run_process", mock_run_process)
+        monkeypatch.setattr("pathlib.Path.exists", lambda x: ".git" in str(x))
+
+        clear_mock = MagicMock()
+        monkeypatch.setattr(
+            "prefect.runner.storage._clear_read_only_attributes", clear_mock
+        )
+
+        repo = GitRepository(url="https://github.com/org/repo.git")
+        await repo.pull_code()
+
+        clear_mock.assert_called_once_with(repo.destination / ".git")
 
     async def test_pull_code_clone_repo(self, mock_run_process: AsyncMock, monkeypatch):
         monkeypatch.setattr("pathlib.Path.exists", lambda x: False)
@@ -1341,6 +1375,128 @@ class TestGitCloneErrorHints:
         repo = GitRepository(url="https://github.com/org/repo.git")
         with pytest.raises(RuntimeError, match="credentials or access token"):
             await repo.pull_code()
+
+    async def test_clone_repo_surfaces_stderr_when_no_hint_matches(self, monkeypatch):
+        """When git's stderr doesn't match any known pattern, the raw (sanitized)
+        stderr should appear in the RuntimeError so users don't have to
+        monkey-patch Prefect to find out what actually went wrong.
+
+        Regression for private-repo clone failures in GCP Cloud Run Jobs where
+        users saw only `exit code 1.` with no further signal.
+        """
+        monkeypatch.setattr("pathlib.Path.exists", lambda x: False)
+
+        stderr = (
+            b"remote: Counting objects: 100% (1/1), done.\n"
+            b"error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly\n"
+            b"fatal: early EOF\n"
+        )
+
+        async def mock_run_process_transient(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["git", "clone"], stderr=stderr)
+
+        monkeypatch.setattr(
+            "prefect.runner.storage.run_process", mock_run_process_transient
+        )
+
+        repo = GitRepository(url="https://github.com/org/repo.git")
+        with pytest.raises(RuntimeError) as exc_info:
+            await repo.pull_code()
+
+        message = str(exc_info.value)
+        assert "exit code 1" in message
+        assert "git stderr:" in message
+        # The actionable final line should be visible to the user.
+        assert "early EOF" in message
+
+    async def test_clone_repo_logs_sanitized_stderr_at_debug(self, monkeypatch, caplog):
+        """Sanitized stderr should be emitted on the GitRepository debug logger
+        even when credentials are present (so the exception chain is suppressed)."""
+        import logging
+
+        monkeypatch.setattr("pathlib.Path.exists", lambda x: False)
+
+        stderr = (
+            b"fatal: unable to access "
+            b"'https://ghp_SECRETTOKEN@github.com/org/repo.git/': HTTP/2 stream closed\n"
+            b"remote: token ghp_SECRETTOKEN was rejected\n"
+        )
+
+        async def mock_run_process(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["git", "clone"], stderr=stderr)
+
+        monkeypatch.setattr("prefect.runner.storage.run_process", mock_run_process)
+
+        # Embed credentials directly in the URL so exc_chain is suppressed.
+        repo = GitRepository(url="https://ghp_SECRETTOKEN@github.com/org/repo.git")
+        with caplog.at_level(
+            logging.DEBUG, logger="prefect.runner.storage.git-repository.repo"
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await repo.pull_code()
+
+        assert "ghp_SECRETTOKEN" not in str(exc_info.value)
+        debug_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG
+            and "git clone failed" in record.getMessage()
+        ]
+        assert debug_messages, "expected a DEBUG log with sanitized git stderr"
+        joined = "\n".join(debug_messages)
+        assert "ghp_SECRETTOKEN" not in joined, "token must be sanitized"
+        assert "github.com" in joined
+
+
+class TestClearReadOnlyAttributes:
+    """Tests for the Windows read-only object file workaround (issue #22446)."""
+
+    def test_noop_on_non_windows(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setattr("prefect.runner.storage.sys.platform", "linux")
+        readonly_file = tmp_path / "pack-abc.idx"
+        readonly_file.write_text("data")
+        readonly_file.chmod(0o444)
+
+        _clear_read_only_attributes(tmp_path)
+
+        assert not (os.stat(readonly_file).st_mode & stat.S_IWRITE)
+
+    def test_clears_readonly_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setattr("prefect.runner.storage.sys.platform", "win32")
+        pack_dir = tmp_path / "objects" / "pack"
+        pack_dir.mkdir(parents=True)
+        readonly_file = pack_dir / "pack-abc.idx"
+        readonly_file.write_text("data")
+        readonly_file.chmod(0o444)
+
+        _clear_read_only_attributes(tmp_path)
+
+        assert os.stat(readonly_file).st_mode & stat.S_IWRITE
+
+    def test_missing_path_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setattr("prefect.runner.storage.sys.platform", "win32")
+        # Should not raise when the directory does not exist
+        _clear_read_only_attributes(tmp_path / "does-not-exist")
+
+    def test_rmtree_removes_read_only_files(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """The reclone fallback must be able to delete read-only git objects."""
+        monkeypatch.setattr("prefect.runner.storage.sys.platform", "win32")
+        destination = tmp_path / "repo"
+        pack_dir = destination / ".git" / "objects" / "pack"
+        pack_dir.mkdir(parents=True)
+        readonly_file = pack_dir / "pack-abc.idx"
+        readonly_file.write_text("data")
+        readonly_file.chmod(0o444)
+
+        _rmtree_including_read_only(destination)
+
+        assert not destination.exists()
 
 
 class TestGitRepositoryConcurrency:

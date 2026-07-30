@@ -94,8 +94,14 @@ async def invalid_work_pool(session):
 
 
 def assert_status_events(resource_name: str, events: List[str]):
+    # Status assertions only care about status transitions; lifecycle
+    # created/updated/deleted events (e.g. from creating the work pool and its
+    # default queue) are emitted separately and are not counted here.
     found_events = [
-        event for item in AssertingEventsClient.all for event in item.events
+        event
+        for item in AssertingEventsClient.all
+        for event in item.events
+        if not event.event.endswith((".created", ".updated", ".deleted"))
     ]
     assert len(events) == len(found_events)
 
@@ -551,6 +557,7 @@ class TestDeleteWorkPool:
 
 class TestUpdateWorkPool:
     async def test_update_work_pool(self, client, session, work_pool):
+        AssertingEventsClient.reset()
         response = await client.patch(
             f"/work_pools/{work_pool.name}",
             json=dict(is_paused=True, concurrency_limit=5),
@@ -1480,6 +1487,9 @@ class TestUpdateWorkQueue:
         assert work_queue_1.concurrency_limit is None
         assert work_queue_1.status == "NOT_READY"
 
+        # Only count events from the update below, not work-pool/queue creation
+        AssertingEventsClient.reset()
+
         new_data = schemas.actions.WorkQueueUpdate(
             is_paused=True, concurrency_limit=3
         ).model_dump(mode="json", exclude_unset=True)
@@ -1514,6 +1524,9 @@ class TestUpdateWorkQueue:
         work_pool,
     ):
         assert work_queue_1.status == "NOT_READY"
+
+        # Only count events from the update below, not work-pool/queue creation
+        AssertingEventsClient.reset()
 
         new_data = schemas.actions.WorkQueueUpdate(
             is_paused=True, concurrency_limit=3
@@ -1554,6 +1567,9 @@ class TestUpdateWorkQueue:
         paused_work_queue,
     ):
         assert paused_work_queue.status == "PAUSED"
+
+        # Only count events from the update below, not work-queue creation
+        AssertingEventsClient.reset()
 
         new_data = schemas.actions.WorkQueueUpdate(
             is_paused=True,
@@ -1600,6 +1616,9 @@ class TestUpdateWorkQueue:
         ready_work_queue,
     ):
         assert ready_work_queue.status == "READY"
+
+        # Only count events from the update below, not work-queue creation
+        AssertingEventsClient.reset()
 
         new_data = schemas.actions.WorkQueueUpdate(
             is_paused=False,
@@ -2372,9 +2391,17 @@ class TestWorkerChannelConnect:
     async def test_connect_rolls_back_created_pool_without_status_event_on_failure(
         self, test_client: TestClient, session: AsyncSession
     ):
-        event_count_before = sum(
-            len(getattr(client, "events", [])) for client in AssertingEventsClient.all
-        )
+        def status_event_count() -> int:
+            # Lifecycle created/updated/deleted events are emitted inline and are
+            # not the subject of this test, which checks for status events.
+            return sum(
+                1
+                for client in AssertingEventsClient.all
+                for event in getattr(client, "events", [])
+                if not event.event.endswith((".created", ".updated", ".deleted"))
+            )
+
+        event_count_before = status_event_count()
         hello = _worker_hello_frame(
             create_pool_if_not_found=True,
             default_base_job_template=_valid_base_job_template(),
@@ -2395,9 +2422,7 @@ class TestWorkerChannelConnect:
             session=session, work_pool_name="rolled-back-pool"
         )
         assert created is None
-        event_count_after = sum(
-            len(getattr(client, "events", [])) for client in AssertingEventsClient.all
-        )
+        event_count_after = status_event_count()
         assert event_count_after == event_count_before
 
     async def test_connect_handles_concurrent_missing_work_pool_creation(
@@ -2559,7 +2584,7 @@ class TestWorkerChannelConnect:
         )
         assert event_count_after == event_count_before
 
-    def test_connect_rejects_unsupported_optional_cleanup_delivery(
+    def test_connect_accepts_optional_cleanup_delivery_for_capable_worker(
         self, test_client: TestClient, work_pool
     ):
         hello = _worker_hello_frame(
@@ -2580,9 +2605,10 @@ class TestWorkerChannelConnect:
         assert ready.payload.accepted_capabilities == [
             WORKER_HEARTBEAT_CAPABILITY,
             WORK_POOL_SNAPSHOT_CAPABILITY,
+            CLEANUP_DELIVERY_CAPABILITY,
         ]
-        assert ready.payload.rejected_capabilities == [CLEANUP_DELIVERY_CAPABILITY]
-        assert ready.payload.effective_max_cleanup_concurrency == 0
+        assert ready.payload.rejected_capabilities == []
+        assert ready.payload.effective_max_cleanup_concurrency == 1
 
     def test_connect_rejects_unknown_optional_capability(
         self, test_client: TestClient, work_pool
@@ -2894,6 +2920,163 @@ class TestWorkerChannelConnect:
 
         assert snapshot.payload.snapshot_sequence == 2
         assert snapshot.payload.work_pool.base_job_template == latest_base_job_template
+
+    async def test_heartbeat_after_missed_update_triggers_reconciliation_snapshot(
+        self, test_client: TestClient, session: AsyncSession, work_pool
+    ) -> None:
+        """Update the pool directly (simulating a lost invalidation), then
+        send a heartbeat.  The server should detect the stale timestamp and
+        push a reconciliation snapshot."""
+        with _connect_worker_channel(test_client, work_pool.name) as websocket:
+            _authenticate_worker_channel(websocket)
+            websocket.send_json(_worker_hello_frame())
+            ready = WorkerReadyFrame.model_validate(websocket.receive_json())
+
+            updated_template = _valid_base_job_template(["echo", "updated"])
+            await models.workers.update_work_pool(
+                session=session,
+                work_pool_id=work_pool.id,
+                work_pool=schemas.actions.WorkPoolUpdate(
+                    base_job_template=updated_template,
+                ),
+            )
+            await session.commit()
+
+            websocket.send_json(_worker_heartbeat_frame(str(ready.payload.consumer_id)))
+            snapshot = WorkPoolSnapshotFrame.model_validate(websocket.receive_json())
+
+        assert snapshot.payload.snapshot_sequence == 2
+        assert snapshot.payload.reason == "heartbeat_reconciliation"
+        assert snapshot.payload.work_pool.base_job_template == updated_template
+
+    async def test_heartbeat_with_unchanged_pool_sends_no_snapshot(
+        self, test_client: TestClient, client: AsyncClient, work_pool
+    ) -> None:
+        """A heartbeat on an unchanged pool should not produce a snapshot.
+        Verified by sending a heartbeat, then triggering a real update; the
+        next frame must be the update snapshot, not a reconciliation."""
+        with _connect_worker_channel(test_client, work_pool.name) as websocket:
+            _authenticate_worker_channel(websocket)
+            websocket.send_json(_worker_hello_frame())
+            ready = WorkerReadyFrame.model_validate(websocket.receive_json())
+
+            websocket.send_json(_worker_heartbeat_frame(str(ready.payload.consumer_id)))
+
+            # Trigger a real update via API (publishes invalidation)
+            probe_template = _valid_base_job_template(["echo", "probe"])
+            response = await client.patch(
+                f"/work_pools/{work_pool.name}",
+                json=schemas.actions.WorkPoolUpdate(
+                    base_job_template=probe_template,
+                ).model_dump(mode="json", exclude_unset=True),
+            )
+            assert response.status_code == status.HTTP_204_NO_CONTENT
+
+            snapshot = WorkPoolSnapshotFrame.model_validate(websocket.receive_json())
+
+        # If the heartbeat had queued a reconciliation, it would have
+        # arrived before the invalidation-driven snapshot.
+        assert snapshot.payload.snapshot_sequence == 2
+        assert snapshot.payload.reason == "work_pool_updated"
+
+    async def test_heartbeat_after_normal_invalidation_does_not_duplicate_snapshot(
+        self,
+        test_client: TestClient,
+        client: AsyncClient,
+        work_pool,
+    ) -> None:
+        """After a snapshot delivered via the normal invalidation path, a
+        heartbeat should NOT trigger a duplicate push because the tracked
+        timestamp was refreshed in _build_snapshot_frame."""
+        with _connect_worker_channel(test_client, work_pool.name) as websocket:
+            _authenticate_worker_channel(websocket)
+            websocket.send_json(_worker_hello_frame())
+            ready = WorkerReadyFrame.model_validate(websocket.receive_json())
+
+            first_template = _valid_base_job_template(["echo", "first"])
+            response = await client.patch(
+                f"/work_pools/{work_pool.name}",
+                json=schemas.actions.WorkPoolUpdate(
+                    base_job_template=first_template,
+                ).model_dump(mode="json", exclude_unset=True),
+            )
+            assert response.status_code == status.HTTP_204_NO_CONTENT
+
+            snapshot = WorkPoolSnapshotFrame.model_validate(websocket.receive_json())
+            assert snapshot.payload.reason == "work_pool_updated"
+
+            # Heartbeat after the delivered snapshot
+            websocket.send_json(_worker_heartbeat_frame(str(ready.payload.consumer_id)))
+
+            # Trigger another real update as a probe
+            probe_template = _valid_base_job_template(["echo", "probe"])
+            response = await client.patch(
+                f"/work_pools/{work_pool.name}",
+                json=schemas.actions.WorkPoolUpdate(
+                    base_job_template=probe_template,
+                ).model_dump(mode="json", exclude_unset=True),
+            )
+            assert response.status_code == status.HTTP_204_NO_CONTENT
+
+            probe_snapshot = WorkPoolSnapshotFrame.model_validate(
+                websocket.receive_json()
+            )
+
+        # If the heartbeat had queued a reconciliation, it would have
+        # arrived before the probe snapshot.
+        assert probe_snapshot.payload.snapshot_sequence == 3
+        assert probe_snapshot.payload.reason == "work_pool_updated"
+        assert probe_snapshot.payload.work_pool.base_job_template == probe_template
+
+    async def test_two_heartbeats_after_change_produce_exactly_one_reconciliation(
+        self,
+        test_client: TestClient,
+        client: AsyncClient,
+        session: AsyncSession,
+        work_pool,
+    ) -> None:
+        """Two consecutive heartbeats after a missed update should produce
+        exactly one reconciliation snapshot (no re-push loop)."""
+        with _connect_worker_channel(test_client, work_pool.name) as websocket:
+            _authenticate_worker_channel(websocket)
+            websocket.send_json(_worker_hello_frame())
+            ready = WorkerReadyFrame.model_validate(websocket.receive_json())
+
+            updated_template = _valid_base_job_template(["echo", "updated"])
+            await models.workers.update_work_pool(
+                session=session,
+                work_pool_id=work_pool.id,
+                work_pool=schemas.actions.WorkPoolUpdate(
+                    base_job_template=updated_template,
+                ),
+            )
+            await session.commit()
+
+            # First heartbeat triggers reconciliation
+            websocket.send_json(_worker_heartbeat_frame(str(ready.payload.consumer_id)))
+            snapshot = WorkPoolSnapshotFrame.model_validate(websocket.receive_json())
+            assert snapshot.payload.reason == "heartbeat_reconciliation"
+
+            # Second heartbeat — should NOT produce another snapshot
+            websocket.send_json(_worker_heartbeat_frame(str(ready.payload.consumer_id)))
+
+            # Trigger a real update as a probe to confirm no duplicate
+            probe_template = _valid_base_job_template(["echo", "probe"])
+            response = await client.patch(
+                f"/work_pools/{work_pool.name}",
+                json=schemas.actions.WorkPoolUpdate(
+                    base_job_template=probe_template,
+                ).model_dump(mode="json", exclude_unset=True),
+            )
+            assert response.status_code == status.HTTP_204_NO_CONTENT
+
+            probe_snapshot = WorkPoolSnapshotFrame.model_validate(
+                websocket.receive_json()
+            )
+
+        assert probe_snapshot.payload.snapshot_sequence == 3
+        assert probe_snapshot.payload.reason == "work_pool_updated"
+        assert probe_snapshot.payload.work_pool.base_job_template == probe_template
 
     async def test_work_pool_delete_closes_connection_without_snapshot(
         self, test_client: TestClient, client: AsyncClient, work_pool

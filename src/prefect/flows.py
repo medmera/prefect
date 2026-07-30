@@ -74,7 +74,7 @@ from prefect.logging.loggers import flow_run_logger
 from prefect.results import ResultSerializer, ResultStorage
 from prefect.schedules import Schedule
 from prefect.settings import (
-    PREFECT_DEFAULT_WORK_POOL_NAME,
+    PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME,
     PREFECT_FLOW_DEFAULT_RETRIES,
     PREFECT_FLOW_DEFAULT_RETRY_DELAY_SECONDS,
     PREFECT_TESTING_UNIT_TEST_MODE,
@@ -706,7 +706,11 @@ class Flow(Generic[P, R]):
                 from fastapi.encoders import jsonable_encoder
 
                 serialized_parameters[key] = jsonable_encoder(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
+                # `jsonable_encoder` recurses into unknown objects with no cycle
+                # or depth limit, so a deeply-nested or self-referential value
+                # raises `RecursionError`. Treat it like any other unserializable
+                # value and fall back to the placeholder below.
                 logger.debug(
                     f"Parameter {key!r} for flow {self.name!r} is unserializable. "
                     f"Type {type(value).__name__!r} and will not be stored "
@@ -1464,7 +1468,7 @@ class Flow(Generic[P, R]):
         Args:
             name: The name to give the created deployment.
             work_pool_name: The name of the work pool to use for this deployment. Defaults to
-                the value of `PREFECT_DEFAULT_WORK_POOL_NAME`.
+                the value of `PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME`.
             image: The name of the Docker image to build, including the registry and
                 repository. Pass a DockerImage instance to customize the Dockerfile used
                 and build arguments.
@@ -1530,11 +1534,12 @@ class Flow(Generic[P, R]):
             ```
         """
         if not (
-            work_pool_name := work_pool_name or PREFECT_DEFAULT_WORK_POOL_NAME.value()
+            work_pool_name := work_pool_name
+            or PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME.value()
         ):
             raise ValueError(
                 "No work pool name provided. Please provide a `work_pool_name` or set the"
-                " `PREFECT_DEFAULT_WORK_POOL_NAME` environment variable."
+                " `PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME` environment variable."
             )
 
         from prefect.client.orchestration import get_client
@@ -1661,7 +1666,7 @@ class Flow(Generic[P, R]):
         Args:
             name: The name to give the created deployment.
             work_pool_name: The name of the work pool to use for this deployment. Defaults to
-                the value of `PREFECT_DEFAULT_WORK_POOL_NAME`.
+                the value of `PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME`.
             image: The name of the Docker image to build, including the registry and
                 repository. Pass a DockerImage instance to customize the Dockerfile used
                 and build arguments.
@@ -3208,19 +3213,11 @@ async def load_flow_from_flow_run(
         "PREFECT__STORAGE_BASE_PATH"
     )
 
-    # If there's no colon, assume it's a module path
-    if ":" not in deployment.entrypoint:
-        run_logger.debug(
-            f"Importing flow code from module path {deployment.entrypoint}"
-        )
-        flow = await run_sync_in_worker_thread(
-            load_flow_from_entrypoint,
-            deployment.entrypoint,
-            use_placeholder_flow=use_placeholder_flow,
-        )
-        return flow
+    # Module-path entrypoints (no colon) rely on pull steps to place the code on
+    # sys.path, so the import must run *after* pull steps — not before.
+    is_module_path = ":" not in deployment.entrypoint
 
-    if not ignore_storage and not deployment.pull_steps:
+    if not is_module_path and not ignore_storage and not deployment.pull_steps:
         sys.path.insert(0, ".")
         if deployment.storage_document_id:
             storage_document = await client.read_block_document(
@@ -3245,7 +3242,7 @@ async def load_flow_from_flow_run(
         run_logger.info(f"Downloading flow code from storage at {from_path!r}")
         await storage_block.get_directory(from_path=from_path, local_path=".")
 
-    if deployment.pull_steps:
+    if not ignore_storage and deployment.pull_steps:
         run_logger.info(f"Running {len(deployment.pull_steps)} deployment pull step(s)")
 
         from prefect.deployments.steps.core import StepExecutionError, run_steps
@@ -3266,6 +3263,17 @@ async def load_flow_from_flow_run(
         if output.get("directory"):
             run_logger.debug(f"Changing working directory to {output['directory']!r}")
             os.chdir(output["directory"])
+
+    if is_module_path:
+        run_logger.debug(
+            f"Importing flow code from module path {deployment.entrypoint}"
+        )
+        flow = await run_sync_in_worker_thread(
+            load_flow_from_entrypoint,
+            deployment.entrypoint,
+            use_placeholder_flow=use_placeholder_flow,
+        )
+        return flow
 
     import_path = relative_path_to_current_platform(deployment.entrypoint)
     run_logger.debug(f"Importing flow code from '{import_path}'")

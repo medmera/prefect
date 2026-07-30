@@ -13530,7 +13530,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13564,7 +13564,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13687,7 +13687,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13768,7 +13768,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13839,7 +13839,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13900,7 +13900,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13917,7 +13917,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13953,7 +13953,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -13984,7 +13984,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14048,7 +14048,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14075,7 +14075,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14112,7 +14112,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14129,7 +14129,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14272,7 +14272,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14415,7 +14415,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14451,7 +14451,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14487,7 +14487,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14518,7 +14518,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14535,7 +14535,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14642,7 +14642,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14690,7 +14690,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14715,7 +14715,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14742,7 +14742,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14759,7 +14759,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14776,7 +14776,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14796,7 +14796,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14823,7 +14823,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -14850,7 +14850,7 @@
                     "limit": {
                         "type": "integer",
                         "title": "Limit",
-                        "description": "Defaults to PREFECT_API_DEFAULT_LIMIT if not provided."
+                        "description": "Defaults to PREFECT_SERVER_API_DEFAULT_LIMIT if not provided."
                     }
                 },
                 "type": "object",
@@ -24449,6 +24449,22 @@
                             "PREFECT_SERVER_DATABASE_CONNECTION_TIMEOUT",
                             "PREFECT_API_DATABASE_CONNECTION_TIMEOUT"
                         ]
+                    },
+                    "migration_timeout": {
+                        "anyOf": [
+                            {
+                                "type": "number",
+                                "exclusiveMinimum": 0.0
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Migration Timeout",
+                        "description": "A statement timeout, in seconds, applied to database migrations. Schema changes such as concurrent index builds on large tables can take much longer than an ordinary API query, so migrations are not bound by `server.database.timeout`. Defaults to `None` (no timeout); set a positive value to bound migration statement duration.",
+                        "supported_environment_variables": [
+                            "PREFECT_SERVER_DATABASE_MIGRATION_TIMEOUT"
+                        ]
                     }
                 },
                 "type": "object",
@@ -24784,11 +24800,57 @@
                             "PREFECT_SERVER_SERVICES_CANCELLATION_CLEANUP_LOOP_SECONDS",
                             "PREFECT_API_SERVICES_CANCELLATION_CLEANUP_LOOP_SECONDS"
                         ]
+                    },
+                    "cancelling_timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "title": "Cancelling Timeout Seconds",
+                        "description": "The cancellation cleanup service will enqueue worker cleanup for flow runs that remain in CANCELLING longer than this many seconds. Defaults to `300`.",
+                        "default": 300,
+                        "supported_environment_variables": [
+                            "PREFECT_SERVER_SERVICES_CANCELLATION_CLEANUP_CANCELLING_TIMEOUT_SECONDS"
+                        ]
                     }
                 },
                 "type": "object",
                 "title": "ServerServicesCancellationCleanupSettings",
                 "description": "Settings for controlling the cancellation cleanup service"
+            },
+            "ServerServicesCleanupReconcilerSettings": {
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "title": "Enabled",
+                        "description": "Whether or not to start the cleanup reconciler service in the server application.",
+                        "default": true,
+                        "supported_environment_variables": [
+                            "PREFECT_SERVER_SERVICES_CLEANUP_RECONCILER_ENABLED"
+                        ]
+                    },
+                    "loop_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "title": "Loop Seconds",
+                        "description": "The cleanup reconciler service will look for expired cleanup message leases this often. Defaults to `5`.",
+                        "default": 5,
+                        "supported_environment_variables": [
+                            "PREFECT_SERVER_SERVICES_CLEANUP_RECONCILER_LOOP_SECONDS"
+                        ]
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0.0,
+                        "title": "Batch Size",
+                        "description": "The maximum number of expired cleanup message leases to process per service loop. Defaults to `100`.",
+                        "default": 100,
+                        "supported_environment_variables": [
+                            "PREFECT_SERVER_SERVICES_CLEANUP_RECONCILER_BATCH_SIZE"
+                        ]
+                    }
+                },
+                "type": "object",
+                "title": "ServerServicesCleanupReconcilerSettings",
+                "description": "Settings for controlling the cleanup reconciler service."
             },
             "ServerServicesDBVacuumSettings": {
                 "properties": {
@@ -25247,6 +25309,11 @@
                         "$ref": "#/components/schemas/ServerServicesRepossessorSettings",
                         "supported_environment_variables": []
                     },
+                    "cleanup_reconciler": {
+                        "$ref": "#/components/schemas/ServerServicesCleanupReconcilerSettings",
+                        "description": "Settings for controlling the cleanup reconciler service",
+                        "supported_environment_variables": []
+                    },
                     "task_run_recorder": {
                         "$ref": "#/components/schemas/ServerServicesTaskRunRecorderSettings",
                         "supported_environment_variables": []
@@ -25592,8 +25659,8 @@
                     "v2_enabled": {
                         "type": "boolean",
                         "title": "V2 Enabled",
-                        "description": "Whether neutral UI entry points should default to the experimental V2 UI instead of V1 when the browser has no saved UI preference.",
-                        "default": false,
+                        "description": "Whether neutral UI entry points should default to the V2 UI instead of V1 when the browser has no saved UI preference. Set to false to restore V1 as the default for browsers without a saved preference.",
+                        "default": true,
                         "supported_environment_variables": [
                             "PREFECT_SERVER_UI_V2_ENABLED"
                         ]
@@ -25658,7 +25725,7 @@
                     "cleanup_queue_storage": {
                         "type": "string",
                         "title": "Cleanup Queue Storage",
-                        "description": "The module to use for storing worker cleanup delivery messages. The default in-memory backend stores messages, leases, wakeups, and dead-letter entries only in the current server process; use a Redis-backed storage module for high availability or restart-safe cleanup delivery.",
+                        "description": "The module to use for storing worker cleanup delivery messages. The default in-memory backend stores messages, leases, wakeups, and dead-letter entries only in the current server process; use an external storage module for high availability or restart-safe cleanup delivery.",
                         "default": "prefect.server.worker_communication.cleanup_queue.memory",
                         "supported_environment_variables": [
                             "PREFECT_SERVER_WORKER_CHANNEL_CLEANUP_QUEUE_STORAGE"
@@ -25695,7 +25762,7 @@
                             }
                         ],
                         "title": "Cleanup Completed Idempotency Retention Seconds",
-                        "description": "How long completed cleanup idempotency records are retained after acknowledgement. None keeps them for the lifetime of the current server process. The in-memory backend does not survive restart; use Redis for high availability or restart-safe cleanup idempotency.",
+                        "description": "How long completed cleanup idempotency records are retained after acknowledgement. None keeps them for the lifetime of the current server process. The in-memory backend does not survive restart; use external storage for high availability or restart-safe cleanup idempotency.",
                         "supported_environment_variables": [
                             "PREFECT_SERVER_WORKER_CHANNEL_CLEANUP_COMPLETED_IDEMPOTENCY_RETENTION_SECONDS"
                         ]
