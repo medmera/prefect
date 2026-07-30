@@ -7,11 +7,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
 from prefect.server.database import PrefectDBInterface, db_injector, orm_models
+from prefect.server.events import clients
+from prefect.server.events.schemas import lifecycle
 from prefect.server.schemas import actions, filters, sorting
 from prefect.server.schemas.core import Artifact
 from prefect.types._datetime import DateTime, now
 
 T = TypeVar("T", bound=tuple[Any, ...])
+
+
+async def emit_artifact_collection_created_event(
+    artifact_collection: orm_models.ArtifactCollection,
+) -> None:
+    """Emit an event when an artifact collection is created."""
+    async with clients.PrefectServerEventsClient() as events_client:
+        await events_client.emit(
+            lifecycle.artifact_collection_created_event(artifact_collection, now("UTC"))
+        )
+
+
+async def emit_artifact_collection_updated_event(
+    artifact_collection: orm_models.ArtifactCollection,
+) -> None:
+    """Emit an event when an artifact collection's latest artifact changes."""
+    async with clients.PrefectServerEventsClient() as events_client:
+        await events_client.emit(
+            lifecycle.artifact_collection_updated_event(artifact_collection, now("UTC"))
+        )
+
+
+async def emit_artifact_collection_deleted_event(
+    artifact_collection: orm_models.ArtifactCollection,
+) -> None:
+    """Emit an event when an artifact collection is deleted."""
+    async with clients.PrefectServerEventsClient() as events_client:
+        await events_client.emit(
+            lifecycle.artifact_collection_deleted_event(artifact_collection, now("UTC"))
+        )
 
 
 @db_injector
@@ -63,6 +95,11 @@ async def _insert_into_artifact_collection(
             f"Artifact {artifact.id} was not inserted into the artifact collection"
             " table."
         )
+
+    if model.created == model.updated:
+        await emit_artifact_collection_created_event(model)
+    else:
+        await emit_artifact_collection_updated_event(model)
 
     return model
 
@@ -272,7 +309,6 @@ async def read_artifacts(
         task_run_filter: Only select artifacts whose task runs matching this filter
         deployment_filter: Only select artifacts whose flow runs belong to deployments matching this filter
         flow_filter: Only select artifacts whose flow runs belong to flows matching this filter
-        work_pool_filter: Only select artifacts whose flow runs belong to work pools matching this filter
     """
     query = sa.select(db.Artifact).order_by(*sort.as_sql_sort())
 
@@ -320,7 +356,6 @@ async def read_latest_artifacts(
         task_run_filter: Only select artifacts whose task runs matching this filter
         deployment_filter: Only select artifacts whose flow runs belong to deployments matching this filter
         flow_filter: Only select artifacts whose flow runs belong to flows matching this filter
-        work_pool_filter: Only select artifacts whose flow runs belong to work pools matching this filter
     """
     query = sa.select(db.ArtifactCollection).order_by(*sort.as_sql_sort())
     query = await _apply_artifact_collection_filters(
@@ -503,6 +538,14 @@ async def delete_artifact(
             )
         ).scalar_one_or_none()
 
+        collection = (
+            await session.execute(
+                sa.select(db.ArtifactCollection).where(
+                    db.ArtifactCollection.key == artifact.key
+                )
+            )
+        ).scalar_one_or_none()
+
         if next_latest_version is not None:
             set_next_latest_version = (
                 sa.update(db.ArtifactCollection)
@@ -521,7 +564,13 @@ async def delete_artifact(
             )
             await session.execute(set_next_latest_version)
 
+            if collection is not None:
+                await session.refresh(collection)
+                await emit_artifact_collection_updated_event(collection)
+
         else:
+            if collection is not None:
+                await emit_artifact_collection_deleted_event(collection)
             await session.execute(
                 sa.delete(db.ArtifactCollection)
                 .where(db.ArtifactCollection.key == artifact.key)

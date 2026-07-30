@@ -90,6 +90,37 @@ def interactive_console(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("readchar._posix_read.readchar", readchar)
 
 
+def test_deploy_init_field_value_can_contain_equals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    captured_inputs: dict[str, Any] = {}
+
+    def initialize_project(
+        name: str | None = None,
+        recipe: str | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> list[str]:
+        captured_inputs.update(inputs or {})
+        return ["prefect.yaml"]
+
+    monkeypatch.setattr("prefect.deployments.initialize_project", initialize_project)
+
+    invoke_and_assert(
+        [
+            "deploy",
+            "init",
+            "--recipe",
+            "local",
+            "--field",
+            "api_key=aGVsbG8gd29ybGQ=",
+        ],
+        temp_dir=str(tmp_path),
+        expected_code=0,
+    )
+
+    assert captured_inputs == {"api_key": "aGVsbG8gd29ybGQ="}
+
+
 @pytest.fixture
 def project_dir(tmp_path: Path):
     with tmpchdir(str(tmp_path)):
@@ -738,6 +769,154 @@ class TestProjectDeploy:
                 }
             ]
 
+        @pytest.mark.usefixtures("project_dir")
+        async def test_project_deploy_empty_pull_disables_pull_steps(
+            self,
+            work_pool: WorkPool,
+            prefect_client: PrefectClient,
+        ):
+            prefect_file = Path("prefect.yaml")
+            config = yaml.safe_load(prefect_file.read_text())
+            config["pull"] = []
+            prefect_file.write_text(yaml.safe_dump(config))
+
+            await run_sync_in_worker_thread(
+                invoke_and_assert,
+                command=(
+                    "deploy ./flows/hello.py:my_flow -n test-name -p"
+                    f" {work_pool.name} --interval 60"
+                ),
+                expected_code=0,
+                expected_output_does_not_contain=[
+                    "Your Prefect workers will attempt to load your flow from:"
+                ],
+            )
+
+            deployment = await prefect_client.read_deployment_by_name(
+                "An important name/test-name"
+            )
+            assert deployment.pull_steps == []
+
+        @pytest.mark.usefixtures("interactive_console", "project_dir")
+        async def test_project_deploy_empty_pull_does_not_prompt_storage(
+            self,
+            work_pool: WorkPool,
+        ):
+            prefect_file = Path("prefect.yaml")
+            config = yaml.safe_load(prefect_file.read_text())
+            config["pull"] = []
+            prefect_file.write_text(yaml.safe_dump(config))
+
+            await run_sync_in_worker_thread(
+                invoke_and_assert,
+                command=(
+                    "deploy ./flows/hello.py:my_flow -n test-name -p"
+                    f" {work_pool.name} --version 1.0.0 -jv env=prod -t foo-bar"
+                    " --interval 60"
+                ),
+                # don't save the deployment configuration
+                user_input="n" + readchar.key.ENTER,
+                expected_code=0,
+                expected_output_does_not_contain=[
+                    "Would you like your workers to pull your flow code from a remote"
+                    " storage location when running this flow?"
+                ],
+            )
+
+        @pytest.mark.usefixtures("project_dir")
+        async def test_project_deploy_deployment_empty_pull_overrides_global(
+            self,
+            work_pool: WorkPool,
+            prefect_client: PrefectClient,
+        ):
+            prefect_file = Path("prefect.yaml")
+            config = yaml.safe_load(prefect_file.read_text())
+            config["pull"] = [
+                {
+                    "prefect.deployments.steps.git_clone": {
+                        "repository": "https://example.com/org/repo.git",
+                    }
+                }
+            ]
+            config["deployments"][0]["pull"] = []
+            prefect_file.write_text(yaml.safe_dump(config))
+
+            await run_sync_in_worker_thread(
+                invoke_and_assert,
+                command=(
+                    "deploy ./flows/hello.py:my_flow -n test-name -p"
+                    f" {work_pool.name} --interval 60"
+                ),
+                expected_code=0,
+            )
+
+            deployment = await prefect_client.read_deployment_by_name(
+                "An important name/test-name"
+            )
+            assert deployment.pull_steps == []
+
+        @pytest.mark.usefixtures("project_dir")
+        async def test_project_deploy_null_pull_generates_default_action(
+            self,
+            work_pool: WorkPool,
+            prefect_client: PrefectClient,
+            project_dir: Path,
+        ):
+            prefect_file = Path("prefect.yaml")
+            config = yaml.safe_load(prefect_file.read_text())
+            config["pull"] = None
+            prefect_file.write_text(yaml.safe_dump(config))
+
+            await run_sync_in_worker_thread(
+                invoke_and_assert,
+                command=(
+                    "deploy ./flows/hello.py:my_flow -n test-name -p"
+                    f" {work_pool.name} --interval 60"
+                ),
+                expected_code=0,
+            )
+
+            deployment = await prefect_client.read_deployment_by_name(
+                "An important name/test-name"
+            )
+            assert deployment.pull_steps == [
+                {
+                    "prefect.deployments.steps.set_working_directory": {
+                        "directory": str(project_dir)
+                    }
+                }
+            ]
+
+        @pytest.mark.usefixtures("interactive_console", "project_dir")
+        async def test_project_deploy_empty_pull_preserved_when_saved(
+            self,
+            work_pool: WorkPool,
+        ):
+            prefect_file = Path("prefect.yaml")
+            config = yaml.safe_load(prefect_file.read_text())
+            config["pull"] = []
+            prefect_file.write_text(yaml.safe_dump(config))
+
+            await run_sync_in_worker_thread(
+                invoke_and_assert,
+                command=(
+                    "deploy ./flows/hello.py:my_flow -n test-name -p"
+                    f" {work_pool.name} --interval 60"
+                ),
+                # save the deployment configuration
+                user_input="y" + readchar.key.ENTER,
+                expected_code=0,
+            )
+
+            saved = yaml.safe_load(prefect_file.read_text())
+            assert saved["pull"] == []
+            saved_deployment = next(
+                d for d in saved["deployments"] if d.get("name") == "test-name"
+            )
+            # An explicit empty pull must not be saved back as null, which would
+            # regenerate the default set_working_directory step on redeploy.
+            assert saved_deployment.get("pull", []) == []
+
         async def test_project_deploy_with_no_prefect_yaml_git_repo_no_remote(
             self,
             work_pool: WorkPool,
@@ -1170,7 +1349,11 @@ class TestProjectDeploy:
                 expected_code=0,
                 user_input=(
                     # Decline pulling from remote storage
-                    "n" + readchar.key.ENTER
+                    "n"
+                    + readchar.key.ENTER
+                    # decline saving to the (existing) prefect.yaml
+                    + "n"
+                    + readchar.key.ENTER
                 ),
                 expected_output_contains=[
                     "prefect deployment run 'An important name/test-name'"
@@ -5118,8 +5301,21 @@ class TestSaveUserInputs:
         assert config["deployments"][0]["work_pool"]["name"] == "inflatable"
 
     def test_save_user_inputs_existing_prefect_file(self):
+        """
+        Regression test: an existing `prefect.yaml` that does not already declare
+        the deployment being created should still prompt to save it.
+
+        Previously `prefect deploy` only offered to save when no `prefect.yaml`
+        existed at all (#17519), which meant users with an `init`-scaffolded file
+        could never persist a new deployment via the interactive wizard.
+        """
         prefect_file = Path("prefect.yaml")
         assert prefect_file.exists()
+
+        # the init-scaffolded file has a single placeholder deployment with a
+        # null name/entrypoint, which never matches a real deployment
+        with prefect_file.open(mode="r") as f:
+            assert len(yaml.safe_load(f)["deployments"]) == 1
 
         invoke_and_assert(
             command="deploy flows/hello.py:my_flow",
@@ -5139,15 +5335,69 @@ class TestSaveUserInputs:
                 # decline schedule
                 + "n"
                 + readchar.key.ENTER
+                # accept saving the new deployment to the existing file
+                + "y"
+                + readchar.key.ENTER
             ),
             expected_code=0,
-            expected_output_contains="View Deployment in UI",
+            expected_output_contains=[
+                (
+                    "Would you like to save configuration for this deployment for"
+                    " faster deployments in the future?"
+                ),
+                "Deployment configuration saved to prefect.yaml",
+            ],
         )
 
         with prefect_file.open(mode="r") as f:
             config = yaml.safe_load(f)
 
+        # the new deployment is appended alongside the placeholder entry
+        assert len(config["deployments"]) == 2
+        new_deployment = config["deployments"][-1]
+        assert new_deployment["name"] == "default"
+        assert new_deployment["entrypoint"] == "flows/hello.py:my_flow"
+        assert new_deployment["work_pool"]["name"] == "inflatable"
+
+    def test_does_not_prompt_save_when_deployment_already_in_prefect_file(
+        self, work_pool: WorkPool
+    ):
+        """
+        Faithful reproduction of #17409 (the report that motivated #17519): a
+        deployment already fully declared in `prefect.yaml` must not prompt to
+        save again when re-deployed by name.
+        """
+        prefect_file = Path("prefect.yaml")
+        with prefect_file.open(mode="r") as f:
+            contents = yaml.safe_load(f)
+
+        # fully declare the deployment so `deploy -n` needs no interactive input
+        contents["deployments"] = [
+            {
+                "name": "already-saved",
+                "entrypoint": "flows/hello.py:my_flow",
+                "schedules": [],
+                "work_pool": {"name": work_pool.name},
+            }
+        ]
+        with prefect_file.open(mode="w") as f:
+            yaml.safe_dump(contents, f)
+
+        invoke_and_assert(
+            command="deploy -n already-saved",
+            expected_code=0,
+            expected_output_contains="View Deployment in UI",
+            expected_output_does_not_contain=(
+                "Would you like to save configuration for this deployment"
+            ),
+        )
+
+        with prefect_file.open(mode="r") as f:
+            config = yaml.safe_load(f)
+
+        # no new entry was appended; the existing one is untouched
         assert len(config["deployments"]) == 1
+        assert config["deployments"][0]["name"] == "already-saved"
 
 
 @pytest.mark.usefixtures("project_dir", "interactive_console", "work_pool")
@@ -5915,7 +6165,11 @@ class TestDeployDockerBuildSteps:
             ),
             user_input=(
                 # Reject build custom docker image
-                "n" + readchar.key.ENTER
+                "n"
+                + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
+                + "n"
+                + readchar.key.ENTER
             ),
             expected_output_contains=[
                 "Would you like to build a custom Docker image",
@@ -5935,7 +6189,11 @@ class TestDeployDockerBuildSteps:
             ),
             user_input=(
                 # Reject build custom docker image
-                "n" + readchar.key.ENTER
+                "n"
+                + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
+                + "n"
+                + readchar.key.ENTER
             ),
             expected_output_contains=["Would you like to build a custom Docker image"],
         )
@@ -5990,6 +6248,9 @@ class TestDeployDockerBuildSteps:
                 +
                 # Reject push to registry
                 "n"
+                + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
+                + "n"
                 + readchar.key.ENTER
             ),
             expected_output_contains=[
@@ -6215,6 +6476,9 @@ class TestDeployDockerBuildSteps:
                 # Decline remote storage
                 + "n"
                 + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
+                + "n"
+                + readchar.key.ENTER
             ),
             expected_output_contains=[
                 "Would you like to build a custom Docker image",
@@ -6418,6 +6682,9 @@ class TestDeployDockerPushSteps:
                 # Reject push to registry
                 + "n"
                 + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
+                + "n"
+                + readchar.key.ENTER
             ),
             expected_output_contains=[
                 "Would you like to build a custom Docker image",
@@ -6464,6 +6731,9 @@ class TestDeployDockerPushSteps:
                 + "https://hub.docker.com"
                 + readchar.key.ENTER
                 # Reject private registry
+                + "n"
+                + readchar.key.ENTER
+                # decline saving to the (existing) prefect.yaml
                 + "n"
                 + readchar.key.ENTER
             ),

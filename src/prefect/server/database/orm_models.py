@@ -1465,6 +1465,14 @@ class EventResource(Base):
             "resource_id",
             "occurred",
         ),
+        sa.Index(
+            "ix_event_resources__occurred",
+            "occurred",
+        ),
+        sa.Index(
+            "ix_event_resources__event_id",
+            "event_id",
+        ),
     )
 
     occurred: Mapped[DateTime]

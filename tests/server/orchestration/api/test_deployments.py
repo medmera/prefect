@@ -1,5 +1,6 @@
 import datetime
 from typing import List
+from unittest import mock
 from uuid import uuid4
 
 import pytest
@@ -1003,6 +1004,41 @@ class TestCreateDeployment:
             " 'string'" in response.text
         )
 
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "https://a.example.com/schema.json",
+            "http://b.example.com.namespace.svc/schema.json",
+            "http://169.254.169.254/latest/meta-data/",
+        ],
+    )
+    async def test_create_deployment_external_ref_schema_does_not_fetch(
+        self,
+        ref,
+        client,
+        flow,
+        work_pool,
+    ):
+        data = dict(
+            name="My Deployment",
+            flow_id=str(flow.id),
+            work_pool_name=work_pool.name,
+            enforce_parameter_schema=True,
+            parameter_openapi_schema={
+                "type": "object",
+                "properties": {"foo": {"$ref": ref}},
+            },
+            parameters={"foo": 1},
+        )
+
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = AssertionError(
+                "validation attempted an outbound network request"
+            )
+            response = await client.post("/deployments/", json=data)
+            urlopen.assert_not_called()
+        assert response.status_code == 422, response.text
+
     async def test_create_deployment_enforces_schema_by_default(
         self,
         client,
@@ -1653,6 +1689,18 @@ class TestPaginateDeployments:
         response = await client.post("/deployments/paginate", json=deployment_filter)
         assert response.status_code == status.HTTP_200_OK
         assert response.json()["count"] == 2
+
+    async def test_paginate_deployments_zero_limit(self, deployments, client):
+        response = await client.post("/deployments/paginate", json=dict(limit=0))
+        assert response.status_code == status.HTTP_200_OK
+
+        json = response.json()
+
+        assert json["results"] == []
+        assert json["count"] == 2
+        assert json["limit"] == 0
+        assert json["pages"] == 0
+        assert json["page"] == 1
 
 
 class TestUpdateDeployment:

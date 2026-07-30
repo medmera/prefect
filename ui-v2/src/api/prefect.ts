@@ -9857,6 +9857,11 @@ export interface components {
              * @default 5
              */
             connection_timeout: number | null;
+            /**
+             * Migration Timeout
+             * @description A statement timeout, in seconds, applied to database migrations. Schema changes such as concurrent index builds on large tables can take much longer than an ordinary API query, so migrations are not bound by `server.database.timeout`. Defaults to `None` (no timeout); set a positive value to bound migration statement duration.
+             */
+            migration_timeout?: number | null;
         };
         /**
          * ServerDefaultResultStorage
@@ -10075,6 +10080,36 @@ export interface components {
              * @default 20
              */
             loop_seconds: number;
+            /**
+             * Cancelling Timeout Seconds
+             * @description The cancellation cleanup service will enqueue worker cleanup for flow runs that remain in CANCELLING longer than this many seconds. Defaults to `300`.
+             * @default 300
+             */
+            cancelling_timeout_seconds: number;
+        };
+        /**
+         * ServerServicesCleanupReconcilerSettings
+         * @description Settings for controlling the cleanup reconciler service.
+         */
+        ServerServicesCleanupReconcilerSettings: {
+            /**
+             * Enabled
+             * @description Whether or not to start the cleanup reconciler service in the server application.
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Loop Seconds
+             * @description The cleanup reconciler service will look for expired cleanup message leases this often. Defaults to `5`.
+             * @default 5
+             */
+            loop_seconds: number;
+            /**
+             * Batch Size
+             * @description The maximum number of expired cleanup message leases to process per service loop. Defaults to `100`.
+             * @default 100
+             */
+            batch_size: number;
         };
         /**
          * ServerServicesDBVacuumSettings
@@ -10378,6 +10413,8 @@ export interface components {
             scheduler?: components["schemas"]["ServerServicesSchedulerSettings"];
             pause_expirations?: components["schemas"]["ServerServicesPauseExpirationsSettings"];
             repossessor?: components["schemas"]["ServerServicesRepossessorSettings"];
+            /** @description Settings for controlling the cleanup reconciler service */
+            cleanup_reconciler?: components["schemas"]["ServerServicesCleanupReconcilerSettings"];
             task_run_recorder?: components["schemas"]["ServerServicesTaskRunRecorderSettings"];
             triggers?: components["schemas"]["ServerServicesTriggersSettings"];
         };
@@ -10578,8 +10615,8 @@ export interface components {
             enabled: boolean;
             /**
              * V2 Enabled
-             * @description Whether neutral UI entry points should default to the experimental V2 UI instead of V1 when the browser has no saved UI preference.
-             * @default false
+             * @description Whether neutral UI entry points should default to the V2 UI instead of V1 when the browser has no saved UI preference. Set to false to restore V1 as the default for browsers without a saved preference.
+             * @default true
              */
             v2_enabled: boolean;
             /**
@@ -10612,7 +10649,7 @@ export interface components {
         ServerWorkerChannelSettings: {
             /**
              * Cleanup Queue Storage
-             * @description The module to use for storing worker cleanup delivery messages. The default in-memory backend stores messages, leases, wakeups, and dead-letter entries only in the current server process; use a Redis-backed storage module for high availability or restart-safe cleanup delivery.
+             * @description The module to use for storing worker cleanup delivery messages. The default in-memory backend stores messages, leases, wakeups, and dead-letter entries only in the current server process; use an external storage module for high availability or restart-safe cleanup delivery.
              * @default prefect.server.worker_communication.cleanup_queue.memory
              */
             cleanup_queue_storage: string;
@@ -10630,7 +10667,7 @@ export interface components {
             cleanup_max_delivery_attempts: number;
             /**
              * Cleanup Completed Idempotency Retention Seconds
-             * @description How long completed cleanup idempotency records are retained after acknowledgement. None keeps them for the lifetime of the current server process. The in-memory backend does not survive restart; use Redis for high availability or restart-safe cleanup idempotency.
+             * @description How long completed cleanup idempotency records are retained after acknowledgement. None keeps them for the lifetime of the current server process. The in-memory backend does not survive restart; use external storage for high availability or restart-safe cleanup idempotency.
              */
             cleanup_completed_idempotency_retention_seconds?: number | null;
         };

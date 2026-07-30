@@ -128,7 +128,7 @@ from prefect.client.schemas.sorting import (
 from prefect.logging import get_logger
 from prefect.settings import (
     PREFECT_API_AUTH_STRING,
-    PREFECT_API_DATABASE_CONNECTION_URL,
+    PREFECT_SERVER_DATABASE_CONNECTION_URL,
     PREFECT_API_ENABLE_HTTP2,
     PREFECT_API_IAP_ENABLED,
     PREFECT_API_KEY,
@@ -138,7 +138,7 @@ from prefect.settings import (
     PREFECT_API_URL,
     PREFECT_CLIENT_CSRF_SUPPORT_ENABLED,
     PREFECT_CLOUD_API_URL,
-    PREFECT_SERVER_ALLOW_EPHEMERAL_MODE,
+    PREFECT_SERVER_EPHEMERAL_ENABLED,
     PREFECT_TESTING_UNIT_TEST_MODE,
 )
 from prefect.types._datetime import now
@@ -251,7 +251,7 @@ def get_client(
     api: str = PREFECT_API_URL.value()
     server_type = None
 
-    if not api and PREFECT_SERVER_ALLOW_EPHEMERAL_MODE:
+    if not api and PREFECT_SERVER_EPHEMERAL_ENABLED:
         # create an ephemeral API if none was provided
         from prefect.server.api.server import SubprocessASGIServer
 
@@ -261,7 +261,7 @@ def get_client(
 
         api = server.api_url
         server_type = ServerType.EPHEMERAL
-    elif not api and not PREFECT_SERVER_ALLOW_EPHEMERAL_MODE:
+    elif not api and not PREFECT_SERVER_EPHEMERAL_ENABLED:
         raise ValueError(
             "No Prefect API URL provided. Please set PREFECT_API_URL to the address of a running Prefect server."
         )
@@ -948,7 +948,7 @@ class PrefectClient(
             deployment_filter: filter criteria for deployments
             sort: sort criteria for the task runs
             limit: maximum number of task runs to return. When `None`, the server
-                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+                applies `PREFECT_SERVER_API_DEFAULT_LIMIT` (200 by default).
             offset: an offset for the task run query.
 
         Returns:
@@ -1055,7 +1055,7 @@ class PrefectClient(
             work_pool_name: Name of the work pool for which to get queues.
             work_queue_filter: Criteria by which to filter queues.
             limit: maximum number of work queues to return. When `None`, the server
-                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+                applies `PREFECT_SERVER_API_DEFAULT_LIMIT` (200 by default).
             offset: an offset for the work queue query.
 
         Returns:
@@ -1205,7 +1205,7 @@ class PrefectClient(
         if self._ephemeral_app:
             self.logger.debug(
                 "Using ephemeral application with database at "
-                f"{PREFECT_API_DATABASE_CONNECTION_URL.value()}"
+                f"{PREFECT_SERVER_DATABASE_CONNECTION_URL.value()}"
             )
         else:
             self.logger.debug(
@@ -1687,7 +1687,7 @@ class SyncPrefectClient(
             deployment_filter: filter criteria for deployments
             sort: sort criteria for the task runs
             limit: maximum number of task runs to return. When `None`, the server
-                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+                applies `PREFECT_SERVER_API_DEFAULT_LIMIT` (200 by default).
             offset: an offset for the task run query.
 
         Returns:
@@ -2097,7 +2097,7 @@ class SyncPrefectClient(
             work_pool_name: Name of the work pool for which to get queues.
             work_queue_filter: Criteria by which to filter queues.
             limit: maximum number of work queues to return. When `None`, the server
-                applies `PREFECT_API_DEFAULT_LIMIT` (200 by default).
+                applies `PREFECT_SERVER_API_DEFAULT_LIMIT` (200 by default).
             offset: an offset for the work queue query.
 
         Returns:

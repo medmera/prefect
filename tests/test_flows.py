@@ -1803,6 +1803,22 @@ class TestFlowParameterTypes:
         # See #1638.
         assert my_flow(data) == data
 
+    def test_serialize_parameters_falls_back_on_self_referential_types(self):
+        @flow
+        def my_flow(x):
+            return x
+
+        class Cyclic:
+            def __init__(self):
+                self.me = self
+
+        data = Cyclic()
+        # jsonable_encoder recurses into unknown objects with no cycle limit, so a
+        # self-referential value raises RecursionError instead of TypeError/ValueError.
+        # serialize_parameters should fall back to the placeholder rather than crash.
+        # See #22244.
+        assert my_flow.serialize_parameters({"x": data}) == {"x": "<Cyclic>"}
+
     def test_flow_parameter_annotations_can_be_non_pydantic_classes(self):
         class Test:
             pass
@@ -5519,6 +5535,100 @@ class TestLoadFlowFromFlowRun:
         result = await load_flow_from_flow_run(flow_run)
 
         assert result == pretend_flow
+        load_flow_from_entrypoint.assert_called_once_with(
+            "my.module.pretend_flow", use_placeholder_flow=True
+        )
+
+    async def test_load_flow_from_module_entrypoint_runs_pull_steps(
+        self, prefect_client: "PrefectClient", monkeypatch
+    ):
+        """Module-path entrypoints must run pull steps before importing the flow.
+
+        Regression test for https://github.com/PrefectHQ/prefect/issues/18138
+        """
+
+        @flow
+        def pretend_flow():
+            pass
+
+        load_flow_from_entrypoint = mock.MagicMock(return_value=pretend_flow)
+        monkeypatch.setattr(
+            "prefect.flows.load_flow_from_entrypoint",
+            load_flow_from_entrypoint,
+        )
+
+        run_steps = mock.AsyncMock(return_value={})
+        monkeypatch.setattr(
+            "prefect.deployments.steps.core.run_steps",
+            run_steps,
+        )
+
+        flow_id = await prefect_client.create_flow_from_name(pretend_flow.__name__)
+
+        deployment_id = await prefect_client.create_deployment(
+            name="My Module Deployment",
+            entrypoint="my.module.pretend_flow",
+            flow_id=flow_id,
+            pull_steps=[
+                {"prefect.deployments.steps.set_working_directory": {"directory": "."}}
+            ],
+        )
+
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            deployment_id=deployment_id
+        )
+
+        result = await load_flow_from_flow_run(flow_run)
+
+        assert result == pretend_flow
+        run_steps.assert_awaited_once()
+        load_flow_from_entrypoint.assert_called_once_with(
+            "my.module.pretend_flow", use_placeholder_flow=True
+        )
+
+    async def test_load_flow_from_module_entrypoint_skips_pull_steps_when_ignoring_storage(
+        self, prefect_client: "PrefectClient", monkeypatch
+    ):
+        """ignore_storage=True assumes the flow is local, so pull steps are skipped.
+
+        Regression test for https://github.com/PrefectHQ/prefect/issues/18138
+        """
+
+        @flow
+        def pretend_flow():
+            pass
+
+        load_flow_from_entrypoint = mock.MagicMock(return_value=pretend_flow)
+        monkeypatch.setattr(
+            "prefect.flows.load_flow_from_entrypoint",
+            load_flow_from_entrypoint,
+        )
+
+        run_steps = mock.AsyncMock(return_value={})
+        monkeypatch.setattr(
+            "prefect.deployments.steps.core.run_steps",
+            run_steps,
+        )
+
+        flow_id = await prefect_client.create_flow_from_name(pretend_flow.__name__)
+
+        deployment_id = await prefect_client.create_deployment(
+            name="My Module Deployment",
+            entrypoint="my.module.pretend_flow",
+            flow_id=flow_id,
+            pull_steps=[
+                {"prefect.deployments.steps.set_working_directory": {"directory": "."}}
+            ],
+        )
+
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            deployment_id=deployment_id
+        )
+
+        result = await load_flow_from_flow_run(flow_run, ignore_storage=True)
+
+        assert result == pretend_flow
+        run_steps.assert_not_awaited()
         load_flow_from_entrypoint.assert_called_once_with(
             "my.module.pretend_flow", use_placeholder_flow=True
         )
