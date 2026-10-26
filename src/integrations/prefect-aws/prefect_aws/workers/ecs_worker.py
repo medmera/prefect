@@ -700,7 +700,7 @@ class ECSWorker(BaseWorker[ECSJobConfiguration, ECSVariables, ECSWorkerResult]):
     )
     _display_name = "AWS Elastic Container Service"
     _documentation_url = "https://docs.prefect.io/integrations/prefect-aws/"
-    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/d74b16fe84ce626345adf235a47008fea2869a60-225x225.png"  # noqa
+    _logo_url = "https://raw.githubusercontent.com/PrefectHQ/prefect/420d0d6a78bb6df1fc18bcf188fdad43c1d22ea9/assets/block-logos/aws.png"  # noqa
 
     async def _initiate_run(
         self,
@@ -1260,32 +1260,34 @@ class ECSWorker(BaseWorker[ECSJobConfiguration, ECSVariables, ECSWorkerResult]):
         _drop_empty_keys_from_dict(task_definition)
 
         # Handle secrets for both API key and auth string
-        secrets = []
+        prefect_secrets: dict[str, str] = {}
         if configuration.prefect_api_key_secret_arn:
-            secrets.append(
-                {
-                    "name": "PREFECT_API_KEY",
-                    "valueFrom": configuration.prefect_api_key_secret_arn,
-                }
+            prefect_secrets["PREFECT_API_KEY"] = (
+                configuration.prefect_api_key_secret_arn
             )
-            # Remove the PREFECT_API_KEY from the environment variables
-            for item in tuple(container.get("environment", [])):
-                if item["name"] == "PREFECT_API_KEY":
-                    container["environment"].remove(item)  # type: ignore
-
         if configuration.prefect_api_auth_string_secret_arn:
-            secrets.append(
-                {
-                    "name": "PREFECT_API_AUTH_STRING",
-                    "valueFrom": configuration.prefect_api_auth_string_secret_arn,
-                }
+            prefect_secrets["PREFECT_API_AUTH_STRING"] = (
+                configuration.prefect_api_auth_string_secret_arn
             )
-            # Remove the PREFECT_API_AUTH_STRING from the environment variables
+
+        if prefect_secrets:
+            # Remove the corresponding environment variables because the values will
+            # be provided via secrets instead
             for item in tuple(container.get("environment", [])):
-                if item["name"] == "PREFECT_API_AUTH_STRING":
+                if item["name"] in prefect_secrets:
                     container["environment"].remove(item)  # type: ignore
 
-        if secrets:
+            # Merge into any secrets already defined on the container rather than
+            # replacing them. A secret configured here takes precedence over one of
+            # the same name in the task definition.
+            secrets = list(container.get("secrets") or [])
+            for secret in secrets:
+                if secret.get("name") in prefect_secrets:
+                    secret["valueFrom"] = prefect_secrets.pop(secret["name"])
+            secrets.extend(
+                {"name": name, "valueFrom": value_from}
+                for name, value_from in prefect_secrets.items()
+            )
             container["secrets"] = secrets
 
         return task_definition
@@ -1332,7 +1334,6 @@ class ECSWorker(BaseWorker[ECSJobConfiguration, ECSVariables, ECSWorkerResult]):
             "awsvpcConfiguration": {
                 "subnets": [s["SubnetId"] for s in subnets],
                 "assignPublicIp": "ENABLED",
-                "securityGroups": [],
             }
         }
 

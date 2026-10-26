@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import threading
 import time
 import uuid
@@ -30,6 +31,7 @@ from prefect.server.events.pipeline import EventsPipeline
 from prefect.states import Completed, Failed, Suspended
 from prefect.task_engine import run_task_async, run_task_sync
 from prefect.task_runners import ThreadPoolTaskRunner
+from prefect.utilities.timeout import timeout as timeout_context
 
 
 class MockFuture(PrefectWrappedFuture[Any, Future[Any]]):
@@ -62,6 +64,16 @@ class TestUtilityFunctions:
 
         for future in mock_futures:
             assert future.state.is_completed()
+
+    def test_wait_with_negative_timeout_raises_value_error(self):
+        mock_futures = [MockFuture(data=i) for i in range(5)]
+        with pytest.raises(ValueError, match="'timeout' must be a non-negative number"):
+            wait(mock_futures, timeout=-1)
+
+    def test_as_completed_with_negative_timeout_raises_value_error(self):
+        mock_futures = [MockFuture(data=i) for i in range(5)]
+        with pytest.raises(ValueError, match="'timeout' must be a non-negative number"):
+            list(as_completed(mock_futures, timeout=-1))
 
     @pytest.mark.timeout(method="thread")
     def test_wait_with_timeout(self):
@@ -159,15 +171,15 @@ class TestUtilityFunctions:
             except BaseException as exc:
                 caught.append(exc)
 
-        worker = threading.Thread(target=consume_as_completed)
+        # Daemonized so a thread blocked on the broken implementation cannot hold up
+        # interpreter exit and take the whole test session down with it.
+        worker = threading.Thread(target=consume_as_completed, daemon=True)
         worker.start()
-        worker.join(timeout=2.0)
+        worker.join(timeout=30.0)
 
         if worker.is_alive():
-            # Self-cleaning: unblock the worker so the suite never leaks a
-            # non-daemon thread on the broken implementation.
             hanging_future.set_result(Completed(data=None))
-            worker.join(timeout=2.0)
+            worker.join(timeout=30.0)
             assert not worker.is_alive(), "Worker thread did not exit"
             pytest.fail("as_completed did not time out in worker thread")
 
@@ -913,6 +925,12 @@ class TestPrefectFutureList:
         for future in futures:
             assert future.state.is_completed()
 
+    def test_result_with_negative_timeout_raises_value_error(self):
+        mock_futures = [MockFuture(data=i) for i in range(5)]
+        futures = PrefectFutureList(mock_futures)
+        with pytest.raises(ValueError, match="'timeout' must be a non-negative number"):
+            futures.result(timeout=-1)
+
     @pytest.mark.timeout(method="thread")  # alarm-based pytest-timeout will interfere
     def test_wait_with_timeout(self):
         mock_futures: List[PrefectFuture] = [MockFuture(data=i) for i in range(5)]
@@ -977,6 +995,98 @@ class TestPrefectFutureList:
 
         with pytest.raises(TimeoutError, match="oops"):
             futures.result()
+
+    @pytest.mark.timeout(method="thread")
+    def test_result_timeout_covers_slow_result_retrieval(self):
+        """The timeout also bounds result retrieval, which runs while
+        `as_completed` is suspended at its `yield`."""
+
+        class SlowResultFuture(MockFuture):
+            def result(
+                self,
+                timeout: Optional[float] = None,
+                raise_on_failure: bool = True,
+            ) -> Any:
+                time.sleep(1)
+                return 42
+
+        futures = PrefectFutureList([SlowResultFuture()])
+
+        with pytest.raises(
+            TimeoutError,
+            match="Timed out waiting for all futures to complete within 0.1 seconds",
+        ):
+            futures.result(timeout=0.1)
+
+    def test_result_with_zero_timeout_returns_completed_results(self):
+        futures = PrefectFutureList([MockFuture(data=i) for i in range(3)])
+
+        assert futures.result(timeout=0) == [0, 1, 2]
+
+    def test_result_with_zero_timeout_returns_uncached_completed_results(self):
+        futures: PrefectFutureList[int] = PrefectFutureList()
+        for i in range(3):
+            wrapped_future: Future[Any] = Future()
+            future = PrefectConcurrentFuture(uuid.uuid4(), wrapped_future)
+            wrapped_future.set_result(Completed(data=i))
+            futures.append(future)
+
+        assert futures.result(timeout=0) == [0, 1, 2]
+
+    def test_result_with_zero_timeout_raises_for_unfinished_future(self):
+        completed_future: Future[Any] = Future()
+        completed_future.set_result(Completed(data=42))
+        unfinished_future: Future[Any] = Future()
+        futures = PrefectFutureList(
+            [
+                PrefectConcurrentFuture(uuid.uuid4(), completed_future),
+                PrefectConcurrentFuture(uuid.uuid4(), unfinished_future),
+            ]
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="Timed out waiting for all futures to complete within 0 seconds",
+        ):
+            futures.result(timeout=0)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="sync cancellation is not supported on Windows"
+    )
+    @pytest.mark.timeout(method="thread")
+    def test_result_with_zero_timeout_preserves_enclosing_timeout(self):
+        """An enclosing timeout firing during retrieval is not claimed as this
+        list's timeout when `timeout=0` arms no local scope."""
+
+        class EnclosingTimeout(TimeoutError):
+            pass
+
+        class SlowResultFuture(MockFuture):
+            def result(
+                self,
+                timeout: Optional[float] = None,
+                raise_on_failure: bool = True,
+            ) -> Any:
+                time.sleep(1)
+                return 42
+
+        futures = PrefectFutureList([SlowResultFuture()])
+
+        with (
+            pytest.raises(EnclosingTimeout),
+            timeout_context(0.1, timeout_exc_type=EnclosingTimeout),
+        ):
+            futures.result(timeout=0)
+
+    @pytest.mark.timeout(method="thread")
+    def test_result_timeout_raises_dedicated_message(self):
+        futures = PrefectFutureList([PrefectConcurrentFuture(uuid.uuid4(), Future())])
+
+        with pytest.raises(
+            TimeoutError,
+            match="Timed out waiting for all futures to complete within 0.5 seconds",
+        ):
+            futures.result(timeout=0.5)
 
     def test_result_fail_fast(self):
         """A fast failure should be raised even when a slow future precedes it."""

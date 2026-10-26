@@ -19,27 +19,27 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-import threading
 import warnings
-from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 import anyio
 import anyio.abc
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 
 from prefect._internal.schemas.validators import validate_working_dir
 from prefect.client.schemas.objects import Flow as APIFlow
-from prefect.runner.runner import Runner
-from prefect.settings import PREFECT_WORKER_QUERY_SECONDS
+from prefect.flows import load_flow_from_flow_run
+from prefect.runner._flow_run_executor import (
+    FlowRunExecutionResult,
+    FlowRunExecutorContext,
+)
+from prefect.runner._process_manager import ProcessHandle
+from prefect.runner._starter_bundle import BundleExecutionStarter
+from prefect.runner._starter_engine import EngineCommandStarter
+from prefect.runner._workspace_starter import WorkspaceResolvingEngineCommandStarter
 from prefect.states import Pending
 from prefect.utilities.processutils import command_to_string, get_sys_executable
-from prefect.utilities.services import (
-    critical_service_loop,
-    start_client_metrics_server,
-    stop_client_metrics_server,
-)
 from prefect.workers.base import (
     BaseJobConfiguration,
     BaseVariables,
@@ -61,6 +61,8 @@ class ProcessJobConfiguration(BaseJobConfiguration):
     stream_output: bool = Field(default=True)
     working_dir: Optional[Path] = Field(default=None)
 
+    _command_configured: bool = PrivateAttr(default=False)
+
     @field_validator("working_dir")
     @classmethod
     def validate_working_dir(cls, v: Path | str | None) -> Path | None:
@@ -77,6 +79,10 @@ class ProcessJobConfiguration(BaseJobConfiguration):
         worker_name: str | None = None,
         worker_id: "UUID | None" = None,
     ) -> None:
+        # The base implementation fills in `_base_flow_run_command()` when no command
+        # is configured, so provenance must be captured before delegating.
+        self._command_configured = self.command is not None
+
         super().prepare_for_flow_run(
             flow_run,
             deployment,
@@ -88,17 +94,16 @@ class ProcessJobConfiguration(BaseJobConfiguration):
 
         self.env: dict[str, str | None] = {**os.environ, **self.env}
         self.command: str | None = (
-            command_to_string([get_sys_executable(), "-m", "prefect.engine"])
-            if self.command == self._base_flow_run_command()
-            else self.command
+            self.command
+            if self._command_configured
+            else command_to_string([get_sys_executable(), "-m", "prefect.engine"])
         )
 
     @staticmethod
     def _base_flow_run_command() -> str:
         """
-        Override the base worker command because process workers still execute
-        runs through `Runner.execute_flow_run` / `python -m prefect.engine`
-        instead of the newer `prefect flow-run execute` path.
+        Process workers use the engine command as their fallback when prepared
+        workspace dependency installation does not select another launcher.
         """
         return "python -m prefect.engine"
 
@@ -139,100 +144,7 @@ class ProcessWorker(
     )
     _display_name = "Process"
     _documentation_url = "https://docs.prefect.io/latest/get-started/quickstart"
-    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/356e6766a91baf20e1d08bbe16e8b5aaef4d8643-48x48.png"
-
-    async def start(
-        self,
-        run_once: bool = False,
-        with_healthcheck: bool = False,
-        printer: Callable[..., None] = print,
-    ) -> None:
-        """
-        Starts the worker and runs the main worker loops.
-
-        By default, the worker will run loops to poll for scheduled/cancelled flow
-        runs and sync with the Prefect API server.
-
-        If `run_once` is set, the worker will only run each loop once and then return.
-
-        If `with_healthcheck` is set, the worker will start a healthcheck server which
-        can be used to determine if the worker is still polling for flow runs and restart
-        the worker if necessary.
-
-        Args:
-            run_once: If set, the worker will only run each loop once then return.
-            with_healthcheck: If set, the worker will start a healthcheck server.
-            printer: A `print`-like function where logs will be reported.
-        """
-        healthcheck_server = None
-        healthcheck_thread = None
-        try:
-            async with self as worker:
-                # wait for an initial heartbeat to configure the worker
-                await worker.sync_with_backend()
-                # schedule the scheduled flow run polling loop
-                async with anyio.create_task_group() as loops_task_group:
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.get_and_submit_flow_runs,
-                            interval=PREFECT_WORKER_QUERY_SECONDS.value(),
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,  # Up to ~1 minute interval during backoff
-                        )
-                    )
-                    # schedule the sync loop
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.sync_with_backend,
-                            interval=self.heartbeat_interval_seconds,
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,
-                        )
-                    )
-
-                    self._started_event = await self._emit_worker_started_event()
-
-                    start_client_metrics_server()
-
-                    if with_healthcheck:
-                        from prefect.workers.server import build_healthcheck_server
-
-                        # we'll start the ASGI server in a separate thread so that
-                        # uvicorn does not block the main thread
-                        healthcheck_server = build_healthcheck_server(
-                            worker=worker,
-                            query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
-                        )
-                        healthcheck_thread = threading.Thread(
-                            name="healthcheck-server-thread",
-                            target=healthcheck_server.run,
-                            daemon=True,
-                        )
-                        healthcheck_thread.start()
-                    printer(f"Worker {worker.name!r} started!")
-
-                # If running once, wait for active runs to complete before exiting
-                if run_once and self._limiter:
-                    while self.limiter.borrowed_tokens > 0:
-                        self._logger.debug(
-                            "Waiting for %s active run(s) to finish before shutdown...",
-                            self.limiter.borrowed_tokens,
-                        )
-                        await anyio.sleep(0.1)
-        finally:
-            stop_client_metrics_server()
-
-            if healthcheck_server and healthcheck_thread:
-                self._logger.debug("Stopping healthcheck server...")
-                healthcheck_server.should_exit = True
-                healthcheck_thread.join()
-                self._logger.debug("Healthcheck server stopped.")
-
-        printer(f"Worker {worker.name!r} stopped!")
+    _logo_url = "https://raw.githubusercontent.com/PrefectHQ/prefect/420d0d6a78bb6df1fc18bcf188fdad43c1d22ea9/assets/block-logos/process.png"
 
     async def run(
         self,
@@ -250,25 +162,62 @@ class ProcessWorker(
         )
         with working_dir_ctx as working_dir, warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            process = await self._runner.execute_flow_run(
-                flow_run_id=flow_run.id,
-                command=configuration.command,
-                cwd=working_dir,
-                env=configuration.env,
-                stream_output=configuration.stream_output,
-                task_status=task_status,
-            )
+            async with FlowRunExecutorContext() as ctx:
+                workspace_root = Path(working_dir).resolve()
+                if configuration._command_configured:
+                    starter = EngineCommandStarter(
+                        command=configuration.command,
+                        cwd=workspace_root,
+                        env=configuration.env,
+                        stream_output=configuration.stream_output,
+                        control_channel=ctx.control_channel,
+                    )
+                    executor = ctx.create_executor(
+                        flow_run,
+                        starter,
+                        resolve_flow=load_flow_from_flow_run,
+                        propose_submitting=False,
+                    )
+                else:
+                    workspace_starter = WorkspaceResolvingEngineCommandStarter(
+                        workspace_root=workspace_root,
+                        command=None,
+                        stream_output=configuration.stream_output,
+                        control_channel=ctx.control_channel,
+                        source_cwd=workspace_root,
+                        environment=configuration.env,
+                    )
+                    ctx.call_after_exit(workspace_starter.close)
+                    executor = ctx.create_executor(
+                        flow_run,
+                        workspace_starter,
+                        propose_submitting=False,
+                        hook_runner=workspace_starter.hook_runner,
+                    )
+                execution: FlowRunExecutionResult | None = None
 
-        status_code = (
-            getattr(process, "returncode", None)
-            if getattr(process, "returncode", None) is not None
-            else getattr(process, "exitcode", None)
-        )
+                async def execute(
+                    *,
+                    task_status: anyio.abc.TaskStatus[
+                        ProcessHandle
+                    ] = anyio.TASK_STATUS_IGNORED,
+                ) -> None:
+                    nonlocal execution
+                    execution = await executor.submit(task_status=task_status)
 
-        if process is None or status_code is None:
+                async with anyio.create_task_group() as task_group:
+                    handle = await task_group.start(execute)
+                    if handle.pid is None:
+                        raise RuntimeError("Flow run process has no PID")
+                    task_status.started(handle.pid)
+
+        if execution is None or execution.status_code is None:
             raise RuntimeError("Failed to start flow run process.")
 
-        return ProcessWorkerResult(status_code=status_code, identifier=str(process.pid))
+        return ProcessWorkerResult(
+            status_code=execution.status_code,
+            identifier=str(execution.handle.pid),
+        )
 
     async def _submit_adhoc_run(
         self,
@@ -317,29 +266,38 @@ class ProcessWorker(
             worker_id=self.backend_id,
         )
 
-        result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        try:
+            result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        except Exception as exc:
+            logger.exception(
+                "Failed to create execution bundle for flow run '%s'.", flow_run.id
+            )
+            message = (
+                f"Flow run bundle could not be created: {type(exc).__name__}: {exc}"
+            )
+            await self._propose_crashed_state(flow_run, message)
+            return
+
+        async def resolve_flow(_: "FlowRun") -> "Flow[..., FR]":
+            return flow
 
         logger.debug("Executing flow run bundle in subprocess...")
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                await self._runner.execute_bundle(
-                    bundle=result["bundle"],
-                    cwd=configuration.working_dir,
-                    env=configuration.env,
+            async with FlowRunExecutorContext() as ctx:
+                executor = ctx.create_executor(
+                    flow_run,
+                    BundleExecutionStarter(
+                        bundle=result["bundle"],
+                        cwd=configuration.working_dir,
+                        env=configuration.env,
+                        control_channel=ctx.control_channel,
+                    ),
+                    resolve_flow=resolve_flow,
+                    propose_submitting=False,
                 )
+                await executor.submit()
         except Exception:
             logger.exception("Error executing flow run bundle in subprocess")
             await self._propose_crashed_state(flow_run, "Flow run execution failed")
         finally:
             logger.debug("Flow run bundle execution complete")
-
-    async def __aenter__(self) -> ProcessWorker:
-        await super().__aenter__()
-        self._runner = await self._exit_stack.enter_async_context(
-            Runner(pause_on_shutdown=False, limit=None)
-        )
-        return self
-
-    async def __aexit__(self, *exc_info: Any) -> None:
-        await super().__aexit__(*exc_info)

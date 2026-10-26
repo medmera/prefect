@@ -35,7 +35,7 @@ class SlackCredentials(Block):
     """  # noqa E501
 
     _block_type_name = "Slack Credentials"
-    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/c1965ecbf8704ee1ea20d77786de9a41ce1087d1-500x500.png"  # noqa
+    _logo_url = "https://raw.githubusercontent.com/PrefectHQ/prefect/420d0d6a78bb6df1fc18bcf188fdad43c1d22ea9/assets/block-logos/slack.png"  # noqa
     _documentation_url = "https://docs.prefect.io/integrations/prefect-slack"  # noqa
 
     token: SecretStr = Field(
@@ -115,12 +115,16 @@ class SlackWebhook(NotificationBlock):
             if response.status_code >= 400:
                 raise NotificationError(f"Failed to send message: {response.body}")
 
+    @staticmethod
+    def _format_text(body: str, subject: Optional[str]) -> str:
+        return f"{subject}\n{body}" if subject else body
+
     async def notify_async(self, body: str, subject: Optional[str] = None):
         """
         Sends a message to the Slack channel asynchronously.
         """
         client = self.get_client()
-        response = await client.send(text=body)
+        response = await client.send(text=self._format_text(body, subject))
         self._raise_on_failure(response)
 
     @async_dispatch(notify_async)
@@ -129,5 +133,5 @@ class SlackWebhook(NotificationBlock):
         Sends a message to the Slack channel.
         """
         client = self.get_client(sync_client=True)
-        response = client.send(text=body)
+        response = client.send(text=self._format_text(body, subject))
         self._raise_on_failure(response)
