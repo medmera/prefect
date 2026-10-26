@@ -35,6 +35,8 @@ import importlib
 import os
 import sys
 import tempfile
+import warnings
+from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
@@ -53,6 +55,8 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    TypeAdapter,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -69,6 +73,7 @@ from prefect._internal.schemas.validators import (
     reconcile_schedules_runner,
 )
 from prefect._internal.versioning import VersionType, get_inferred_version_info
+from prefect.blocks.core import Block, BlockNotSavedError
 from prefect.client.base import ServerType
 from prefect.client.orchestration import PrefectClient, SyncPrefectClient, get_client
 from prefect.client.schemas.actions import (
@@ -100,13 +105,19 @@ from prefect.schedules import Schedule
 from prefect.settings import (
     PREFECT_DEPLOYMENTS_DEFAULT_WORK_POOL_NAME,
     PREFECT_UI_URL,
+    get_current_settings,
 )
 from prefect.types import ListOfNonEmptyStrings
 from prefect.types.entrypoint import EntrypointType
 from prefect.utilities.annotations import freeze
 from prefect.utilities.asyncutils import run_coro_as_sync
 from prefect.utilities.callables import ParameterSchema, parameter_schema
-from prefect.utilities.collections import get_from_dict, isiterable
+from prefect.utilities.collections import (
+    StopVisiting,
+    get_from_dict,
+    isiterable,
+    visit_collection,
+)
 from prefect.utilities.dockerutils import (
     parse_image_tag,
 )
@@ -116,6 +127,30 @@ if TYPE_CHECKING:
     from prefect.flows import Flow
 
 __all__ = ["RunnerDeployment"]
+
+
+def _should_clear_empty_schedules() -> bool:
+    if get_current_settings().deployments.clear_schedules_on_empty:
+        return True
+
+    warnings.warn(
+        "Preserving existing schedules when an empty schedules list is provided "
+        "on redeployment is deprecated. A future release will clear schedules "
+        "by default after at least six months or three minor releases, whichever "
+        "is longer. The opt-in setting and this warning will then be removed. "
+        "Set PREFECT_DEPLOYMENTS_CLEAR_SCHEDULES_ON_EMPTY=true to opt in now. "
+        "To preserve existing schedules, omit schedules or use schedules=None "
+        "(schedules: null in prefect.yaml).",
+        FutureWarning,
+        stacklevel=3,
+    )
+    return False
+
+
+_DEPLOYMENT_PARAMETER_SERIALIZER = TypeAdapter(
+    dict[str, Any],
+    config=ConfigDict(ser_json_timedelta="float"),
+)
 
 
 def _extract_concurrency_options(
@@ -296,6 +331,47 @@ class RunnerDeployment(BaseModel):
     def full_name(self) -> str:
         return f"{self.flow_name}/{self.name}"
 
+    @field_validator("parameters", "schedules", mode="before")
+    @classmethod
+    def validate_block_parameters(cls, value: Any) -> Any:
+        def ensure_block_is_saved(value: Any) -> Any:
+            if isinstance(value, Block):
+                if value._block_document_id is None:
+                    raise BlockNotSavedError(
+                        "Block must be saved with `.save()` before it can be used as a "
+                        "deployment parameter."
+                    )
+                raise StopVisiting()
+            return value
+
+        visit_collection(value, ensure_block_is_saved)
+        return value
+
+    @field_serializer("parameters", when_used="json")
+    def serialize_block_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        return _DEPLOYMENT_PARAMETER_SERIALIZER.dump_python(
+            parameters,
+            mode="json",
+            context={"serialize_blocks_as_references": True},
+        )
+
+    def _schedules_with_serialized_block_parameters(
+        self,
+    ) -> Optional[List[Union[DeploymentScheduleCreate, DeploymentScheduleUpdate]]]:
+        if self.schedules is None:
+            return None
+
+        return [
+            schedule.model_copy(
+                update={
+                    "parameters": self.serialize_block_parameters(schedule.parameters)
+                }
+            )
+            if schedule.parameters
+            else schedule
+            for schedule in self.schedules
+        ]
+
     def _get_deployment_version_info(
         self, version_type: Optional[VersionType] = None
     ) -> VersionInfo:
@@ -378,6 +454,9 @@ class RunnerDeployment(BaseModel):
                 " with a work pool."
             )
 
+        parameters = self.model_dump(mode="json", include={"parameters"})["parameters"]
+        schedules = self._schedules_with_serialized_block_parameters()
+
         async with get_client() as client:
             flow_id = await client.create_flow_from_name(self.flow_name)
 
@@ -389,10 +468,10 @@ class RunnerDeployment(BaseModel):
                 version=self.version,
                 version_info=version_info,
                 paused=self.paused,
-                schedules=self.schedules,
+                schedules=schedules,
                 concurrency_limit=self.concurrency_limit,
                 concurrency_options=self.concurrency_options,
-                parameters=self.parameters,
+                parameters=parameters,
                 description=self.description,
                 tags=self.tags,
                 path=self._path,
@@ -481,6 +560,9 @@ class RunnerDeployment(BaseModel):
                 " with a work pool."
             )
 
+        parameters = self.model_dump(mode="json", include={"parameters"})["parameters"]
+        schedules = self._schedules_with_serialized_block_parameters()
+
         with get_client(sync_client=True) as client:
             flow_id = client.create_flow_from_name(self.flow_name)
 
@@ -492,10 +574,10 @@ class RunnerDeployment(BaseModel):
                 version=self.version,
                 version_info=version_info,
                 paused=self.paused,
-                schedules=self.schedules,
+                schedules=schedules,
                 concurrency_limit=self.concurrency_limit,
                 concurrency_options=self.concurrency_options,
-                parameters=self.parameters,
+                parameters=parameters,
                 description=self.description,
                 tags=self.tags,
                 path=self._path,
@@ -557,15 +639,21 @@ class RunnerDeployment(BaseModel):
         deployment_id: UUID,
         client: PrefectClient,
         version_info: VersionInfo | None,
+        *,
+        preserve_schedules: bool = False,
     ):
         parameter_openapi_schema = self._parameter_openapi_schema.model_dump(
             exclude_unset=True
         )
 
+        exclude = {"storage", "name", "flow_name", "triggers", "version_type"}
+        if preserve_schedules:
+            # Explicitly set schedules survive exclude_unset, even when empty.
+            exclude.add("schedules")
         update_payload = self.model_dump(
             mode="json",
             exclude_unset=True,
-            exclude={"storage", "name", "flow_name", "triggers", "version_type"},
+            exclude=exclude,
         )
 
         if self.storage:
@@ -576,10 +664,10 @@ class RunnerDeployment(BaseModel):
         else:
             update_payload["pull_steps"] = None
 
-        if self.schedules:
+        if self.schedules and not preserve_schedules:
             update_payload["schedules"] = [
                 schedule.model_dump(mode="json", exclude_unset=True)
-                for schedule in self.schedules
+                for schedule in self._schedules_with_serialized_block_parameters() or []
             ]
 
         await client.update_deployment(
@@ -609,15 +697,21 @@ class RunnerDeployment(BaseModel):
         deployment_id: UUID,
         client: SyncPrefectClient,
         version_info: VersionInfo | None,
+        *,
+        preserve_schedules: bool = False,
     ):
         parameter_openapi_schema = self._parameter_openapi_schema.model_dump(
             exclude_unset=True
         )
 
+        exclude = {"storage", "name", "flow_name", "triggers", "version_type"}
+        if preserve_schedules:
+            # Keep schedule exclusion in sync with _update above.
+            exclude.add("schedules")
         update_payload = self.model_dump(
             mode="json",
             exclude_unset=True,
-            exclude={"storage", "name", "flow_name", "triggers", "version_type"},
+            exclude=exclude,
         )
 
         if self.storage:
@@ -628,10 +722,10 @@ class RunnerDeployment(BaseModel):
         else:
             update_payload["pull_steps"] = None
 
-        if self.schedules:
+        if self.schedules and not preserve_schedules:
             update_payload["schedules"] = [
                 schedule.model_dump(mode="json", exclude_unset=True)
-                for schedule in self.schedules
+                for schedule in self._schedules_with_serialized_block_parameters() or []
             ]
 
         client.update_deployment(
@@ -696,6 +790,9 @@ class RunnerDeployment(BaseModel):
         Registers this deployment with the API and returns the deployment's ID.
 
         Args:
+            schedules: Override the schedules for this deployment. On redeployment,
+                an empty list preserves schedules by default and emits a warning.
+                Set `PREFECT_DEPLOYMENTS_CLEAR_SCHEDULES_ON_EMPTY=true` to clear them.
             work_pool_name: The name of the work pool to use for this
                 deployment.
             image: The registry, name, and tag of the Docker image to
@@ -724,11 +821,29 @@ class RunnerDeployment(BaseModel):
                     self.job_variables["image"] = image
                 if work_pool_name:
                     self.work_pool_name = work_pool_name
-                if schedules:
+                clear_schedules = schedules == [] and _should_clear_empty_schedules()
+                if schedules or clear_schedules:
                     self.schedules = [
-                        DeploymentScheduleUpdate(**schedule) for schedule in schedules
+                        DeploymentScheduleUpdate(**schedule)
+                        for schedule in schedules or []
                     ]
-                return await self._update(deployment.id, client, version_info)
+                await self._update(
+                    deployment.id,
+                    client,
+                    version_info,
+                    preserve_schedules=schedules == [] and not clear_schedules,
+                )
+                # The update API preserves empty-list updates when all existing
+                # schedules have slugs. Clear those explicitly after a successful update.
+                if clear_schedules and all(
+                    schedule.slug is not None for schedule in deployment.schedules
+                ):
+                    for schedule in deployment.schedules:
+                        with suppress(ObjectNotFound):
+                            await client.delete_deployment_schedule(
+                                deployment.id, schedule.id
+                            )
+                return deployment.id
 
     @async_dispatch(aapply)
     def apply(
@@ -742,6 +857,9 @@ class RunnerDeployment(BaseModel):
         Registers this deployment with the API and returns the deployment's ID.
 
         Args:
+            schedules: Override the schedules for this deployment. On redeployment,
+                an empty list preserves schedules by default and emits a warning.
+                Set `PREFECT_DEPLOYMENTS_CLEAR_SCHEDULES_ON_EMPTY=true` to clear them.
             work_pool_name: The name of the work pool to use for this
                 deployment.
             image: The registry, name, and tag of the Docker image to
@@ -769,11 +887,28 @@ class RunnerDeployment(BaseModel):
                     self.job_variables["image"] = image
                 if work_pool_name:
                     self.work_pool_name = work_pool_name
-                if schedules:
+                clear_schedules = schedules == [] and _should_clear_empty_schedules()
+                if schedules or clear_schedules:
                     self.schedules = [
-                        DeploymentScheduleUpdate(**schedule) for schedule in schedules
+                        DeploymentScheduleUpdate(**schedule)
+                        for schedule in schedules or []
                     ]
-                return self._update_sync(deployment.id, client, version_info)
+                self._update_sync(
+                    deployment.id,
+                    client,
+                    version_info,
+                    preserve_schedules=schedules == [] and not clear_schedules,
+                )
+                # Keep explicit clearing in sync with aapply above.
+                if clear_schedules and all(
+                    schedule.slug is not None for schedule in deployment.schedules
+                ):
+                    for schedule in deployment.schedules:
+                        with suppress(ObjectNotFound):
+                            client.delete_deployment_schedule(
+                                deployment.id, schedule.id
+                            )
+                return deployment.id
 
     async def _create_slas(self, deployment_id: UUID, client: PrefectClient):
         if not isinstance(self._sla, list):

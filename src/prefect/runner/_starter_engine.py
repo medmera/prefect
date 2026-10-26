@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING
 import anyio
 import anyio.abc
 
-from prefect.runner._process_manager import ProcessHandle
+from prefect.runner._process_manager import (
+    ProcessHandle,
+    create_isolated_termination_scope,
+)
 from prefect.settings import get_current_settings
 from prefect.utilities.processutils import (
     command_from_string,
@@ -27,7 +30,6 @@ if TYPE_CHECKING:
 class EngineCommandStarter:
     """Starts a flow run via `python -m prefect.engine` subprocess.
 
-    Source: runner.py lines 891-965.
     Uses module-level `run_process` reference -- patch the module to override.
 
     `task_status_handler=lambda p: ProcessHandle(p)` ensures the signaled
@@ -47,6 +49,8 @@ class EngineCommandStarter:
         stream_output: bool = True,
         heartbeat_seconds: int | None = None,
         control_channel: ControlChannel | None = None,
+        isolate_process_group: bool = False,
+        env_overrides_settings: bool = False,
     ) -> None:
         self._tmp_dir = tmp_dir
         self._storage = storage
@@ -58,13 +62,15 @@ class EngineCommandStarter:
         self._stream_output = stream_output
         self._heartbeat_seconds = heartbeat_seconds
         self._control_channel = control_channel
+        self._isolate_process_group = isolate_process_group
+        self._env_overrides_settings = env_overrides_settings
 
     async def start(
         self,
         flow_run: FlowRun,
         task_status: anyio.abc.TaskStatus[ProcessHandle] = anyio.TASK_STATUS_IGNORED,
     ) -> None:
-        # Assemble command -- mirrors runner.py lines 891-894
+        # Assemble command
         if self._command is None:
             runner_command = [get_sys_executable(), "-m", "prefect.engine"]
         else:
@@ -76,6 +82,9 @@ class EngineCommandStarter:
         kwargs: dict[str, object] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        elif self._isolate_process_group:
+            # So a group-wide SIGTERM cannot beat the caller's intent to the child.
+            kwargs["start_new_session"] = True
 
         # Register the flow run with the control channel before spawning so
         # the child can connect back as soon as it starts. Returned port +
@@ -95,7 +104,7 @@ class EngineCommandStarter:
                 # legacy kill-only cancellation path.
                 pass
 
-        # Build env following runner.py lines 907-929
+        # Build env
         deployment_name = (
             self._deployment_name
             if self._deployment_name is not None
@@ -103,8 +112,15 @@ class EngineCommandStarter:
         )
         env: dict[str, str | None] = {}
         env.update(os.environ)
-        env.update(self._env)
-        env.update(get_current_settings().to_environment_variables(exclude_unset=True))
+        settings_environment = get_current_settings().to_environment_variables(
+            exclude_unset=True
+        )
+        if self._env_overrides_settings:
+            env.update(settings_environment)
+            env.update(self._env)
+        else:
+            env.update(self._env)
+            env.update(settings_environment)
         env.update(
             {
                 "PREFECT__FLOW_RUN_ID": str(flow_run.id),
@@ -150,8 +166,15 @@ class EngineCommandStarter:
 
         def _task_status_handler(process: anyio.abc.Process) -> ProcessHandle:
             nonlocal handed_off
+            termination_scope = (
+                create_isolated_termination_scope(process.pid)
+                if self._isolate_process_group
+                else None
+            )
             handed_off = True
-            return ProcessHandle(process)
+            if termination_scope is None:
+                return ProcessHandle(process)
+            return ProcessHandle(process, termination_scope=termination_scope)
 
         try:
             await run_process(

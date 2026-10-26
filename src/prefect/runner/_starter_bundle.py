@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 class BundleExecutionStarter:
     """Executes a pre-serialized bundle in a subprocess via `SpawnProcess`.
 
-    Source: runner.py lines 771-841.
     Uses module-level `execute_bundle_in_subprocess` reference -- patch the
     module to override.
 
@@ -31,7 +30,7 @@ class BundleExecutionStarter:
         self,
         *,
         bundle: SerializedBundle,
-        cwd: Path | None = None,
+        cwd: Path | str | None = None,
         env: dict[str, str | None] | None = None,
         control_channel: ControlChannel | None = None,
     ) -> None:
@@ -71,5 +70,6 @@ class BundleExecutionStarter:
             await anyio.to_thread.run_sync(process.join)  # SpawnProcess.join is sync
         except BaseException:
             if control_registered and not handed_off:
+                assert self._control_channel is not None
                 self._control_channel.unregister(flow_run.id)
             raise

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import contextlib
 import logging
 import ssl
 from typing import Type
@@ -47,6 +49,17 @@ def assert_recorded_events_in_order(recorder: Recorder, events: list[Event]):
             unique_events.append(event)
 
     assert unique_events == events
+
+
+async def wait_for_events_to_be_confirmed(
+    client: PrefectEventsClient, timeout: float = 5
+) -> None:
+    """Wait until the client holds no unconfirmed events, or until `timeout`
+    seconds pass, so the caller's own assertion reports a failure."""
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(timeout):
+            while client._unconfirmed_events:
+                await asyncio.sleep(0.01)
 
 
 @pytest.mark.usefixtures("ephemeral_settings")
@@ -464,6 +477,46 @@ async def test_events_subscriber_auth_string(puppeteer: Puppeteer, events_api_ur
                     pass  # Connection should fail during __aenter__
 
 
+def test_events_client_sends_basic_auth_header():
+    """The handshake carries the auth string as a basic auth header so that servers
+    and proxies that authenticate the upgrade request accept the connection"""
+    with temporary_settings(
+        {
+            PREFECT_API_URL: "http://localhost:4200/api",
+            PREFECT_API_AUTH_STRING: "admin:pass",
+        }
+    ):
+        client = PrefectEventsClient()
+
+    token = base64.b64encode(b"admin:pass").decode()
+    assert client._connect.additional_headers == {"Authorization": f"Basic {token}"}
+
+
+def test_events_client_omits_basic_auth_header_without_auth_string():
+    with temporary_settings(
+        {
+            PREFECT_API_URL: "http://localhost:4200/api",
+            PREFECT_API_AUTH_STRING: None,
+        }
+    ):
+        client = PrefectEventsClient()
+
+    assert not client._connect.additional_headers
+
+
+def test_cloud_events_client_sends_bearer_auth_header():
+    with temporary_settings(
+        {
+            PREFECT_API_URL: "https://cloudy/api",
+            PREFECT_API_KEY: "my-token",
+            PREFECT_API_AUTH_STRING: "admin:pass",
+        }
+    ):
+        client = PrefectCloudEventsClient()
+
+    assert client._connect.additional_headers == {"Authorization": "bearer my-token"}
+
+
 async def test_events_client_aexit_handles_failed_connection(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -748,8 +801,7 @@ async def test_background_checkpoint_clears_unconfirmed_events(
         await client.emit(example_event_2)
         assert len(client._unconfirmed_events) == 2
 
-        # Wait for background checkpoint to fire
-        await asyncio.sleep(0.2)
+        await wait_for_events_to_be_confirmed(client)
         assert len(client._unconfirmed_events) == 0
 
     assert recorder.events == [example_event_1, example_event_2]
@@ -764,7 +816,7 @@ async def test_reconnect_only_resends_events_after_interval_checkpoint(
     puppeteer: Puppeteer,
 ):
     """After a background checkpoint clears confirmed events, a reconnect should
-    only resend events emitted after the checkpoint — not the full history."""
+    only resend events emitted after the checkpoint, not the full history."""
     client = Client(
         checkpoint_every=1000,
         checkpoint_interval=0.1,
@@ -773,17 +825,29 @@ async def test_reconnect_only_resends_events_after_interval_checkpoint(
         await client.emit(example_event_1)
         await client.emit(example_event_2)
 
-        # Wait for background checkpoint to confirm events 1 and 2
-        await asyncio.sleep(0.2)
+        await wait_for_events_to_be_confirmed(client)
+        assert len(client._unconfirmed_events) == 0
 
-        # Now disconnect — only event_3 (emitted after checkpoint) should be resent
+        # Now disconnect; only event_3 (emitted after the checkpoint) should be resent
         puppeteer.hard_disconnect_after = example_event_3.id
         await client.emit(example_event_3)
+
+        # The background checkpoint pings the dead connection, reconnects, and
+        # resends the events still unconfirmed
+        await wait_for_events_to_be_confirmed(client)
+        assert len(client._unconfirmed_events) == 0
 
     assert_recorded_events_in_order(
         recorder,
         [example_event_1, example_event_2, example_event_3],
     )
+    assert recorder.events == [
+        example_event_1,
+        example_event_2,
+        example_event_3,
+        example_event_3,
+    ]
+    assert recorder.connections == 2
 
 
 async def test_background_checkpoint_reconnects_after_connection_loss(
@@ -808,7 +872,7 @@ async def test_background_checkpoint_reconnects_after_connection_loss(
 
         # Wait for the background checkpoint to notice the dead connection,
         # reconnect, resend, and confirm
-        await asyncio.sleep(0.5)
+        await wait_for_events_to_be_confirmed(client)
         assert len(client._unconfirmed_events) == 0
 
     # The event was received once before the disconnect and once as a resend
@@ -840,7 +904,7 @@ async def test_background_checkpoint_retries_reconnect_until_server_available(
         assert client._unconfirmed_events == [example_event_1]
 
         puppeteer.refuse_any_further_connections = False
-        await asyncio.sleep(0.5)
+        await wait_for_events_to_be_confirmed(client)
         assert len(client._unconfirmed_events) == 0
 
     assert recorder.events[-1] == example_event_1
