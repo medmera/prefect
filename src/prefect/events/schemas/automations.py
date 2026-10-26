@@ -22,16 +22,21 @@ from pydantic import (
     Field,
     PrivateAttr,
     Tag,
+    TypeAdapter,
+    ValidationError,
     field_validator,
     model_validator,
 )
 from typing_extensions import Self, TypeAlias
 
 from prefect._internal.schemas.bases import PrefectBaseModel
-from prefect.events.actions import ActionTypes, RunDeployment
+from prefect.events.actions import ActionTypes, ActionTypesOrUnknown, RunDeployment
+from prefect.types import DurationOrSecondsTimeDelta
 from prefect.utilities.collections import AutoEnum
 
 from .events import ResourceSpecification
+
+_timedelta_adapter: TypeAdapter[timedelta] = TypeAdapter(timedelta)
 
 # Dict form accepted by ResourceSpecification via Pydantic coercion
 ResourceSpecificationDict: TypeAlias = Dict[str, Union[str, List[str]]]
@@ -96,7 +101,7 @@ class Trigger(PrefectBaseModel, abc.ABC, extra="ignore"):  # type: ignore[call-a
             description=getattr(self, "description", ""),
             enabled=getattr(self, "enabled", True),
             trigger=trigger,
-            actions=self.actions(),
+            actions=list(self.actions()),
             owner_resource=self.owner_resource(),
         )
 
@@ -196,7 +201,7 @@ class EventTrigger(ResourceTrigger):
             "triggers)"
         ),
     )
-    within: timedelta = Field(
+    within: DurationOrSecondsTimeDelta = Field(
         default=timedelta(seconds=0),
         ge=timedelta(seconds=0),
         description=(
@@ -220,8 +225,15 @@ class EventTrigger(ResourceTrigger):
         posture: Optional[Posture] = data.get("posture")
         within: Optional[timedelta] = data.get("within")
 
-        if isinstance(within, (int, float)):
-            within = timedelta(seconds=within)
+        if within is not None and not isinstance(within, timedelta):
+            # Parse the raw value the same way the field would, so that every
+            # form pydantic accepts for a timedelta reaches the comparisons
+            # below as a timedelta.
+            try:
+                within = _timedelta_adapter.validate_python(within)
+            except ValidationError:
+                # The field validation reports the unparsable value.
+                return data
 
         if posture == Posture.Proactive:
             if not within or within == timedelta(0):
@@ -294,7 +306,7 @@ class MetricTriggerQuery(PrefectBaseModel):
             "the query result against the threshold value."
         ),
     )
-    range: timedelta = Field(
+    range: DurationOrSecondsTimeDelta = Field(
         timedelta(seconds=300),  # defaults to 5 minutes
         description=(
             "The lookback duration (seconds) for a metric query. This duration is "
@@ -302,7 +314,7 @@ class MetricTriggerQuery(PrefectBaseModel):
             "The minimum value is 300 seconds (5 minutes)."
         ),
     )
-    firing_for: timedelta = Field(
+    firing_for: DurationOrSecondsTimeDelta = Field(
         timedelta(seconds=300),  # defaults to 5 minutes
         description=(
             "The duration (seconds) for which the metric query must breach "
@@ -356,7 +368,7 @@ class CompositeTrigger(Trigger, abc.ABC):
 
     type: Literal["compound", "sequence"]
     triggers: List["TriggerTypes"]
-    within: Optional[timedelta] = Field(
+    within: Optional[DurationOrSecondsTimeDelta] = Field(
         None,
         description=(
             "The time period over which the events must occur.  For Reactive triggers, "
@@ -486,17 +498,17 @@ class AutomationCore(PrefectBaseModel, extra="ignore"):  # type: ignore[call-arg
         ),
     )
 
-    actions: List[ActionTypes] = Field(
+    actions: List[ActionTypesOrUnknown] = Field(
         default=...,
         description="The actions to perform when this Automation triggers",
     )
 
-    actions_on_trigger: List[ActionTypes] = Field(
+    actions_on_trigger: List[ActionTypesOrUnknown] = Field(
         default_factory=list,
         description="The actions to perform when an Automation goes into a triggered state",
     )
 
-    actions_on_resolve: List[ActionTypes] = Field(
+    actions_on_resolve: List[ActionTypesOrUnknown] = Field(
         default_factory=list,
         description="The actions to perform when an Automation goes into a resolving state",
     )

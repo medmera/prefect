@@ -6,10 +6,9 @@ import copy
 import datetime
 import logging
 import os
-import threading
 import uuid
 import warnings
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, ExitStack
 from functools import partial
 from importlib.metadata import distributions
 from typing import (
@@ -26,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import anyio
 import anyio.abc
+import httpx
 from exceptiongroup import BaseExceptionGroup, ExceptionGroup
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 from pydantic.json_schema import GenerateJsonSchema
@@ -38,6 +38,7 @@ from prefect._internal.infrastructure_exit_codes import get_infrastructure_exit_
 from prefect._internal.launchers import resolve_bundle_step_with_launcher
 from prefect._internal.observers import FlowRunCancellingObserver
 from prefect._internal.schemas.validators import return_v_or_none
+from prefect._internal.server_maintenance import polling_window_start
 from prefect.client.orchestration import PrefectClient, get_client
 from prefect.client.schemas.objects import Flow as APIFlow
 from prefect.client.schemas.objects import (
@@ -116,6 +117,30 @@ if TYPE_CHECKING:
         WorkerFlowRunResponse,
     )
     from prefect.flows import Flow
+
+
+def _is_transient_api_error(exc: httpx.HTTPError) -> bool:
+    """Whether an API error is likely to resolve itself if retried."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+def _is_within_polling_window(
+    last_polled_time: datetime.datetime, query_interval_seconds: float
+) -> bool:
+    """
+    Whether a worker that last polled at `last_polled_time` is within its
+    polling window of `query_interval_seconds` x 30.
+
+    While the Prefect API is in maintenance, requests wait out the `Retry-After`
+    it sends, so the window counts from the later of `last_polled_time` and the
+    end of the latest maintenance back-off.
+    """
+    seconds_since_window_start = (
+        prefect.types._datetime.now("UTC") - polling_window_start(last_polled_time)
+    ).total_seconds()
+    return seconds_since_window_start <= query_interval_seconds * 30
 
 
 class BaseJobConfiguration(BaseModel):
@@ -665,7 +690,9 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._cleanup_handler_registry = build_cleanup_handler_registry(self)
 
         self._prefetch_seconds: float = (
-            prefetch_seconds or PREFECT_WORKER_PREFETCH_SECONDS.value()
+            prefetch_seconds
+            if prefetch_seconds is not None
+            else PREFECT_WORKER_PREFETCH_SECONDS.value()
         )
         self.heartbeat_interval_seconds: int = (
             heartbeat_interval_seconds or PREFECT_WORKER_HEARTBEAT_SECONDS.value()
@@ -681,6 +708,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._submitting_flow_run_ids: set[UUID] = set()
         self._scheduled_task_scopes: set[anyio.CancelScope] = set()
         self._worker_channel: Optional[WorkerChannel] = None
+        self._has_successfully_synced = False
 
         # Cancellation handling
         self._cancelling_observer: Optional[FlowRunCancellingObserver] = None
@@ -832,53 +860,61 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             with_healthcheck: If set, the worker will start a healthcheck server.
             printer: A `print`-like function where logs will be reported.
         """
-        healthcheck_server = None
-        healthcheck_thread = None
+        healthcheck_stack = ExitStack()
         try:
+            if with_healthcheck:
+                from prefect.workers.server import (
+                    _run_healthcheck_server,  # pyright: ignore[reportPrivateUsage]
+                )
+
+                # Started before setup, which syncs with the API: while the API is
+                # in maintenance that sync waits, and the healthcheck must still
+                # answer.
+                query_interval_seconds = PREFECT_WORKER_QUERY_SECONDS.value()
+                healthcheck_stack.enter_context(
+                    _run_healthcheck_server(
+                        lambda: self.is_worker_still_polling(
+                            query_interval_seconds=query_interval_seconds
+                        )
+                    )
+                )
+
             async with self as worker:
-                # schedule the scheduled flow run polling loop
+                polling_service = partial(
+                    critical_service_loop,
+                    workload=self.get_and_submit_flow_runs,
+                    interval=PREFECT_WORKER_QUERY_SECONDS.value(),
+                    run_once=run_once,
+                    jitter_range=0.3,
+                    backoff=4,  # Up to ~1 minute interval during backoff
+                )
+                sync_service = partial(
+                    critical_service_loop,
+                    workload=self._sync_and_initialize,
+                    interval=self.heartbeat_interval_seconds,
+                    run_once=run_once,
+                    jitter_range=0.3,
+                    backoff=4,
+                )
+
                 async with anyio.create_task_group() as loops_task_group:
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.get_and_submit_flow_runs,
-                            interval=PREFECT_WORKER_QUERY_SECONDS.value(),
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,  # Up to ~1 minute interval during backoff
-                        )
-                    )
-                    # schedule the sync loop
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.sync_with_backend,
-                            interval=self.heartbeat_interval_seconds,
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,
-                        )
-                    )
+                    if run_once:
+
+                        async def run_once_services() -> None:
+                            # A one-shot poll needs the work-pool configuration
+                            # produced by the one-shot synchronization attempt.
+                            await sync_service()
+                            await polling_service()
+
+                        loops_task_group.start_soon(run_once_services)
+                    else:
+                        loops_task_group.start_soon(polling_service)
+                        loops_task_group.start_soon(sync_service)
 
                     self._started_event = await self._emit_worker_started_event()
 
                     start_client_metrics_server()
 
-                    if with_healthcheck:
-                        from prefect.workers.server import build_healthcheck_server
-
-                        # we'll start the ASGI server in a separate thread so that
-                        # uvicorn does not block the main thread
-                        healthcheck_server = build_healthcheck_server(
-                            worker=worker,
-                            query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
-                        )
-                        healthcheck_thread = threading.Thread(
-                            name="healthcheck-server-thread",
-                            target=healthcheck_server.run,
-                            daemon=True,
-                        )
-                        healthcheck_thread.start()
                     printer(f"Worker {worker.name!r} started!")
 
                 # If running once, wait for active runs to finish before teardown
@@ -892,12 +928,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                         await anyio.sleep(0.1)
         finally:
             stop_client_metrics_server()
-
-            if healthcheck_server and healthcheck_thread:
-                self._logger.debug("Stopping healthcheck server...")
-                healthcheck_server.should_exit = True
-                healthcheck_thread.join()
-                self._logger.debug("Healthcheck server stopped.")
+            healthcheck_stack.close()
 
         printer(f"Worker {worker.name!r} stopped!")
 
@@ -1128,7 +1159,18 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             worker_id=self.backend_id,
         )
 
-        bundle_result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        try:
+            bundle_result = create_bundle_for_flow_run(flow=flow, flow_run=flow_run)
+        except Exception as exc:
+            logger.exception(
+                "Failed to create execution bundle for flow run '%s'.", flow_run.id
+            )
+            message = (
+                f"Flow run bundle could not be created: {type(exc).__name__}: {exc}"
+            )
+            await self._propose_crashed_state(flow_run, message, client=self.client)
+            return
+
         bundle = bundle_result["bundle"]
         zip_path = bundle_result["zip_path"]
 
@@ -1193,6 +1235,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
     async def setup(self) -> None:
         """Prepares the worker to run."""
         self._logger.debug("Setting up worker...")
+        self._has_successfully_synced = False
         self._runs_task_group = anyio.create_task_group()
         self._limiter = (
             anyio.CapacityLimiter(self._limit) if self._limit is not None else None
@@ -1210,31 +1253,16 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         # it in all API requests made by this worker process.
         os.environ["PREFECT__WORKER_NAME"] = self.name
 
-        await self.sync_with_backend()
-
-        # Initialize cancellation handling if enabled
-        if get_current_settings().worker.enable_cancellation and self._work_pool:
-            try:
-                self._cancelling_observer = await self._exit_stack.enter_async_context(
-                    FlowRunCancellingObserver(
-                        on_cancelling=lambda flow_run_id: (
-                            self._runs_task_group.start_soon(
-                                self._cancel_run, flow_run_id
-                            )
-                        ),
-                        polling_interval=get_current_settings().worker.cancellation_poll_seconds,
-                        event_filter=EventFilter(
-                            event=EventNameFilter(name=["prefect.flow-run.Cancelling"]),
-                            any_resource=EventAnyResourceFilter(
-                                id=[f"prefect.work-pool.{self._work_pool.id}"]
-                            ),
-                        ),
-                    )
-                )
-            except Exception as exc:
-                self._logger.warning(
-                    "Failed to setup cancellation handling: %s", exc, exc_info=True
-                )
+        try:
+            await self._sync_and_initialize()
+        except httpx.HTTPError as exc:
+            if not _is_transient_api_error(exc):
+                raise
+            self._logger.warning(
+                "Unable to reach the Prefect API while starting up; the worker will "
+                "keep attempting to connect: %s",
+                exc,
+            )
 
         self.is_setup = True
 
@@ -1266,6 +1294,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._runs_task_group = None
         self._client = None
         self._worker_channel = None
+        self._has_successfully_synced = False
+        self._cancelling_observer = None
 
     def is_worker_still_polling(self, query_interval_seconds: float) -> bool:
         """
@@ -1277,18 +1307,21 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         the loop services - we will evaluate if the _last_polled_time
         was within that interval x 30 (so 10s -> 5m)
 
+        While the Prefect API is in maintenance, requests wait out the
+        `Retry-After` it sends, so the window counts from the later of
+        `self._last_polled_time` and the end of the latest maintenance back-off.
+
         The instance property `self._last_polled_time`
         is currently set/updated in `get_and_submit_flow_runs()`
         """
-        threshold_seconds = query_interval_seconds * 30
-
-        seconds_since_last_poll = (
-            prefect.types._datetime.now("UTC") - self._last_polled_time
-        ).seconds
-
-        is_still_polling = seconds_since_last_poll <= threshold_seconds
+        is_still_polling = _is_within_polling_window(
+            self._last_polled_time, query_interval_seconds
+        )
 
         if not is_still_polling:
+            seconds_since_last_poll = (
+                prefect.types._datetime.now("UTC") - self._last_polled_time
+            ).total_seconds()
             self._logger.error(
                 f"Worker has not polled in the last {seconds_since_last_poll} seconds "
                 "and should be restarted"
@@ -1297,6 +1330,14 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         return is_still_polling
 
     async def get_and_submit_flow_runs(self) -> list["FlowRun"]:
+        if not self._has_successfully_synced:
+            self._logger.debug(
+                "Worker has not yet synced with the Prefect API; "
+                "skipping flow run submission."
+            )
+            self._last_polled_time = prefect.types._datetime.now("UTC")
+            return []
+
         runs_response = await self._get_scheduled_flow_runs()
 
         self._last_polled_time = prefect.types._datetime.now("UTC")
@@ -1341,6 +1382,15 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             return WorkerMetadata(integrations=integration_versions)
         return None
 
+    async def _sync_and_initialize(self) -> None:
+        """Synchronize the worker and initialize sync-dependent services."""
+        await self.sync_with_backend()
+
+        # Preserve startup behavior for custom workers that override the public
+        # synchronization method without calling `super()`.
+        if not self._has_successfully_synced:
+            await self._initialize_after_sync()
+
     async def sync_with_backend(self) -> None:
         """
         Updates the worker's local information about it's current work pool and
@@ -1353,11 +1403,54 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             return
 
         await self._worker_channel.sync(self._runs_task_group)
+        await self._initialize_after_sync()
 
         self._logger.debug(
             "Worker synchronized with the Prefect API server. "
             + (f"Remote ID: {self.backend_id}" if self.backend_id else "")
         )
+
+    async def _initialize_after_sync(self) -> None:
+        """Initialize services that depend on a completed backend sync."""
+        # Synchronization can succeed without a work pool when automatic work-pool
+        # creation is disabled. The worker cannot submit runs without its template.
+        if self._work_pool is None:
+            return
+
+        await self._setup_cancellation_observer()
+        self._has_successfully_synced = True
+
+    async def _setup_cancellation_observer(self) -> None:
+        """Start observing flow run cancellations if not already observing.
+
+        Requires a work pool, which is only available once the worker has
+        synced with the API.
+        """
+        if self._cancelling_observer is not None or self._work_pool is None:
+            return
+
+        if not get_current_settings().worker.enable_cancellation:
+            return
+
+        try:
+            self._cancelling_observer = await self._exit_stack.enter_async_context(
+                FlowRunCancellingObserver(
+                    on_cancelling=lambda flow_run_id: self._runs_task_group.start_soon(
+                        self._cancel_run, flow_run_id
+                    ),
+                    polling_interval=get_current_settings().worker.cancellation_poll_seconds,
+                    event_filter=EventFilter(
+                        event=EventNameFilter(name=["prefect.flow-run.Cancelling"]),
+                        any_resource=EventAnyResourceFilter(
+                            id=[f"prefect.work-pool.{self._work_pool.id}"]
+                        ),
+                    ),
+                )
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to setup cancellation handling: %s", exc, exc_info=True
+            )
 
     def _ensure_worker_channel(self) -> None:
         if self._client is None:
@@ -1450,6 +1543,14 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                     " in progress."
                 )
                 break
+            except RuntimeError as exc:
+                if "already holding" not in str(exc):
+                    raise
+                self._logger.warning(
+                    f"Duplicate submission of flow run '{flow_run.id}' detected. Worker"
+                    " will not re-submit flow run."
+                )
+                continue
             else:
                 run_logger = self.get_flow_run_logger(flow_run)
                 run_logger.info(
